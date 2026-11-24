@@ -68,6 +68,18 @@ pub enum Tab {
     /// View > MicroProfiler (Ctrl+F6): the profiler window
     /// (crates/rustudio-profiler-ui), its own OS window by default.
     Profiler,
+    /// Native Animation Editor (Avatar > Clip Editor): src/anim_editor.rs.
+    AnimationEditor,
+    /// Native Luau Command Bar (Script > Command Bar): src/command_bar.rs.
+    CommandBar,
+    /// Native CollectionService Tag Editor: src/tag_editor.rs.
+    TagEditor,
+    /// Native PhysicsService Collision Groups matrix: src/tag_editor.rs.
+    CollisionGroups,
+    /// Native Find & Replace Across All Scripts: src/find_in_place.rs.
+    FindInPlace,
+    /// Native Studio Pro Hub (Lighting, VFX, Device Emulator, Templates): src/studio_extras.rs.
+    StudioTools,
     /// A script open in the code editor.
     Script(Ref),
     /// A plugin's DockWidgetPluginGui (src/plugin_host/widgets_ui.rs: the
@@ -88,6 +100,12 @@ impl Tab {
             Tab::AssetManager => "Asset Manager",
             Tab::FileSync => "File Sync",
             Tab::Profiler => "MicroProfiler",
+            Tab::AnimationEditor => "Animation Editor",
+            Tab::CommandBar => "Command Bar",
+            Tab::TagEditor => "Tag Editor",
+            Tab::CollisionGroups => "Collision Groups",
+            Tab::FindInPlace => "Find in Place",
+            Tab::StudioTools => "Studio Pro",
             Tab::Script(_) => "Script",
             Tab::Plugin(_) => "Plugin",
         }
@@ -266,6 +284,16 @@ pub struct Editor {
     pub toolbox: crate::toolbox::Toolbox,
     /// The Asset Manager panel's state (src/asset_manager), kept while hidden.
     pub asset_manager: crate::asset_manager::AssetManager,
+    /// Native Animation Editor state (src/anim_editor.rs).
+    pub anim_ed: crate::anim_editor::AnimEditorState,
+    /// Native Command Bar state (src/command_bar.rs).
+    pub command_bar: crate::command_bar::CommandBarState,
+    /// Native Tag Editor & Collision Groups state (src/tag_editor.rs).
+    pub tag_ed: crate::tag_editor::TagEditorState,
+    /// Native Find in Place state (src/find_in_place.rs).
+    pub find_in_place: crate::find_in_place::FindInPlaceState,
+    /// Native Studio Pro (Lighting, VFX, Device Emulator, Templates, Perf HUD): src/studio_extras.rs.
+    pub extras: crate::studio_extras::StudioExtrasState,
     /// The MicroProfiler window while its tab is open (recording runs while
     /// it exists; dropping it stops recording).
     pub profiler: Option<rustudio_profiler_ui::ProfilerWindow>,
@@ -514,6 +542,11 @@ impl RustudioApp {
             terrain_ed: Default::default(),
             toolbox: Default::default(),
             asset_manager: Default::default(),
+            anim_ed: Default::default(),
+            command_bar: Default::default(),
+            tag_ed: Default::default(),
+            find_in_place: Default::default(),
+            extras: Default::default(),
             profiler: None,
             toolbox_vf: Default::default(),
             fly_held: 0.0,
@@ -2008,6 +2041,12 @@ impl TabViewer for Viewer<'_> {
             Tab::Toolbox => self.ed.toolbox_ui(ui),
             Tab::AssetManager => self.ed.asset_manager_ui(ui),
             Tab::FileSync => self.ed.file_sync_panel_ui(ui),
+            Tab::AnimationEditor => self.ed.anim_editor_ui(ui),
+            Tab::CommandBar => self.ed.command_bar_ui(ui),
+            Tab::TagEditor => self.ed.tag_editor_ui(ui),
+            Tab::CollisionGroups => self.ed.collision_groups_ui(ui),
+            Tab::FindInPlace => self.ed.find_in_place_ui(ui),
+            Tab::StudioTools => self.ed.studio_tools_ui(ui),
             Tab::Profiler => {
                 let rect = ui.available_rect_before_wrap();
                 let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect));
@@ -2710,7 +2749,20 @@ impl RustudioApp {
             for t in popped {
                 if self.dock.find_tab(&t).is_none()
                     && native_tab_enabled(t, self.ed.builtin_tools)
-                    && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync)
+                    && !matches!(
+                        t,
+                        Tab::AvatarSettings
+                            | Tab::TerrainEditor
+                            | Tab::Toolbox
+                            | Tab::AssetManager
+                            | Tab::FileSync
+                            | Tab::AnimationEditor
+                            | Tab::CommandBar
+                            | Tab::TagEditor
+                            | Tab::CollisionGroups
+                            | Tab::FindInPlace
+                            | Tab::StudioTools
+                    )
                 {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
@@ -2813,6 +2865,7 @@ impl RustudioApp {
             });
         drop(_dock_scope);
         self.reset_document_tabs();
+        self.ed.studio_perf_hud_overlay(&ctx);
         self.panel_windows(&ctx, &windows, dock_rect);
         self.reset_document_tabs();
         // Window > Explorer / Properties / Output / Avatar Settings toggles
@@ -2917,6 +2970,12 @@ impl RustudioApp {
             (Tab::AssetManager, "Asset Manager"),
             (Tab::FileSync, "File Sync"),
             (Tab::Profiler, "MicroProfiler"),
+            (Tab::AnimationEditor, "Animation Editor"),
+            (Tab::CommandBar, "Command Bar"),
+            (Tab::TagEditor, "Tag Editor"),
+            (Tab::CollisionGroups, "Collision Groups"),
+            (Tab::FindInPlace, "Find in Place"),
+            (Tab::StudioTools, "Studio Pro"),
         ]
         .into_iter()
         .filter(|(t, _)| self.panels.locate(&self.dock, t).is_some())

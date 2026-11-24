@@ -130,8 +130,9 @@ pub const PLACEMENTS: &[Placement] = &[
     row("material_manager", "Material Manager", Bottom, &[], 0.22),
     row("clip_editor", "Animation Editor", Bottom, &[], 0.3),
     row("scene_analysis", "Scene Analysis", Bottom, &[], 0.22),
+    row("studio_tools", "Studio Pro", Left, &[TabWith("toolbox")], 0.24),
     // A narrow full-width strip under all the panes.
-    row("command_bar", "Command Bar", BottomFull, &[], 0.05),
+    row("command_bar", "Command Bar", BottomFull, &[], 0.08),
     // Studio opens these floating.
     float("manage_plugins", "Manage Plugins"),
     float("version_history", "Version History"),
@@ -183,6 +184,12 @@ impl Tab {
             Tab::AssetManager => "asset_manager",
             Tab::FileSync => "file_sync",
             Tab::Profiler => "microprofiler",
+            Tab::AnimationEditor => "clip_editor",
+            Tab::CommandBar => "command_bar",
+            Tab::TagEditor => "tag_editor",
+            Tab::CollisionGroups => "collision_groups",
+            Tab::FindInPlace => "find_in_place",
+            Tab::StudioTools => "studio_tools",
             Tab::Script(_) => "script",
             Tab::Plugin(n) => crate::plugin_host::widgets_ui::slot_key(*n),
         }

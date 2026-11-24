@@ -90,6 +90,11 @@ pub mod group_icons;
 pub mod ui_shots;
 pub mod viewport;
 pub mod viewport_menu;
+pub mod anim_editor;
+pub mod command_bar;
+pub mod find_in_place;
+pub mod studio_extras;
+pub mod tag_editor;
 
 use std::path::PathBuf;
 

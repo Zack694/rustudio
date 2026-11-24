@@ -260,7 +260,10 @@ impl Editor {
                     self.rb(ui, "list-details", "Properties", "panel_properties", p, a);
                     let tb_on = self.action_state("toolbox").1 == Some(true);
                     self.rb(ui, "tools", "Toolbox", "toolbox", tb_on, a);
-                    self.rb(ui, "folders", "Assets", "asset_manager", false, a);
+                    let am_on = self.ui.panels_open.contains("Asset Manager");
+                    self.rb(ui, "folders", "Assets", "asset_manager", am_on, a);
+                    let pro_on = self.ui.panels_open.contains("Studio Pro");
+                    self.rb(ui, "sparkles", "Studio Pro", "studio_tools", pro_on, a);
                 }
                 RibbonTab::Model => {
                     self.ribbon_tools(ui, a);
@@ -330,10 +333,12 @@ impl Editor {
                     self.rb(ui, "file-code", "Script", "script", false, a);
                     divider(ui);
                     self.rb(ui, "indent-increase", "Format", "format_document", false, a);
-                    self.rb(ui, "search", "Find", "find_in_place", false, a);
+                    let fip = self.ui.panels_open.contains("Find in Place");
+                    self.rb(ui, "search", "Find", "find_in_place", fip, a);
                     self.rb(ui, "list-numbers", "Go to Line", "goto_line", false, a);
                     divider(ui);
-                    self.rb(ui, "terminal-2", "Command", "command_bar", false, a);
+                    let cb = self.ui.panels_open.contains("Command Bar");
+                    self.rb(ui, "terminal-2", "Command", "command_bar", cb, a);
                     let o = self.ui.panels_open.contains("Output");
                     self.rb(ui, "terminal", "Output", "panel_output", o, a);
                     divider(ui);
