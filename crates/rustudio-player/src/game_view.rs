@@ -2553,8 +2553,17 @@ impl Game {
             // The same tone curve rule as the 3D view (lighting::tone_curve_on).
             let curve = rustudio_render::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
             r.draw_world_gui(rs, ctx.font_texture_update(), &self.gui.world_batches, self.effects.drawn(), curve);
-            // 3D viewport adornments (Team Create collaborator camera gizmos, adorn.rs).
-            r.draw_adorn(rs, &self.extra_adorn);
+            // 3D viewport adornments (Team Create collaborator camera gizmos + ForceField bubbles, adorn.rs).
+            let ff_time = self.play.as_ref().map(|p| p.time as f32).unwrap_or(0.0);
+            let ff_draws = rustudio_render::adorn::forcefield_bubble_draws(&self.doc, ff_time);
+            if ff_draws.is_empty() {
+                r.draw_adorn(rs, &self.extra_adorn);
+            } else {
+                let mut all_adorn = Vec::with_capacity(self.extra_adorn.len() + ff_draws.len());
+                all_adorn.extend_from_slice(&self.extra_adorn);
+                all_adorn.extend(ff_draws);
+                r.draw_adorn(rs, &all_adorn);
+            }
             // Highlights last, over the finished image (highlight.rs).
             r.draw_highlights(rs, &hl);
         }

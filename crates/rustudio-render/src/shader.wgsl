@@ -740,14 +740,17 @@ fn local_light(l: Light, world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     var ndl = max(dot(n, dir), 0.0);
     if (kind > 0.5) {
         // Spot / surface: inside the cone (Angle is the full cone), fading
-        // as the square of the way from its edge to its axis.
+        // smoothly across the cone edge; SpotLights also carry a soft outer
+        // penumbra spill to match Studio's Soft lighting style.
         let c = dot(-dir, l.dir.xyz);
         let cone = clamp((c - l.dir.w) / max(1.0 - l.dir.w, 1e-3), 0.0, 1.0);
-        k *= cone * cone;
         if (kind > 1.5) {
             // Surface lights shine from the whole face: wrapped by its size.
-            k *= step(0.0, c);
+            k *= cone * cone * step(0.0, c);
             ndl = clamp(dot(n, dir) + sqrt(l.extra.x * l.extra.y) / max(d, 1e-3), 0.0, 1.0);
+        } else {
+            let outer = clamp((c - (l.dir.w - 0.18)) / max(1.0 - (l.dir.w - 0.18), 1e-3), 0.0, 1.0);
+            k *= max(cone * cone, outer * outer * 0.22);
         }
     }
     return l.color.rgb * k * ndl;
@@ -1636,6 +1639,15 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         // Neon glows at its own colour, unlit (and blooms). See-through
         // Neon blends the same radiance (neon_over_scene below).
         c = base * base * NEON_GLOW;
+    } else if (SPEC_SPECIAL_KINDS && kind > 3.5 && kind < 4.5) {
+        // ForceField material (Enum.Material.ForceField): translucent core with
+        // luminous Fresnel rim and subtle spatial energy pattern.
+        let v = normalize(g.cam_pos.xyz - in.world);
+        let nv = clamp(abs(dot(n, v)), 0.0, 1.0);
+        let rim = pow(1.0 - nv, 2.2);
+        let weave = 0.85 + 0.15 * sin(in.world.y * 5.0 + in.world.x * 2.5);
+        c = base * (0.45 + rim * 2.8) * weave;
+        alpha = clamp(alpha * (0.35 + rim * 1.15), 0.06, 0.95);
     } else if (spec_pred(2u, g.perf.x < 1.5)) {
         // Performance > Shading detail "Medium": the same diffuse light as
         // High (sun shadow, sky light grid, ambient), without the
