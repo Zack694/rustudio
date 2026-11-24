@@ -3813,7 +3813,7 @@ mod touch_scroll_tests {
 
     #[test]
     fn billboard_extents_offset_world_and_camera_space() {
-        use rbx_dom_weak::types::{CFrame, Matrix3, UDim, UDim2, Vector3};
+        use rbx_dom_weak::{InstanceBuilder, types::{CFrame, Matrix3, UDim, UDim2, Vector3}};
         let mut doc = Document::new_place();
         let ws = doc.workspace().unwrap();
         let part = doc.insert(

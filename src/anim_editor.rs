@@ -910,51 +910,57 @@ impl Editor {
                         pose_dirty = true;
                     }
                 });
-                let jp = kf.poses.entry(joint_name.clone()).or_default();
-                cols[1].horizontal(|ui| {
-                    ui.label("Rot°:");
-                    pose_dirty |= ui.add(egui::DragValue::new(&mut jp.rot_deg[0]).speed(1.0).range(-180.0..=180.0).prefix("X ")).changed();
-                    pose_dirty |= ui.add(egui::DragValue::new(&mut jp.rot_deg[1]).speed(1.0).range(-180.0..=180.0).prefix("Y ")).changed();
-                    pose_dirty |= ui.add(egui::DragValue::new(&mut jp.rot_deg[2]).speed(1.0).range(-180.0..=180.0).prefix("Z ")).changed();
-                });
-                cols[1].horizontal(|ui| {
-                    ui.label("Pos:");
-                    pose_dirty |= ui.add(egui::DragValue::new(&mut jp.pos[0]).speed(0.05).prefix("X ")).changed();
-                    pose_dirty |= ui.add(egui::DragValue::new(&mut jp.pos[1]).speed(0.05).prefix("Y ")).changed();
-                    pose_dirty |= ui.add(egui::DragValue::new(&mut jp.pos[2]).speed(0.05).prefix("Z ")).changed();
-                });
-                cols[1].horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("anim_ease_style").selected_text(jp.style.label()).width(80.0).show_ui(ui, |ui| {
-                        for st in EasingStyle::ALL {
-                            if ui.selectable_label(jp.style == st, st.label()).clicked() {
-                                jp.style = st;
-                                pose_dirty = true;
-                            }
-                        }
+                let mut mirror_insert: Option<(String, JointPose)> = None;
+                {
+                    let jp = kf.poses.entry(joint_name.clone()).or_default();
+                    cols[1].horizontal(|ui| {
+                        ui.label("Rot°:");
+                        pose_dirty |= ui.add(egui::DragValue::new(&mut jp.rot_deg[0]).speed(1.0).range(-180.0..=180.0).prefix("X ")).changed();
+                        pose_dirty |= ui.add(egui::DragValue::new(&mut jp.rot_deg[1]).speed(1.0).range(-180.0..=180.0).prefix("Y ")).changed();
+                        pose_dirty |= ui.add(egui::DragValue::new(&mut jp.rot_deg[2]).speed(1.0).range(-180.0..=180.0).prefix("Z ")).changed();
                     });
-                    egui::ComboBox::from_id_salt("anim_ease_dir").selected_text(jp.dir.label()).width(68.0).show_ui(ui, |ui| {
-                        for d in EasingDir::ALL {
-                            if ui.selectable_label(jp.dir == d, d.label()).clicked() {
-                                jp.dir = d;
-                                pose_dirty = true;
-                            }
-                        }
+                    cols[1].horizontal(|ui| {
+                        ui.label("Pos:");
+                        pose_dirty |= ui.add(egui::DragValue::new(&mut jp.pos[0]).speed(0.05).prefix("X ")).changed();
+                        pose_dirty |= ui.add(egui::DragValue::new(&mut jp.pos[1]).speed(0.05).prefix("Y ")).changed();
+                        pose_dirty |= ui.add(egui::DragValue::new(&mut jp.pos[2]).speed(0.05).prefix("Z ")).changed();
                     });
-                    if ui.small_button("Reset").clicked() {
-                        *jp = JointPose::default();
-                        pose_dirty = true;
-                    }
-                    if let Some(mirror) = mirror_joint_name(&joint_name) {
-                        if ui.small_button("Mirror L↔R").clicked() {
-                            let mut cloned = jp.clone();
-                            cloned.pos[0] = -cloned.pos[0];
-                            cloned.rot_deg[1] = -cloned.rot_deg[1];
-                            cloned.rot_deg[2] = -cloned.rot_deg[2];
-                            kf.poses.insert(mirror, cloned);
+                    cols[1].horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("anim_ease_style").selected_text(jp.style.label()).width(80.0).show_ui(ui, |ui| {
+                            for st in EasingStyle::ALL {
+                                if ui.selectable_label(jp.style == st, st.label()).clicked() {
+                                    jp.style = st;
+                                    pose_dirty = true;
+                                }
+                            }
+                        });
+                        egui::ComboBox::from_id_salt("anim_ease_dir").selected_text(jp.dir.label()).width(68.0).show_ui(ui, |ui| {
+                            for d in EasingDir::ALL {
+                                if ui.selectable_label(jp.dir == d, d.label()).clicked() {
+                                    jp.dir = d;
+                                    pose_dirty = true;
+                                }
+                            }
+                        });
+                        if ui.small_button("Reset").clicked() {
+                            *jp = JointPose::default();
                             pose_dirty = true;
                         }
-                    }
-                });
+                        if let Some(mirror) = mirror_joint_name(&joint_name) {
+                            if ui.small_button("Mirror L↔R").clicked() {
+                                let mut cloned = jp.clone();
+                                cloned.pos[0] = -cloned.pos[0];
+                                cloned.rot_deg[1] = -cloned.rot_deg[1];
+                                cloned.rot_deg[2] = -cloned.rot_deg[2];
+                                mirror_insert = Some((mirror, cloned));
+                                pose_dirty = true;
+                            }
+                        }
+                    });
+                }
+                if let Some((mirror, cloned)) = mirror_insert {
+                    kf.poses.insert(mirror, cloned);
+                }
                 // KeyframeMarkers (Events)
                 cols[1].horizontal(|ui| {
                     ui.label("Event:");
