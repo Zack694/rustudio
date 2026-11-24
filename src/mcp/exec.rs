@@ -10,7 +10,7 @@ use rustudio_engine::runtime::Side;
 use serde_json::{json, Value as J};
 
 use super::server::ToolResult;
-use super::{project_apply, sessions, tree, Op, Step};
+use super::{extra::AsyncOutcome, project_apply, sessions, tree, Op, ShotMode, Step};
 use crate::app::Editor;
 
 type R<T> = Result<T, String>;
@@ -68,7 +68,34 @@ impl Editor {
             "get_source" => self.mcp_get_source(a).map(Into::into),
             "grep_scripts" => self.mcp_grep(a).map(Into::into),
             "read_output" => Ok(self.mcp_read_output(a).into()),
-            "screenshot" => Ok(Step::Wait(Op::Shot { save: s(a, "path").map(PathBuf::from), requested: false, settled: false, asked: Instant::now() }, Duration::from_secs(40))),
+            "screenshot" => {
+                let mode = match s(a, "mode").unwrap_or("viewport").to_ascii_lowercase().as_str() {
+                    "window" | "full" => ShotMode::Window,
+                    "3d" | "scene" | "raw" => ShotMode::Scene3d,
+                    _ => ShotMode::Viewport,
+                };
+                Ok(Step::Wait(
+                    Op::Shot { save: s(a, "path").map(PathBuf::from), mode, requested: false, settled: false, asked: Instant::now() },
+                    Duration::from_secs(40),
+                ))
+            }
+            "inspect_gui" => self.mcp_inspect_gui(a).map(Into::into),
+            "describe_class" => self.mcp_describe_class(a).map(Into::into),
+            "list_enums" => self.mcp_list_enums(a).map(Into::into),
+            "search_toolbox" => self.mcp_search_toolbox(a),
+            "browse_inventory" => self.mcp_browse_inventory(a),
+            "get_asset_details" => self.mcp_get_asset_details(a),
+            "insert_asset" => self.mcp_insert_asset(a),
+            "download_asset" => self.mcp_download_asset(a),
+            "upload_asset" => self.mcp_upload_asset(a),
+            "publish_place" => self.mcp_publish_place(a),
+            "build_tree" => self.mcp_writable().and_then(|_| self.mcp_build_tree(a)).map(Into::into),
+            "batch_edit" => self.mcp_writable().and_then(|_| self.mcp_batch_edit(a)).map(Into::into),
+            "edit_terrain" => self.mcp_writable().and_then(|_| self.mcp_edit_terrain(a)).map(Into::into),
+            "create_animation" => self.mcp_writable().and_then(|_| self.mcp_create_animation(a)).map(Into::into),
+            "spawn_rig" => self.mcp_writable().and_then(|_| self.mcp_spawn_rig(a)).map(Into::into),
+            "apply_lighting_preset" => self.mcp_writable().and_then(|_| self.mcp_apply_lighting_preset(a)).map(Into::into),
+            "spawn_game_template" => self.mcp_writable().and_then(|_| self.mcp_spawn_game_template(a)).map(Into::into),
             "list_plugins" => Ok(ToolResult::json(&self.plugins.result_json()).into()),
             "team_create_status" => Ok(ToolResult::json(&self.mcp_live_status()).into()),
             "run_luau" => self.mcp_run_luau(a),
@@ -105,7 +132,7 @@ impl Editor {
     }
 
     /// Edit-DataModel writes need edit mode.
-    fn mcp_writable(&self) -> R<()> {
+    pub(super) fn mcp_writable(&self) -> R<()> {
         if self.game.play.is_some() {
             return Err("Play is running: an edit now would land in the Play DataModel and be lost at Stop. Call stop first, or use run_luau with target \"server\" / \"client\" to change the running game.".into());
         }
@@ -115,11 +142,11 @@ impl Editor {
         Ok(())
     }
 
-    fn mcp_resolve(&self, p: &str) -> R<Ref> {
+    pub(super) fn mcp_resolve(&self, p: &str) -> R<Ref> {
         tree::resolve(&self.game.doc, p)
     }
 
-    fn mcp_datamodel(&self) -> String {
+    pub(super) fn mcp_datamodel(&self) -> String {
         match self.game.play.as_ref() {
             None => "edit".into(),
             Some(p) => format!("{} ({:?} shown)", self.mcp_mode(), p.showing).to_lowercase(),
@@ -395,7 +422,7 @@ impl Editor {
     // ---------------------------------------------------------------- edits
 
     /// Property JSON → (name, value) for `class`, all checked before use.
-    fn mcp_resolve_props(class: &str, props: &serde_json::Map<String, J>) -> R<Props> {
+    pub(super) fn mcp_resolve_props(class: &str, props: &serde_json::Map<String, J>) -> R<Props> {
         let mut out = Vec::new();
         let mut rename = None;
         let mut errors = Vec::new();
@@ -420,7 +447,7 @@ impl Editor {
         }
     }
 
-    fn mcp_set_properties(&mut self, a: &J) -> R<ToolResult> {
+    pub(super) fn mcp_set_properties(&mut self, a: &J) -> R<ToolResult> {
         let r = self.mcp_resolve(req(a, "path")?)?;
         let class = self.game.doc.class_of(r).ok_or("gone")?.to_string();
         let empty = serde_json::Map::new();
@@ -476,7 +503,7 @@ impl Editor {
         }
     }
 
-    fn mcp_set_source(&mut self, a: &J) -> R<ToolResult> {
+    pub(super) fn mcp_set_source(&mut self, a: &J) -> R<ToolResult> {
         let r = self.mcp_resolve(req(a, "path")?)?;
         let src = req(a, "source")?.to_string();
         let class = self.game.doc.class_of(r).ok_or("gone")?;
@@ -490,7 +517,7 @@ impl Editor {
         Ok(ToolResult::text(format!("Wrote {lines} lines to {}{live}", tree::path(&self.game.doc, r))))
     }
 
-    fn mcp_create(&mut self, a: &J) -> R<ToolResult> {
+    pub(super) fn mcp_create(&mut self, a: &J) -> R<ToolResult> {
         let parent = self.mcp_resolve(req(a, "parent")?)?;
         let class = req(a, "class")?;
         if !class_exists(class) {
@@ -510,7 +537,7 @@ impl Editor {
         Ok(ToolResult::json(&json!({ "path": tree::path(&self.game.doc, r), "id": tree::id(r) })))
     }
 
-    fn mcp_clone(&mut self, a: &J) -> R<ToolResult> {
+    pub(super) fn mcp_clone(&mut self, a: &J) -> R<ToolResult> {
         let r = self.mcp_resolve(req(a, "path")?)?;
         let parent = match s(a, "parent") {
             Some(p) => self.mcp_resolve(p)?,
@@ -522,7 +549,7 @@ impl Editor {
         Ok(ToolResult::json(&json!({ "path": tree::path(&self.game.doc, c), "id": tree::id(c) })))
     }
 
-    fn mcp_delete(&mut self, a: &J) -> R<ToolResult> {
+    pub(super) fn mcp_delete(&mut self, a: &J) -> R<ToolResult> {
         let paths: Vec<&str> = a.get("paths").and_then(|p| p.as_array()).map(|v| v.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
         if paths.is_empty() {
             return Err("paths: a list of instance paths".into());
@@ -543,7 +570,7 @@ impl Editor {
         Ok(ToolResult::text(format!("Deleted {n} instance(s) (with their descendants)")))
     }
 
-    fn mcp_move(&mut self, a: &J) -> R<ToolResult> {
+    pub(super) fn mcp_move(&mut self, a: &J) -> R<ToolResult> {
         let r = self.mcp_resolve(req(a, "path")?)?;
         let parent = s(a, "parent").map(|p| self.mcp_resolve(p)).transpose()?;
         let name = s(a, "name");
@@ -924,7 +951,15 @@ impl Editor {
                 r.is_error = !ok;
                 Some(r)
             }
-            Op::Shot { save, requested, settled, asked } => self.mcp_poll_shot(ctx, save.clone(), requested, settled, *asked),
+            Op::Shot { save, mode, requested, settled, asked } => self.mcp_poll_shot(ctx, save.clone(), *mode, requested, settled, *asked),
+            Op::AsyncJob { rx, .. } => match rx.try_recv() {
+                Ok(AsyncOutcome::Ready(r)) => Some(r),
+                Ok(AsyncOutcome::InsertAsset { asset_id, name, kind, bytes, parent, position }) => {
+                    Some(self.finish_insert_asset(asset_id, name, kind, bytes, parent, position))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(ToolResult::error("Background worker terminated unexpectedly")),
+            },
             Op::Play { want } => {
                 let playing = self.game.play.is_some();
                 if playing == *want && (!*want || !self.place_loading()) {
@@ -991,6 +1026,7 @@ impl Editor {
                 r
             }
             Op::Shot { .. } => ToolResult::error("The screenshot didn't come back"),
+            Op::AsyncJob { label, .. } => ToolResult::error(format!("{label} timed out")),
             Op::Play { want: true } => ToolResult::error(format!("Play didn't start in 2 minutes ({}); read_output may say why", self.mcp_mode())),
             Op::Play { want: false } => ToolResult::error("Play didn't stop in a minute"),
             Op::Input { .. } => ToolResult::error("The input wasn't all sent in time"),
@@ -1006,7 +1042,16 @@ impl Editor {
         }
     }
 
-    fn mcp_poll_shot(&mut self, ctx: &egui::Context, save: Option<PathBuf>, requested: &mut bool, settled: &mut bool, asked: Instant) -> Option<ToolResult> {
+    fn mcp_poll_shot(&mut self, ctx: &egui::Context, save: Option<PathBuf>, mode: ShotMode, requested: &mut bool, settled: &mut bool, asked: Instant) -> Option<ToolResult> {
+        // Default save path inside `/storage/emulated/0/rustudio/screenshots/` on Android
+        // (or `<Pictures>/rustudio/` on desktop) when no explicit path is provided.
+        let resolved_save = save.unwrap_or_else(|| {
+            let dir = rustudio_core::paths::screenshots();
+            let _ = std::fs::create_dir_all(&dir);
+            let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
+            dir.join(format!("rustudio_{stamp}.png"))
+        });
+
         if !*requested {
             let ready = self.game.viewport_rect.is_positive()
                 && !self.place_loading()
@@ -1020,11 +1065,17 @@ impl Editor {
             }
             *requested = true;
             *settled = ready;
-            let direct = self.game.renderer.as_ref().zip(self.game.render_state.as_ref()).and_then(|(r, rs)| r.read_frame(rs));
-            if let Some((w, h, rgba)) = direct {
-                return Some(shot_result(w, h, rgba, save.as_deref(), *settled));
+            // Only bypass egui compositing when raw 3D-only mode is explicitly requested.
+            // Default `Viewport` and `Window` modes capture the composited frame so 2D
+            // ScreenGui / PlayerGui / HUD overlays are fully visible in the screenshot!
+            if mode == ShotMode::Scene3d {
+                let direct = self.game.renderer.as_ref().zip(self.game.render_state.as_ref()).and_then(|(r, rs)| r.read_frame(rs));
+                if let Some((w, h, rgba)) = direct {
+                    return Some(shot_result(w, h, rgba, Some(resolved_save.as_path()), *settled));
+                }
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            ctx.request_repaint();
             return None;
         }
         let image = ctx.input(|i| {
@@ -1033,9 +1084,23 @@ impl Editor {
                 _ => None,
             })
         });
-        let image = image?;
-        let ppp = ctx.pixels_per_point();
-        let (x0, y0, w, h) = crate::app::view_pixels(self.game.viewport_rect, ppp, image.size);
+        let Some(image) = image else {
+            // Fallback to direct 3D framebuffer if viewport screenshot event never fires
+            // (e.g. headless/offscreen runner) after waiting 4 seconds.
+            if asked.elapsed() > Duration::from_secs(24) {
+                let direct = self.game.renderer.as_ref().zip(self.game.render_state.as_ref()).and_then(|(r, rs)| r.read_frame(rs));
+                if let Some((w, h, rgba)) = direct {
+                    return Some(shot_result(w, h, rgba, Some(resolved_save.as_path()), *settled));
+                }
+            }
+            return None;
+        };
+        let (x0, y0, w, h) = if mode == ShotMode::Window {
+            (0usize, 0usize, image.size[0], image.size[1])
+        } else {
+            let ppp = ctx.pixels_per_point();
+            crate::app::view_pixels(self.game.viewport_rect, ppp, image.size)
+        };
         let mut rgba = Vec::with_capacity(w * h * 4);
         for y in 0..h {
             for x in 0..w {
@@ -1043,7 +1108,7 @@ impl Editor {
                 rgba.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
             }
         }
-        Some(shot_result(w as u32, h as u32, rgba, save.as_deref(), *settled))
+        Some(shot_result(w as u32, h as u32, rgba, Some(resolved_save.as_path()), *settled))
     }
 }
 
@@ -1057,9 +1122,12 @@ fn shot_result(w: u32, h: u32, mut rgba: Vec<u8>, save: Option<&Path>, settled: 
     };
     let mut note = format!("{w}x{h}{}", if settled { "" } else { " (taken before everything had loaded)" });
     if let Some(p) = save {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         match img.save(p) {
             Ok(()) => note += &format!(", saved to {}", p.display()),
-            Err(e) => return ToolResult::error(format!("{}: {e}", p.display())),
+            Err(e) => note += &format!(" (save warning {}: {e})", p.display()),
         }
     }
     let img = if w > 1600 { image::imageops::resize(&img, 1600, (h as f32 * 1600.0 / w as f32) as u32, image::imageops::FilterType::Triangle) } else { img };

@@ -72,7 +72,8 @@ pub fn cache() -> PathBuf {
     return dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
 }
 
-/// Where screenshots go: `~/Pictures` on Linux, the Pictures folder elsewhere.
+/// Where screenshots go: `/storage/emulated/0/rustudio/screenshots` on Android,
+/// `~/Pictures` on Linux, and the system Pictures folder elsewhere.
 pub fn pictures() -> PathBuf {
     #[cfg(target_os = "android")]
     return crate::android_dirs::pictures_dir();
@@ -80,6 +81,21 @@ pub fn pictures() -> PathBuf {
     return home().join("Pictures");
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     return dirs::picture_dir().unwrap_or_else(|| home().join("Pictures"));
+}
+
+/// Dedicated rustudio screenshots folder:
+/// `/storage/emulated/0/rustudio/screenshots` on Android (with automatic
+/// fallback if shared storage permission isn't granted), or
+/// `<Pictures>/rustudio` on desktop platforms.
+pub fn screenshots() -> PathBuf {
+    #[cfg(target_os = "android")]
+    return crate::android_dirs::screenshots_dir();
+    #[cfg(not(target_os = "android"))]
+    {
+        let dir = pictures().join("rustudio");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
 }
 
 /// Roblox Studio installed on this Mac (`RobloxStudio.app` in /Applications

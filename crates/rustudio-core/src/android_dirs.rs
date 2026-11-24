@@ -80,10 +80,24 @@ pub fn state_dir() -> PathBuf {
     dirs().files.join("state")
 }
 
-/// Screenshots (`paths::pictures()`): the app's external Pictures folder
-/// (writing to the shared Pictures collection needs MediaStore).
+/// Preferred shared-storage screenshots folder on Android
+/// (`/storage/emulated/0/rustudio/screenshots`), falling back to the app's
+/// external `screenshots/` directory if shared storage access hasn't been
+/// granted yet.
+pub fn screenshots_dir() -> PathBuf {
+    let preferred = PathBuf::from("/storage/emulated/0/rustudio/screenshots");
+    if std::fs::create_dir_all(&preferred).is_ok() && is_writable(&preferred) {
+        return preferred;
+    }
+    let fallback = data_dir().join("screenshots");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
+/// Screenshots (`paths::pictures()`): uses [`screenshots_dir`] so UI and MCP
+/// screenshots consistently land in `/storage/emulated/0/rustudio/screenshots`.
 pub fn pictures_dir() -> PathBuf {
-    data_dir().join("Pictures")
+    screenshots_dir()
 }
 
 /// Files unpacked from the APK's `assets/` (api-dump.json), where
