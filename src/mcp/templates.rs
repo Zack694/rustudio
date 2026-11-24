@@ -244,7 +244,7 @@ pub fn apply_lighting_preset(doc: &mut Document, preset: &str) -> Result<String,
 
     let c3 = |a: [f32; 3]| Variant::Color3(Color3::new(a[0], a[1], a[2]));
     doc.set_props(
-        format!("Apply Lighting preset ({key})"),
+        &format!("Apply Lighting preset ({key})"),
         vec![
             (lighting, ustr("ClockTime"), Variant::Float32(p.clock_time)),
             (lighting, ustr("Brightness"), Variant::Float32(p.brightness)),
@@ -257,6 +257,11 @@ pub fn apply_lighting_preset(doc: &mut Document, preset: &str) -> Result<String,
         ],
         None,
     );
+
+    // Studio's Atmosphere haze/sky/fog only activate when Lighting also has a Sky child.
+    if doc.find_child(lighting, "Sky").is_none() {
+        doc.insert(lighting, InstanceBuilder::new("Sky").with_name("Sky"));
+    }
 
     // Upsert Atmosphere, BloomEffect, ColorCorrectionEffect, SunRaysEffect under Lighting.
     upsert_lighting_child(
@@ -321,7 +326,7 @@ fn upsert_lighting_child(
 ) {
     if let Some(existing) = doc.find_child(lighting, class) {
         let updates = props.into_iter().map(|(k, v)| (existing, ustr(k), v)).collect();
-        doc.set_props(format!("Update {name}"), updates, None);
+        doc.set_props(&format!("Update {name}"), updates, None);
     } else {
         let mut b = InstanceBuilder::new(class).with_name(name);
         for (k, v) in props {

@@ -72,6 +72,8 @@ pub struct Game {
     pub(crate) quality_cpu_ms: f32,
     /// The document's Highlights, kept from its change journal (viewport.rs).
     pub highlight_index: Option<rustudio_core::doc::ClassIndex>,
+    /// The document's ForceFields, kept from its change journal (adorn.rs).
+    pub forcefield_index: Option<rustudio_core::doc::ClassIndex>,
     /// ParticleEmitters, Beams and Trails (round 25).
     pub effects: rustudio_render::effects::Effects,
     /// Loaded MeshPart / SpecialMesh geometry.
@@ -202,6 +204,7 @@ impl Game {
             quality_frame_at: None,
             quality_cpu_ms: 0.0,
             highlight_index: None,
+            forcefield_index: None,
             effects: Default::default(),
             meshes: Default::default(),
             textures: Default::default(),

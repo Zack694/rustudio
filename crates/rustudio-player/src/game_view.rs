@@ -2548,14 +2548,20 @@ impl Game {
             let room = rustudio_render::highlight::MAX.saturating_sub(hl.len());
             hl.extend(self.extra_highlights.iter().take(room).cloned());
         }
+        let ff_time = self.play.as_ref().map(|p| p.time as f32).unwrap_or(0.0);
+        let ff_draws = {
+            let index = self
+                .forcefield_index
+                .get_or_insert_with(|| rustudio_core::doc::ClassIndex::new(rustudio_core::doc::Reader::ForceFields));
+            index.update(&mut self.doc, |c| c == "ForceField");
+            rustudio_render::adorn::forcefield_bubble_draws(&self.doc, index.list(), ff_time)
+        };
         if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
             let _g = rustudio_core::bench::scope("gui_world_pass");
             // The same tone curve rule as the 3D view (lighting::tone_curve_on).
             let curve = rustudio_render::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
             r.draw_world_gui(rs, ctx.font_texture_update(), &self.gui.world_batches, self.effects.drawn(), curve);
             // 3D viewport adornments (Team Create collaborator camera gizmos + ForceField bubbles, adorn.rs).
-            let ff_time = self.play.as_ref().map(|p| p.time as f32).unwrap_or(0.0);
-            let ff_draws = rustudio_render::adorn::forcefield_bubble_draws(&self.doc, ff_time);
             if ff_draws.is_empty() {
                 r.draw_adorn(rs, &self.extra_adorn);
             } else {

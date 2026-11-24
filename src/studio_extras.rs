@@ -33,6 +33,9 @@ pub struct StudioExtrasState {
     pub status: Option<String>,
     pub grid_cols: i32,
     pub grid_spacing: f32,
+    pub cached_doc_id: u64,
+    pub cached_instances: usize,
+    pub cached_at: Option<std::time::Instant>,
 }
 
 const EMU_PRESETS: &[(&str, Option<[u32; 2]>)] = &[
@@ -428,7 +431,7 @@ fn apply_lighting_preset_local(doc: &mut Document, preset: &str) {
     };
     let c3 = |a: [f32; 3]| Variant::Color3(Color3::new(a[0], a[1], a[2]));
     doc.set_props(
-        format!("Lighting preset {preset}"),
+        &format!("Lighting preset {preset}"),
         vec![
             (lighting, ustr("ClockTime"), Variant::Float32(clock)),
             (lighting, ustr("Brightness"), Variant::Float32(bright)),
@@ -440,13 +443,17 @@ fn apply_lighting_preset_local(doc: &mut Document, preset: &str) {
         ],
         None,
     );
+    // Studio's Atmosphere haze/sky/fog only activate when Lighting also has a Sky child.
+    if doc.find_child(lighting, "Sky").is_none() {
+        doc.insert(lighting, InstanceBuilder::new("Sky").with_name("Sky"));
+    }
     for (cls, name, props) in [
         ("Atmosphere", "Atmosphere", vec![("Density", Variant::Float32(atmo_d))]),
         ("BloomEffect", "Bloom", vec![("Enabled", Variant::Bool(true)), ("Intensity", Variant::Float32(bloom_i))]),
         ("ColorCorrectionEffect", "ColorCorrection", vec![("Enabled", Variant::Bool(true)), ("Saturation", Variant::Float32(cc_sat))]),
     ] {
         if let Some(ex) = doc.find_child(lighting, cls) {
-            doc.set_props(format!("Update {name}"), props.into_iter().map(|(k, v)| (ex, ustr(k), v)).collect(), None);
+            doc.set_props(&format!("Update {name}"), props.into_iter().map(|(k, v)| (ex, ustr(k), v)).collect(), None);
         } else {
             let mut b = InstanceBuilder::new(cls).with_name(name);
             for (k, v) in props {
@@ -459,7 +466,7 @@ fn apply_lighting_preset_local(doc: &mut Document, preset: &str) {
 
 impl Editor {
     /// Draws the floating Performance / FPS / Memory Stats HUD when enabled (Window > Performance Summary > Stats).
-    pub fn studio_perf_hud_overlay(&self, ctx: &egui::Context) {
+    pub fn studio_perf_hud_overlay(&mut self, ctx: &egui::Context) {
         if !self.extras.show_perf_hud {
             return;
         }
@@ -467,14 +474,16 @@ impl Editor {
         if !vp.is_positive() {
             return;
         }
-        let instances = self.game.doc.dom.descendants().count();
-        let parts = self
-            .game
-            .doc
-            .dom
-            .descendants()
-            .filter(|i| doc::is_a(i.class.as_str(), "BasePart"))
-            .count();
+        let now = std::time::Instant::now();
+        let stale = self.extras.cached_doc_id != self.game.doc.id
+            || self.extras.cached_at.is_none_or(|t| now.duration_since(t).as_secs_f32() >= 0.5);
+        if stale {
+            self.extras.cached_doc_id = self.game.doc.id;
+            self.extras.cached_instances = self.game.doc.dom.descendants().count();
+            self.extras.cached_at = Some(now);
+        }
+        let instances = self.extras.cached_instances;
+        let parts = self.game.scene.parts.len();
         let mode = if self.game.play.is_some() { "PLAY" } else { "EDIT" };
         let fps = self.fps;
         let fps_col = if fps >= 50.0 {

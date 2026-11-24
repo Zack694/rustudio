@@ -577,8 +577,8 @@ pub struct Gui {
     root_boxes: rustc_hash::FxHashMap<Ref, Vec<(Ref, GuiBox)>>,
     /// ScreenGuis drawn as they were last frame (gui_input.rs `RootCache`).
     cache: rustc_hash::FxHashMap<Ref, input::RootCache>,
-    /// Model billboard anchors, invalidated through the document journal.
-    billboard_model_centers: HashMap<Ref, Option<Vec3>>,
+    /// Model billboard AABB `(center, half_extents)`, invalidated through the document journal.
+    billboard_model_centers: HashMap<Ref, Option<(Vec3, Vec3)>>,
     /// Workspace SurfaceGuis' own placement properties (gui_input.rs
     /// `SurfaceSpec`), invalidated through the document journal.
     surface_specs: rustc_hash::FxHashMap<Ref, input::SurfaceSpec>,

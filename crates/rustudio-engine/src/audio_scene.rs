@@ -7,13 +7,17 @@ use rustudio_core::{
 use rustudio_render::scene::{self, xform_of};
 use glam::{Mat3, Vec3};
 use rbx_dom_weak::types::{Ref, Variant};
-fn number(d: &Document, r: Ref, k: &str, default: f32) -> f32 {
+fn number_opt(d: &Document, r: Ref, k: &str) -> Option<f32> {
     match d.prop(r, k) {
-        Some(Variant::Float32(x)) => x,
-        Some(Variant::Float64(x)) => x as f32,
-        Some(Variant::Int32(x)) => x as f32,
-        _ => default,
+        Some(Variant::Float32(x)) => Some(x),
+        Some(Variant::Float64(x)) => Some(x as f32),
+        Some(Variant::Int32(x)) => Some(x as f32),
+        _ => None,
     }
+}
+
+fn number(d: &Document, r: Ref, k: &str, default: f32) -> f32 {
+    number_opt(d, r, k).unwrap_or(default)
 }
 fn effects(d: &Document, r: Ref) -> Vec<Effect> {
     let mut out = vec![];
@@ -221,11 +225,19 @@ pub fn settings(
                 .find_child(d.dom.root_ref(), "SoundService")
                 .unwrap_or_else(Ref::none);
             let scale = number(d, service, "RolloffScale", 1.);
+            // Roblox docs: EmitterSize and MaxDistance are legacy serialized
+            // aliases for RollOffMinDistance and RollOffMaxDistance.
+            let min_dist = number_opt(d, r, "RollOffMinDistance")
+                .or_else(|| number_opt(d, r, "EmitterSize"))
+                .unwrap_or(10.);
+            let max_dist = number_opt(d, r, "RollOffMaxDistance")
+                .or_else(|| number_opt(d, r, "MaxDistance"))
+                .unwrap_or(10000.);
             s.gain = rolloff(
                 scene::enum_u32(d.prop(r, "RollOffMode")).unwrap_or(0),
                 distance,
-                number(d, r, "RollOffMinDistance", 10.),
-                number(d, r, "RollOffMaxDistance", 10000.),
+                min_dist,
+                max_dist,
                 scale,
             );
             s.pan = Some(delta.normalize_or_zero().dot(right));
@@ -312,5 +324,31 @@ mod tests {
             )),
         );
         assert_eq!(s.gain, 1.);
+    }
+
+    #[test]
+    fn audio_legacy_emitter_size_and_max_distance_fallback() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let part = d.dom.insert(
+            ws,
+            InstanceBuilder::new("Part").with_property(
+                "CFrame",
+                rbx_dom_weak::types::CFrame::new(
+                    rbx_dom_weak::types::Vector3::new(40., 0., 0.),
+                    rbx_dom_weak::types::Matrix3::identity(),
+                ),
+            ),
+        );
+        let sound = d.dom.insert(
+            part,
+            InstanceBuilder::new("Sound")
+                .with_property("EmitterSize", 20f32)
+                .with_property("MaxDistance", 50f32),
+        );
+        let (_, s) = settings(&d, sound, Vec3::ZERO, Vec3::X, None);
+        assert!((s.gain - 0.5).abs() < 1e-6, "EmitterSize=20 at d=40 should yield 0.5 gain, got {}", s.gain);
+        let (_, far) = settings(&d, sound, Vec3::new(-20., 0., 0.), Vec3::X, None);
+        assert_eq!(far.gain, 0., "MaxDistance=50 at d=60 should silence sound");
     }
 }

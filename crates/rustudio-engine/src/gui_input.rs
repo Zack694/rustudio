@@ -360,7 +360,7 @@ impl Gui {
                                 self.billboard_model_centers.clear();
                                 break;
                             }
-                            doc::Mark::Prop(r, name) if matches!(name.as_str(), "CFrame" | "Position" | "Orientation" | "Rotation") => {
+                            doc::Mark::Prop(r, name) if matches!(name.as_str(), "CFrame" | "Position" | "Orientation" | "Rotation" | "Size") => {
                                 let mut part = r;
                                 while let Some(inst) = d.dom.get_by_ref(part) {
                                     self.billboard_model_centers.remove(&part);
@@ -2925,7 +2925,7 @@ fn place_3d(
     view_proj: &glam::Mat4,
     rect: Rect,
     g: Ref,
-    model_centers: &mut HashMap<Ref, Option<Vec3>>,
+    model_centers: &mut HashMap<Ref, Option<(Vec3, Vec3)>>,
 ) -> Option<(Target, [f32; 2], f32)> {
     let class = d.class_of(g)?;
     let adornee = match d.prop(g, "Adornee") {
@@ -2941,13 +2941,17 @@ fn place_3d(
         let spec = SurfaceSpec::read(d, g)?;
         return spec.place(d, cam);
     }
-    // BillboardGui: over a part, attachment or model.
-    let part_position = |r| match d.prop(r, "CFrame") {
-        Some(Variant::CFrame(cf)) => Some(Vec3::new(cf.position.x, cf.position.y, cf.position.z)),
-        _ => None,
+    // BillboardGui: over a part, attachment or model. Compute both the world
+    // AABB center and half-extents so ExtentsOffset / ExtentsOffsetWorldSpace
+    // match Roblox Studio's documented bounding-box scaling.
+    let part_bounds = |r: Ref| -> Option<(Vec3, Vec3)> {
+        let xf = xform_of(d, r)?;
+        let h = vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::ZERO) * 0.5;
+        let ext = xf.rot.x_axis.abs() * h.x + xf.rot.y_axis.abs() * h.y + xf.rot.z_axis.abs() * h.z;
+        Some((xf.pos, ext))
     };
-    let base = if doc::is_a(&host_class, "BasePart") {
-        part_position(host)?
+    let (base, half_extents) = if doc::is_a(&host_class, "BasePart") {
+        part_bounds(host)?
     } else if host_class == "Attachment" {
         let pxf = xform_of(d, d.dom.get_by_ref(host)?.parent())?;
         let cf = match d.prop(host, "CFrame") {
@@ -2957,22 +2961,34 @@ fn place_3d(
                 rot: Mat3::IDENTITY,
             },
         };
-        pxf.apply(cf.pos)
+        (pxf.apply(cf.pos), Vec3::ZERO)
     } else if doc::is_a(&host_class, "Model") {
         (*model_centers.entry(host).or_insert_with(|| {
-            let (sum, count) = d.dom.descendants_of(host)
-                .filter(|i| doc::is_a(&i.class, "BasePart"))
-                .filter_map(|i| part_position(i.referent()))
-                .fold((Vec3::ZERO, 0u32), |(sum, count), pos| (sum + pos, count + 1));
-            (count > 0).then(|| sum / count as f32)
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            let mut any = false;
+            for i in d.dom.descendants_of(host).filter(|i| doc::is_a(&i.class, "BasePart")) {
+                if let Some((pos, ext)) = part_bounds(i.referent()) {
+                    lo = lo.min(pos - ext);
+                    hi = hi.max(pos + ext);
+                    any = true;
+                }
+            }
+            any.then(|| ((lo + hi) * 0.5, (hi - lo) * 0.5))
         }))?
     } else {
         return None;
     };
     let world_off = vec3_of(d.prop(g, "StudsOffsetWorldSpace")).unwrap_or(Vec3::ZERO);
     let cam_off = vec3_of(d.prop(g, "StudsOffset")).unwrap_or(Vec3::ZERO);
-    let p = base + world_off + cam.right() * cam_off.x + cam.up() * cam_off.y
-        - cam.forward() * cam_off.z;
+    let ext_world = vec3_of(d.prop(g, "ExtentsOffsetWorldSpace")).unwrap_or(Vec3::ZERO);
+    let ext_cam = vec3_of(d.prop(g, "ExtentsOffset")).unwrap_or(Vec3::ZERO);
+    let p = base
+        + world_off
+        + ext_world * half_extents
+        + cam.right() * (cam_off.x + ext_cam.x * half_extents.x)
+        + cam.up() * (cam_off.y + ext_cam.y * half_extents.y)
+        - cam.forward() * (cam_off.z + ext_cam.z * half_extents.z);
     let dist = (p - cam.pos).length();
     let max = num(d, g, "MaxDistance", 0.0);
     if max > 0.0 && max.is_finite() && dist > max {
@@ -3793,5 +3809,38 @@ mod touch_scroll_tests {
         gui.touch_input(&[touch(TouchState::Change, 100.0, 200.0)], rect);
         gui.touch_input(&[touch(TouchState::End, 100.0, 200.0)], rect);
         assert!(!gui.events.iter().any(|e| matches!(e, GuiEvent::ScrollDrag(..) | GuiEvent::Fling(..))), "{:?}", gui.events);
+    }
+
+    #[test]
+    fn billboard_extents_offset_world_and_camera_space() {
+        use rbx_dom_weak::{InstanceBuilder, types::{CFrame, Matrix3, UDim, UDim2, Vector3}};
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let part = doc.insert(
+            ws,
+            InstanceBuilder::new("Part")
+                .with_property("Size", Vector3::new(4.0, 10.0, 6.0))
+                .with_property("CFrame", CFrame::new(Vector3::new(0.0, 5.0, -20.0), Matrix3::identity())),
+        );
+        let bb = doc.insert(
+            part,
+            InstanceBuilder::new("BillboardGui")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 40)))
+                .with_property("ExtentsOffsetWorldSpace", Vector3::new(0.0, 1.0, 0.0))
+                .with_property("ExtentsOffset", Vector3::new(0.5, 0.0, 0.0)),
+        );
+        let mut cam = Camera::default();
+        cam.pos = Vec3::new(0.0, 5.0, 0.0);
+        cam.yaw = 0.0;
+        cam.pitch = 0.0;
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let vp = cam.view_proj(rect);
+        let mut cache = HashMap::new();
+        let (target, _, _) = place_3d(&doc, &cam, &vp, rect, bb, &mut cache).expect("billboard placed");
+        let Target::Billboard(_, world) = target else { panic!("expected billboard target") };
+        // Part center is (0, 5, -20) with half-extents (2, 5, 3).
+        // ExtentsOffsetWorldSpace (0,1,0) adds +5 on Y; ExtentsOffset (0.5,0,0) adds +1 along cam.right (+X).
+        assert!((world.y - 10.0).abs() < 1e-3, "expected Y=10.0, got {world:?}");
+        assert!((world.x - (cam.right().x * 1.0)).abs() < 1e-3, "expected X shift by 0.5*half_x, got {world:?}");
     }
 }

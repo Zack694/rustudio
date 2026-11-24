@@ -965,10 +965,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             288 => 1.0,  // Neon
             272 => 2.0,  // SmoothPlastic
             1568 => 3.0, // Glass
-            1584 => {
-                alpha *= 0.65; // ForceField (dedicated Fresnel energy-shield shader)
-                4.0
-            }
+            1584 => 6.0, // ForceField (Studio DefaultUnifiedForcefieldFS)
             _ => 0.0,
         }
     };
@@ -1661,5 +1658,21 @@ mod tests {
         assert_eq!(scene.parts.len(), 1);
         assert_eq!(scene.parts[0].r, part);
         assert_eq!(scene.parts[0].layer, Some(live));
+    }
+
+    #[test]
+    fn forcefield_material_uses_forcefield_shader_kind() {
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let part = doc.insert(
+            ws,
+            InstanceBuilder::new("Part")
+                .with_property("Material", rbx_dom_weak::types::Enum::from_u32(1584)),
+        );
+        let mut scene = Scene::default();
+        scene.sync(&mut doc);
+        let p = scene.parts.iter().find(|p| p.r == part).expect("ForceField part in scene");
+        assert_eq!(p.draw.material, 6.0);
+        assert!((p.draw.alpha - 1.0).abs() < 1e-6);
     }
 }

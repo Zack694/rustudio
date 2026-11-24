@@ -129,9 +129,11 @@ pub enum Reader {
     /// Edit-mode Sound preview playback and on-demand Sound loading
     /// (crates/rustudio-player/src/edit_audio.rs).
     EditAudio = 24,
+    /// Active ForceField instances under Workspace (crates/rustudio-render/src/adorn.rs).
+    ForceFields = 25,
 }
 
-const JOURNAL_READERS: usize = Reader::EditAudio as usize + 1;
+const JOURNAL_READERS: usize = Reader::ForceFields as usize + 1;
 
 /// What a reader gets back: everything changed (rebuild), or the new marks.
 pub enum Marks {

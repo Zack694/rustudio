@@ -42,6 +42,8 @@ pub enum AdornShape {
     Sphere,
     Cylinder,
     Cone,
+    /// Translucent Fresnel-rim energy shield sphere (ForceField spawn protection).
+    ForceFieldSphere,
 }
 
 /// One 3D adornment mesh instance to draw in world space, depth-tested against
@@ -107,19 +109,27 @@ pub fn collaborator_camera_draws(xf: Xform, color: [f32; 3]) -> [AdornDraw; 3] {
     [cyl, cone, sphere]
 }
 
-/// Builds shimmering translucent 3D energy-shield spheres (`AdornShape::Sphere`)
-/// for every active `ForceField` (`Visible != false`) inside `Workspace`,
-/// enclosing the ForceField's parent character/Model (or BasePart).
-pub fn forcefield_bubble_draws(doc: &rustudio_core::doc::Document, time_secs: f32) -> Vec<AdornDraw> {
+/// Builds shimmering translucent Fresnel energy-shield spheres
+/// (`AdornShape::ForceFieldSphere`) for every active `ForceField` (`Visible != false`)
+/// in `forcefields` that lives under `Workspace`, enclosing its parent character/Model
+/// or BasePart. Driven by `doc::ClassIndex` so frames with no ForceFields do O(1) work.
+pub fn forcefield_bubble_draws(
+    doc: &rustudio_core::doc::Document,
+    forcefields: &[rbx_dom_weak::types::Ref],
+    time_secs: f32,
+) -> Vec<AdornDraw> {
+    if forcefields.is_empty() {
+        return Vec::new();
+    }
     let Some(ws) = doc.workspace() else { return Vec::new() };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(forcefields.len() * 2);
     let pulse = 0.5 + 0.5 * (time_secs * 3.5).sin();
 
-    for inst in doc.dom.descendants_of(ws) {
-        if inst.class.as_str() != "ForceField" {
+    for &r in forcefields {
+        let Some(inst) = doc.dom.get_by_ref(r) else { continue };
+        if inst.class.as_str() != "ForceField" || !doc.is_ancestor(ws, r) {
             continue;
         }
-        let r = inst.referent();
         if matches!(doc.prop(r, "Visible"), Some(rbx_dom_weak::types::Variant::Bool(false))) {
             continue;
         }
@@ -162,19 +172,19 @@ pub fn forcefield_bubble_draws(doc: &rustudio_core::doc::Document, time_secs: f3
         }
         let center = (lo + hi) * 0.5;
         let radius = ((hi - lo).length() * 0.54).clamp(1.5, 14.0);
-        // Outer translucent cyan-blue shield shell
+        // Outer translucent Fresnel cyan-blue shield shell
         out.push(AdornDraw {
             xf: Xform { pos: center, rot: Mat3::IDENTITY },
             scale: Vec3::splat(radius * (1.0 + 0.025 * pulse)),
-            shape: AdornShape::Sphere,
-            color: [0.22, 0.72, 1.0, 0.16 + 0.06 * pulse],
+            shape: AdornShape::ForceFieldSphere,
+            color: [0.24, 0.76, 1.0, 0.34 + 0.14 * pulse],
         });
-        // Inner luminous rim shell
+        // Inner shimmering rim shell
         out.push(AdornDraw {
             xf: Xform { pos: center, rot: Mat3::IDENTITY },
             scale: Vec3::splat(radius * (0.94 - 0.015 * pulse)),
-            shape: AdornShape::Sphere,
-            color: [0.55, 0.88, 1.0, 0.10 + 0.04 * (1.0 - pulse)],
+            shape: AdornShape::ForceFieldSphere,
+            color: [0.62, 0.90, 1.0, 0.22 + 0.10 * (1.0 - pulse)],
         });
     }
     out
@@ -202,6 +212,7 @@ struct AdornInst {
 struct Params {
     view_proj: [[f32; 4]; 4],
     light_dir: [f32; 4],
+    cam_pos: [f32; 4],
 }
 
 struct GpuMesh {
@@ -327,6 +338,7 @@ const SHADER_BODY: &str = r#"
 struct Params {
     view_proj: mat4x4<f32>,
     light_dir: vec4<f32>,
+    cam_pos: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> p: Params;
 
@@ -344,6 +356,8 @@ struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) world: vec3<f32>,
+    @location(3) mode: f32,
 };
 
 @vertex
@@ -358,6 +372,8 @@ fn vs_main(v: VIn) -> VOut {
     out.clip = p.view_proj * vec4<f32>(world, 1.0);
     out.normal = wn;
     out.color = v.color;
+    out.world = world;
+    out.mode = v.scale.w;
     return out;
 }
 
@@ -369,6 +385,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         discard;
     }
     let n = normalize(in.normal);
+    if in.mode > 0.5 {
+        // ForceField Fresnel energy-shield rim: transparent center, luminous edge.
+        let view = normalize(p.cam_pos.xyz - in.world);
+        let rim = pow(1.0 - clamp(abs(dot(n, view)), 0.0, 1.0), 2.1);
+        let alpha = clamp(in.color.a * (0.14 + rim * 1.65), 0.0, 0.92);
+        return vec4<f32>(in.color.rgb * (0.75 + rim * 1.1), alpha);
+    }
     let ndl = max(dot(n, p.light_dir.xyz), 0.0);
     let shade = 0.55 + 0.45 * ndl;
     return vec4<f32>(in.color.rgb * shade, in.color.a);
@@ -511,6 +534,7 @@ impl AdornPass {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         device: &wgpu::Device,
@@ -518,6 +542,7 @@ impl AdornPass {
         depth_view: &wgpu::TextureView,
         display_view: &wgpu::TextureView,
         view_proj: Mat4,
+        cam_pos: Vec3,
         list: &[AdornDraw],
     ) {
         if list.is_empty() {
@@ -536,6 +561,7 @@ impl AdornPass {
         let params = Params {
             view_proj: view_proj.to_cols_array_2d(),
             light_dir: [light.x, light.y, light.z, 0.0],
+            cam_pos: [cam_pos.x, cam_pos.y, cam_pos.z, 0.0],
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
@@ -549,7 +575,12 @@ impl AdornPass {
                     r0: [c0.x, c0.y, c0.z, d.xf.pos.x],
                     r1: [c1.x, c1.y, c1.z, d.xf.pos.y],
                     r2: [c2.x, c2.y, c2.z, d.xf.pos.z],
-                    scale: [d.scale.x, d.scale.y, d.scale.z, 0.0],
+                    scale: [
+                        d.scale.x,
+                        d.scale.y,
+                        d.scale.z,
+                        if d.shape == AdornShape::ForceFieldSphere { 1.0 } else { 0.0 },
+                    ],
                     color: d.color,
                 }
             })
@@ -585,7 +616,7 @@ impl AdornPass {
             pass.set_vertex_buffer(1, self.insts.slice(..));
             for (idx, item) in list.iter().enumerate() {
                 let mesh = match item.shape {
-                    AdornShape::Sphere => &self.sphere,
+                    AdornShape::Sphere | AdornShape::ForceFieldSphere => &self.sphere,
                     AdornShape::Cylinder => &self.cylinder,
                     AdornShape::Cone => &self.cone,
                 };
@@ -656,5 +687,29 @@ mod tests {
                 assert!(cross.dot(n) > 0.0, "{name} triangle has inward winding");
             }
         }
+    }
+
+    #[test]
+    fn forcefield_bubble_respects_visible_and_uses_fresnel_shape() {
+        use rbx_dom_weak::{InstanceBuilder, types::{CFrame, Matrix3, Vector3}};
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let part = doc.insert(
+            ws,
+            InstanceBuilder::new("Part")
+                .with_property("Size", Vector3::new(4.0, 6.0, 4.0))
+                .with_property("CFrame", CFrame::new(Vector3::new(1.0, 3.0, 2.0), Matrix3::identity())),
+        );
+        let vis = doc.insert(part, InstanceBuilder::new("ForceField"));
+        let hidden = doc.insert(
+            part,
+            InstanceBuilder::new("ForceField").with_property("Visible", false),
+        );
+        let draws = forcefield_bubble_draws(&doc, &[vis, hidden], 0.5);
+        assert_eq!(draws.len(), 2);
+        assert!(draws.iter().all(|d| d.shape == AdornShape::ForceFieldSphere));
+        assert!((draws[0].xf.pos - Vec3::new(1.0, 3.0, 2.0)).length() < 1e-4);
+        assert!(forcefield_bubble_draws(&doc, &[hidden], 0.5).is_empty());
+        assert!(forcefield_bubble_draws(&doc, &[], 0.5).is_empty());
     }
 }

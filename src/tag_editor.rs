@@ -201,7 +201,7 @@ impl Editor {
                 }
             }
             if !edits.is_empty() {
-                self.game.doc.set_props(format!("Delete tag {tag}"), edits, None);
+                self.game.doc.set_props(&format!("Delete tag {tag}"), edits, None);
             }
         }
     }
@@ -229,11 +229,8 @@ impl Editor {
             edits.push((r, ustr("Tags"), Variant::Tags(nt)));
         }
         if !edits.is_empty() {
-            self.game.doc.set_props(
-                if add { format!("Add tag {tag}") } else { format!("Remove tag {tag}") },
-                edits,
-                None,
-            );
+            let label = if add { format!("Add tag {tag}") } else { format!("Remove tag {tag}") };
+            self.game.doc.set_props(&label, edits, None);
         }
     }
 
@@ -343,7 +340,7 @@ impl Editor {
                 .into_iter()
                 .map(|r| (r, ustr("CollisionGroup"), Variant::String(g.clone())))
                 .collect();
-            self.game.doc.set_props(format!("Set CollisionGroup {g}"), edits, None);
+            self.game.doc.set_props(&format!("Set CollisionGroup {g}"), edits, None);
             self.tag_ed.status = Some(format!("Assigned selected parts to '{g}'"));
         }
         if dirty {
