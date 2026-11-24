@@ -2832,6 +2832,7 @@ pub struct Renderer {
     adorn: [Option<crate::adorn::AdornPass>; 3],
     /// The last frame's view-projection (Highlights draw with it).
     last_view_proj: Mat4,
+    last_cam_pos: Vec3,
     /// SurfaceGuis / BillboardGuis tested against the scene's depth (round 23).
     world_gui: [Option<crate::world_gui::WorldGuiPass>; 3],
     /// Terrain water (round 24, water.rs).
@@ -3699,6 +3700,7 @@ impl Renderer {
             highlight: [None, None, None],
             adorn: [None, None, None],
             last_view_proj: Mat4::IDENTITY,
+            last_cam_pos: Vec3::ZERO,
             glass_layout,
             material_epoch: Instant::now(),
             shadow,
@@ -5095,7 +5097,7 @@ impl Renderer {
         let Some(t) = self.target.as_ref() else { return };
         let pass = self.adorn[sample_slot(t.samples)]
             .get_or_insert_with(|| crate::adorn::AdornPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
-        pass.draw(&rs.device, &rs.queue, &t.depth, &t.display_view, self.last_view_proj, list);
+        pass.draw(&rs.device, &rs.queue, &t.depth, &t.display_view, self.last_view_proj, self.last_cam_pos, list);
     }
 
     /// Re-run post-processing after world GUIs and effects are drawn into HDR.
@@ -5174,6 +5176,7 @@ impl Renderer {
         // continuous across scene rebuilds, independently of lighting time.
         let mut globals = frame.globals;
         self.last_view_proj = Mat4::from_cols_array_2d(&frame.globals.view_proj);
+        self.last_cam_pos = Vec3::new(frame.globals.cam_pos[0], frame.globals.cam_pos[1], frame.globals.cam_pos[2]);
         if std::env::var_os("RUSTUDIO_RENDER_DIAGNOSTICS").is_some() {
             static LAST: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
             let state = [globals.cc_tint[3], globals.bloom[1], globals.bloom[0], globals.params[1]];

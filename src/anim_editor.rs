@@ -806,7 +806,7 @@ impl Editor {
         let (tl_rect, tl_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(120.0), tl_h), Sense::click_and_drag());
         let p = ui.painter();
         p.rect_filled(tl_rect, 4.0, theme::PANEL_DARK);
-        p.rect_stroke(tl_rect, 4.0, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+        p.rect_stroke(tl_rect, 4.0, Stroke::new(1.0, theme::DIVIDER), egui::StrokeKind::Inside);
         let dur = self.anim_ed.length.max(0.25);
         let pad_x = 10.0;
         let span_w = (tl_rect.width() - pad_x * 2.0).max(1.0);

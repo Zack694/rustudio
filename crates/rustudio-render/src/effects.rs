@@ -1261,6 +1261,7 @@ impl EmitterState {
 /// The camera as the effects need it.
 struct View<'a> {
     vp: Mat4,
+    planes: [glam::Vec4; 5],
     pos: Vec3,
     right: Vec3,
     up: Vec3,
@@ -1422,23 +1423,31 @@ fn particles_draw(
     // bounding sphere (lights and glass are picked per emitter).
     let mut lo = Vec3::splat(f32::MAX);
     let mut hi = Vec3::splat(f32::MIN);
-    let mut order: Vec<(f32, usize, Vec3)> = st
-        .particles
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let w = if c.locked { xf.pos + xf.rot * p.pos } else { p.pos };
-            lo = lo.min(w);
-            hi = hi.max(w);
-            ((w - view.pos).dot(view.forward), i, w)
-        })
-        .collect();
-    // (far first, ties in particle order: the order a stable sort by
-    // distance gives, the index making every key distinct)
-    order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut order: Vec<(f32, usize, Vec3)> = Vec::with_capacity(st.particles.len());
+    for (i, p) in st.particles.iter().enumerate() {
+        let w = if c.locked { xf.pos + xf.rot * p.pos } else { p.pos };
+        let depth = (w - view.pos).dot(view.forward);
+        if depth < 0.001 {
+            continue;
+        }
+        lo = lo.min(w);
+        hi = hi.max(w);
+        order.push((depth, i, w));
+    }
+    if order.is_empty() {
+        return None;
+    }
     let max_size = c.size.0.iter().map(|k| (k.1 + k.2.abs()) * mech::FX_PARTICLE_HALF_SIZE).fold(0.0f32, f32::max);
     let centre = (lo + hi) * 0.5;
     let radius = (hi - lo).length() * 0.5 + max_size;
+    // Skip emitters completely outside the view frustum before sorting, glass
+    // lookup, or consuming the per-frame particle budget.
+    if !crate::render::sphere_visible(&view.planes, centre, radius) {
+        return None;
+    }
+    // (far first, ties in particle order: the order a stable sort by
+    // distance gives, the index making every key distinct)
+    order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     // (RUSTUDIO_FX_LIGHT_CHECK: the lights the CPU reference reads)
     let lights = if view.check && c.look.lit() {
         view.light.near(centre, radius + mech::FX_LIGHT_TOWARD_CAMERA)
@@ -2193,6 +2202,7 @@ impl Effects {
             light: f.light,
             glass: f.glass,
             vp: cam.view_proj_reverse_z(f.rect),
+            planes: crate::render::frustum(cam.view_proj(f.rect)),
             pos: cam.pos,
             right: cam.right(),
             up: cam.up(),

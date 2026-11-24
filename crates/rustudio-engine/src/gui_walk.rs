@@ -1545,14 +1545,43 @@ impl<M: AutoText> Sizer<'_, M> {
             };
             ext = self.m.measure_text(d, r, wrap, scale);
         }
-        let kids: Vec<Ref> = children(d, r)
+        // Measure direct children and any nested Folder-held layout groups
+        // (matching `Walk::children` — closes ENGINE-GAPS AutomaticSize Folder gap).
+        fn collect_folders(d: &Document, parent: Ref, out: &mut Vec<Ref>) {
+            for c in children(d, parent) {
+                if d.class_of(c).as_deref() == Some("Folder") {
+                    out.push(c);
+                    collect_folders(d, c, out);
+                }
+            }
+        }
+        ext = ext.max(self.measure_group(r, inner, scale, auto, depth));
+        let mut folders = Vec::new();
+        collect_folders(d, r, &mut folders);
+        for folder in folders {
+            ext = ext.max(self.measure_group(folder, inner, scale, auto, depth));
+        }
+        egui::vec2(ext.x + pl + pr, ext.y + pt + pb)
+    }
+
+    fn measure_group(
+        &mut self,
+        group: Ref,
+        inner: Rect,
+        scale: f32,
+        auto: u32,
+        depth: usize,
+    ) -> egui::Vec2 {
+        let d = self.d;
+        let mut ext = egui::Vec2::ZERO;
+        let kids: Vec<Ref> = children(d, group)
             .into_iter()
             .filter(|c| {
                 d.class_of(*c).is_some_and(|k| doc::is_a(&k, "GuiObject"))
                     && boolp(d, *c, "Visible", true)
             })
             .collect();
-        if let Some(lay) = child_of_class(d, r, "UIListLayout") {
+        if let Some(lay) = child_of_class(d, group, "UIListLayout") {
             let vertical = enum_u32(d.prop(lay, "FillDirection")).unwrap_or(1) == 1;
             let p = udim(d, lay, "Padding");
             let gap =
@@ -1578,7 +1607,7 @@ impl<M: AutoText> Sizer<'_, M> {
                 egui::vec2(along, across)
             };
             ext = ext.max(e);
-        } else if let Some(lay) = child_of_class(d, r, "UIGridLayout") {
+        } else if let Some(lay) = child_of_class(d, group, "UIGridLayout") {
             // A grid holds its cells (CellSize, not the children's Size), in
             // as many lines as the fill axis fits (as `children` places them).
             let vertical = enum_u32(d.prop(lay, "FillDirection")).unwrap_or(1) == 1;
@@ -1625,7 +1654,7 @@ impl<M: AutoText> Sizer<'_, M> {
                     rows as f32 * ch + rows.saturating_sub(1) as f32 * py,
                 ));
             }
-        } else if let Some(lay) = child_of_class(d, r, "UITableLayout") {
+        } else if let Some(lay) = child_of_class(d, group, "UITableLayout") {
             let major_col = enum_u32(d.prop(lay, "MajorAxis")).unwrap_or(0) == 1;
             let sort_order = enum_u32(d.prop(lay, "SortOrder")).unwrap_or(2);
             let pad = udim2(d, lay, "Padding");
@@ -1698,7 +1727,7 @@ impl<M: AutoText> Sizer<'_, M> {
                 ext = ext.max(at + egui::vec2(s.x * (1.0 - anchor[0]), s.y * (1.0 - anchor[1])));
             }
         }
-        egui::vec2(ext.x + pl + pr, ext.y + pt + pb)
+        ext
     }
 
     /// A child's size as its AutomaticSize parent (growing on `auto`'s axes)
@@ -4090,6 +4119,48 @@ mod layout_tests {
             // Overflow = 60: `a` hits MinSize 80 (shrinks 20), `b` absorbs remaining 40 -> 60.
             assert!((bx(a).size[0] - 80.0).abs() < 0.01);
             assert!((bx(b_ref).size[0] - 60.0).abs() < 0.01);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn automatic_size_measures_folder_held_list() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let holder = doc.dom.insert(
+            root,
+            InstanceBuilder::new("Frame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0)))
+                .with_property("AutomaticSize", Enum::from_u32(3)),
+        );
+        let folder = doc.dom.insert(holder, InstanceBuilder::new("Folder"));
+        doc.dom.insert(
+            folder,
+            InstanceBuilder::new("UIListLayout")
+                .with_property("FillDirection", Enum::from_u32(0))
+                .with_property("Padding", UDim::new(0.0, 5)),
+        );
+        for n in 0..3 {
+            doc.dom.insert(
+                folder,
+                InstanceBuilder::new("TextButton")
+                    .with_property("LayoutOrder", n)
+                    .with_property("Size", UDim2::new(UDim::new(0.0, 40), UDim::new(0.0, 24))),
+            );
+        }
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(root, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let h = walk.boxes.iter().find(|(k, _)| *k == holder).unwrap().1;
+            // 3 buttons * 40 px + 2 * 5 px gaps = 130 px wide, 24 px tall.
+            assert!((h.size[0] - 130.0).abs() < 0.01 && (h.size[1] - 24.0).abs() < 0.01, "expected 130x24, got {:?}", h.size);
         });
         out.textures_delta.clear();
     }

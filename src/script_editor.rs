@@ -314,16 +314,16 @@ fn builtin_completions(text: &str, cursor_chars: usize) -> Vec<(String, String)>
     }
     let low = prefix.to_ascii_lowercase();
     let mut out: Vec<(String, String)> = Vec::new();
-    let mut push = |item: &str| {
-        if item.to_ascii_lowercase().starts_with(&low) && item != prefix && !out.iter().any(|(l, _)| l == item) {
+    fn push_item(out: &mut Vec<(String, String)>, low: &str, prefix: &str, item: &str) {
+        if item.to_ascii_lowercase().starts_with(low) && item != prefix && !out.iter().any(|(l, _)| l == item) {
             out.push((item.to_string(), item.to_string()));
         }
-    };
+    }
     for &k in KEYWORDS {
-        push(k);
+        push_item(&mut out, &low, &prefix, k);
     }
     for &g in GLOBALS {
-        push(g);
+        push_item(&mut out, &low, &prefix, g);
     }
     for svc in [
         "Players", "Workspace", "ReplicatedStorage", "ServerScriptService", "ServerStorage",
@@ -335,12 +335,12 @@ fn builtin_completions(text: &str, cursor_chars: usize) -> Vec<(String, String)>
         "GetService", "WaitForChild", "FindFirstChild", "FindFirstChildOfClass",
         "GetChildren", "GetDescendants", "IsA", "Connect", "Once", "Clone", "Destroy",
     ] {
-        push(svc);
+        push_item(&mut out, &low, &prefix, svc);
     }
     if out.len() < 12 {
         if let Some(api) = rustudio_core::api::get() {
             for cname in &api.class_order {
-                push(cname);
+                push_item(&mut out, &low, &prefix, cname);
                 if out.len() >= 12 {
                     break;
                 }
