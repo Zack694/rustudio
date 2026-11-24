@@ -107,6 +107,79 @@ pub fn collaborator_camera_draws(xf: Xform, color: [f32; 3]) -> [AdornDraw; 3] {
     [cyl, cone, sphere]
 }
 
+/// Builds shimmering translucent 3D energy-shield spheres (`AdornShape::Sphere`)
+/// for every active `ForceField` (`Visible != false`) inside `Workspace`,
+/// enclosing the ForceField's parent character/Model (or BasePart).
+pub fn forcefield_bubble_draws(doc: &rustudio_core::doc::Document, time_secs: f32) -> Vec<AdornDraw> {
+    let Some(ws) = doc.workspace() else { return Vec::new() };
+    let mut out = Vec::new();
+    let pulse = 0.5 + 0.5 * (time_secs * 3.5).sin();
+
+    for inst in doc.dom.descendants_of(ws) {
+        if inst.class.as_str() != "ForceField" {
+            continue;
+        }
+        let r = inst.referent();
+        if matches!(doc.prop(r, "Visible"), Some(rbx_dom_weak::types::Variant::Bool(false))) {
+            continue;
+        }
+        let parent = inst.parent();
+        let Some(p_inst) = doc.dom.get_by_ref(parent) else { continue };
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        let mut any = false;
+
+        let mut check_part = |pr: rbx_dom_weak::types::Ref| {
+            let Some(pi) = doc.dom.get_by_ref(pr) else { return };
+            if !rustudio_core::doc::is_a(pi.class.as_str(), "BasePart") {
+                return;
+            }
+            if let (Some(xf), Some(sz)) = (
+                rustudio_core::doc::xform_of(doc, pr),
+                rustudio_core::doc::vec3_of(doc.prop(pr, "Size")),
+            ) {
+                let half = sz * 0.5;
+                let ext = xf.rot.x_axis.abs() * half.x
+                    + xf.rot.y_axis.abs() * half.y
+                    + xf.rot.z_axis.abs() * half.z;
+                if ext.is_finite() && xf.pos.is_finite() {
+                    lo = lo.min(xf.pos - ext);
+                    hi = hi.max(xf.pos + ext);
+                    any = true;
+                }
+            }
+        };
+
+        if rustudio_core::doc::is_a(p_inst.class.as_str(), "BasePart") {
+            check_part(parent);
+        } else {
+            for d in doc.dom.descendants_of(parent) {
+                check_part(d.referent());
+            }
+        }
+        if !any {
+            continue;
+        }
+        let center = (lo + hi) * 0.5;
+        let radius = ((hi - lo).length() * 0.54).clamp(1.5, 14.0);
+        // Outer translucent cyan-blue shield shell
+        out.push(AdornDraw {
+            xf: Xform { pos: center, rot: Mat3::IDENTITY },
+            scale: Vec3::splat(radius * (1.0 + 0.025 * pulse)),
+            shape: AdornShape::Sphere,
+            color: [0.22, 0.72, 1.0, 0.16 + 0.06 * pulse],
+        });
+        // Inner luminous rim shell
+        out.push(AdornDraw {
+            xf: Xform { pos: center, rot: Mat3::IDENTITY },
+            scale: Vec3::splat(radius * (0.94 - 0.015 * pulse)),
+            shape: AdornShape::Sphere,
+            color: [0.55, 0.88, 1.0, 0.10 + 0.04 * (1.0 - pulse)],
+        });
+    }
+    out
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct AdornVertex {

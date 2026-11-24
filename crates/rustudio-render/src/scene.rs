@@ -966,8 +966,8 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             272 => 2.0,  // SmoothPlastic
             1568 => 3.0, // Glass
             1584 => {
-                alpha *= 0.5; // ForceField
-                3.0
+                alpha *= 0.65; // ForceField (dedicated Fresnel energy-shield shader)
+                4.0
             }
             _ => 0.0,
         }

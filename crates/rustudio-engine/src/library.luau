@@ -1164,6 +1164,7 @@ function __rs_input_frame_end() mouse_delta = Vector2.zero end
 -- when it landed (the input action system's UIButton / UIModifier,
 -- domains/gui_input.luau).
 local touch_objects = {}
+local touch_gesture_targets = nil
 function __rs_touch_object(finger, state, x, y, dx, dy)
     local io = touch_objects[finger]
     if not io then
@@ -1176,6 +1177,9 @@ function __rs_touch_object(finger, state, x, y, dx, dy)
     return io
 end
 function __rs_touch_event(state, finger, x, y, dx, dy, gpe, began_on)
+    if state == "Begin" and type(began_on) == "table" and #began_on > 0 then
+        touch_gesture_targets = began_on
+    end
     local io = __rs_touch_object(finger, state, x, y, dx, dy)
     local uis = game:GetService("UserInputService")
     local sunk = false
@@ -1191,7 +1195,10 @@ function __rs_touch_event(state, finger, x, y, dx, dy, gpe, began_on)
     local processed = gpe == true or sunk
     fire(uis, state == "Begin" and "InputBegan" or over and "InputEnded" or "InputChanged", io, processed)
     fire(uis, state == "Begin" and "TouchStarted" or over and "TouchEnded" or "TouchMoved", io, processed)
-    if over then touch_objects[finger] = nil end
+    if over then
+        touch_objects[finger] = nil
+        if next(touch_objects) == nil then touch_gesture_targets = nil end
+    end
     return sunk
 end
 -- The fingers' gestures (src/touch_gestures.rs): UserInputService's
@@ -1203,20 +1210,54 @@ end
 function __rs_touch_gesture(kind, positions, a, b, c, d, state, gpe)
     local uis = game:GetService("UserInputService")
     gpe = gpe or false
+    local targets = touch_gesture_targets
     if kind == "Tap" then
         fire(uis, "TouchTap", positions, gpe)
     elseif kind == "TapInWorld" then
         fire(uis, "TouchTapInWorld", positions[1] or Vector2.zero, gpe)
     elseif kind == "LongPress" then
-        fire(uis, "TouchLongPress", positions, Enum.UserInputState[state], gpe)
+        local st = Enum.UserInputState[state]
+        fire(uis, "TouchLongPress", positions, st, gpe)
+        if targets then
+            for _, obj in ipairs(targets) do
+                fire(obj, "TouchLongPress", positions, st)
+            end
+        end
     elseif kind == "Pan" then
-        fire(uis, "TouchPan", positions, Vector2.new(a, b), Vector2.new(c, d), Enum.UserInputState[state], gpe)
+        local trans = Vector2.new(a, b)
+        local vel = Vector2.new(c, d)
+        local st = Enum.UserInputState[state]
+        fire(uis, "TouchPan", positions, trans, vel, st, gpe)
+        fire(uis, "TouchDrag", positions, trans, vel, st, gpe)
+        if targets then
+            for _, obj in ipairs(targets) do
+                fire(obj, "TouchPan", positions, trans, vel, st)
+            end
+        end
     elseif kind == "Pinch" then
-        fire(uis, "TouchPinch", positions, a, b, Enum.UserInputState[state], gpe)
+        local st = Enum.UserInputState[state]
+        fire(uis, "TouchPinch", positions, a, b, st, gpe)
+        if targets then
+            for _, obj in ipairs(targets) do
+                fire(obj, "TouchPinch", positions, a, b, st)
+            end
+        end
     elseif kind == "Rotate" then
-        fire(uis, "TouchRotate", positions, a, b, Enum.UserInputState[state], gpe)
+        local st = Enum.UserInputState[state]
+        fire(uis, "TouchRotate", positions, a, b, st, gpe)
+        if targets then
+            for _, obj in ipairs(targets) do
+                fire(obj, "TouchRotate", positions, a, b, st)
+            end
+        end
     elseif kind == "Swipe" then
-        fire(uis, "TouchSwipe", Enum.SwipeDirection[state], a, gpe)
+        local dir = Enum.SwipeDirection[state]
+        fire(uis, "TouchSwipe", dir, a, gpe)
+        if targets then
+            for _, obj in ipairs(targets) do
+                fire(obj, "TouchSwipe", dir, a)
+            end
+        end
     end
 end
 function M.GetLastInputType(self) return Enum.UserInputType[last_input()] end
