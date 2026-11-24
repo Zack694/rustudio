@@ -355,6 +355,7 @@ pub const WINDOW: &[M] = &[
     I("Output", "", "panel_output"),
     I("Activity History", "", "activity_history"),
     I("Asset Manager", "", "asset_manager"),
+    I("Studio Pro (Lighting / VFX / Templates)", "", "studio_tools"),
     I("Insert Object", "", "insert_object"),
     S,
     Sub("3D", &[

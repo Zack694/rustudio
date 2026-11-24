@@ -185,10 +185,12 @@ impl Editor {
                 }
             }
             "clip_editor" => {
-                if self.builtin_tools.plugins_enabled {
+                if self.builtin_tools.plugins_enabled
+                    && self.builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor")).is_some()
+                {
                     self.builtin_button_state("AnimationClipEditor", Some("Animations"), Some("Animation Editor"))
                 } else {
-                    (false, None)
+                    (true, open("Animation Editor"))
                 }
             }
             "avatar_setup" => {
@@ -220,12 +222,19 @@ impl Editor {
                 }
             }
             "tag_editor" => {
-                if self.builtin_tools.plugins_enabled {
+                if self.builtin_tools.plugins_enabled
+                    && self.builtin_plugin_button("TagEditor", Some("tagEditorToolbar"), Some("TagEditor")).is_some()
+                {
                     self.builtin_button_state("TagEditor", Some("tagEditorToolbar"), Some("TagEditor"))
                 } else {
-                    (false, None)
+                    (true, open("Tag Editor"))
                 }
             }
+            "collision_groups" => (true, open("Collision Groups")),
+            "find_in_place" => (true, open("Find in Place")),
+            "studio_tools" | "device_simulator" => (true, open("Studio Pro")),
+            "stats" | "render_stats" => (true, Some(self.extras.show_perf_hud)),
+            "format_document" | "goto_line" => (edit, None),
             "audio_discovery" => {
                 if self.builtin_tools.plugins_enabled {
                     self.builtin_button_state("AudioDiscovery", Some("Audio Discovery"), Some("View Sounds"))
@@ -316,7 +325,7 @@ impl Editor {
             a if a.starts_with("manage_plugins:") => (true, None),
             "plugins_folder" => (true, None),
             "save_local_plugin" | "publish_plugin" => (edit && sel, None),
-            "command_bar" => (false, Some(false)),
+            "command_bar" => (true, open("Command Bar")),
             // Ribbon-only actions.
             "transform" => (true, None),
             "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => {
@@ -590,7 +599,13 @@ impl Editor {
                 }
             }
             "clip_editor" => {
-                self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"));
+                if self.builtin_tools.plugins_enabled
+                    && self.builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor")).is_some()
+                {
+                    self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"));
+                } else {
+                    self.ui.panel_requests.push((Tab::AnimationEditor, None));
+                }
             }
             "avatar_setup" => {
                 self.trigger_builtin_plugin_button("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"));
@@ -605,8 +620,25 @@ impl Editor {
                 self.trigger_builtin_plugin_button("DraftsWidget", Some("draftsToolbar"), Some("draftsButton"));
             }
             "tag_editor" => {
-                self.trigger_builtin_plugin_button("TagEditor", Some("tagEditorToolbar"), Some("TagEditor"));
+                if self.builtin_tools.plugins_enabled
+                    && self.builtin_plugin_button("TagEditor", Some("tagEditorToolbar"), Some("TagEditor")).is_some()
+                {
+                    self.trigger_builtin_plugin_button("TagEditor", Some("tagEditorToolbar"), Some("TagEditor"));
+                } else {
+                    self.ui.panel_requests.push((Tab::TagEditor, None));
+                }
             }
+            "command_bar" => self.ui.panel_requests.push((Tab::CommandBar, None)),
+            "collision_groups" => self.ui.panel_requests.push((Tab::CollisionGroups, None)),
+            "find_in_place" => self.ui.panel_requests.push((Tab::FindInPlace, None)),
+            "studio_tools" => self.ui.panel_requests.push((Tab::StudioTools, None)),
+            "device_simulator" => {
+                self.extras.tab = crate::studio_extras::ProTab::DeviceEmu;
+                self.ui.panel_requests.push((Tab::StudioTools, Some(true)));
+            }
+            "stats" | "render_stats" => self.extras.show_perf_hud = !self.extras.show_perf_hud,
+            "format_document" => self.format_active_script(),
+            "goto_line" => self.scripts.show_goto = !self.scripts.show_goto,
             "audio_discovery" => {
                 self.trigger_builtin_plugin_button("AudioDiscovery", Some("Audio Discovery"), Some("View Sounds"));
             }

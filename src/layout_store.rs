@@ -38,6 +38,12 @@ pub enum SavedTab {
     AssetManager,
     FileSync,
     Profiler,
+    AnimationEditor,
+    CommandBar,
+    TagEditor,
+    CollisionGroups,
+    FindInPlace,
+    StudioTools,
 }
 
 impl SavedTab {
@@ -53,6 +59,12 @@ impl SavedTab {
             Tab::AssetManager => SavedTab::AssetManager,
             Tab::FileSync => SavedTab::FileSync,
             Tab::Profiler => SavedTab::Profiler,
+            Tab::AnimationEditor => SavedTab::AnimationEditor,
+            Tab::CommandBar => SavedTab::CommandBar,
+            Tab::TagEditor => SavedTab::TagEditor,
+            Tab::CollisionGroups => SavedTab::CollisionGroups,
+            Tab::FindInPlace => SavedTab::FindInPlace,
+            Tab::StudioTools => SavedTab::StudioTools,
             Tab::Script(_) | Tab::Plugin(_) => return None,
         })
     }
@@ -68,6 +80,12 @@ impl SavedTab {
             SavedTab::AssetManager => Tab::AssetManager,
             SavedTab::FileSync => Tab::FileSync,
             SavedTab::Profiler => Tab::Profiler,
+            SavedTab::AnimationEditor => Tab::AnimationEditor,
+            SavedTab::CommandBar => Tab::CommandBar,
+            SavedTab::TagEditor => Tab::TagEditor,
+            SavedTab::CollisionGroups => Tab::CollisionGroups,
+            SavedTab::FindInPlace => Tab::FindInPlace,
+            SavedTab::StudioTools => Tab::StudioTools,
         }
     }
 }

@@ -253,6 +253,102 @@ pub struct ScriptTabs {
     /// Lines (1-based) to put the cursor on and scroll to once the tab
     /// draws (the profiler's "Open script at line N").
     pub goto: HashMap<Ref, usize>,
+    pub active: Option<Ref>,
+    pub show_find: bool,
+    pub find_query: String,
+    pub replace_with: String,
+    pub show_goto: bool,
+    pub goto_input: String,
+}
+
+const SCRIPT_SNIPPETS: &[(&str, &str)] = &[
+    ("PlayerAdded", "local Players = game:GetService(\"Players\")\nPlayers.PlayerAdded:Connect(function(player)\n\tprint(player.Name, \"joined\")\nend)\n"),
+    ("InputBegan", "local UIS = game:GetService(\"UserInputService\")\nUIS.InputBegan:Connect(function(input, gp)\n\tif gp then return end\n\tif input.KeyCode == Enum.KeyCode.E then\n\t\t\n\tend\nend)\n"),
+    ("Heartbeat", "local RunService = game:GetService(\"RunService\")\nRunService.Heartbeat:Connect(function(dt)\n\t\nend)\n"),
+    ("Tween", "local TweenService = game:GetService(\"TweenService\")\nTweenService:Create(part, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {\n\tPosition = part.Position + Vector3.new(0, 5, 0),\n}):Play()\n"),
+    ("Raycast", "local params = RaycastParams.new()\nparams.FilterType = Enum.RaycastFilterType.Exclude\nlocal res = workspace:Raycast(origin, dir * 100, params)\nif res then\n\tprint(res.Instance, res.Position)\nend\n"),
+    ("Pathfinding", "local PathfindingService = game:GetService(\"PathfindingService\")\nlocal path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })\npath:ComputeAsync(startPos, goalPos)\nif path.Status == Enum.PathStatus.Success then\n\tfor _, wp in ipairs(path:GetWaypoints()) do\n\t\thumanoid:MoveTo(wp.Position)\n\t\thumanoid.MoveToFinished:Wait()\n\tend\nend\n"),
+    ("RemoteEvent", "local ReplicatedStorage = game:GetService(\"ReplicatedStorage\")\nlocal remote = ReplicatedStorage:WaitForChild(\"MyRemote\")\nremote.OnServerEvent:Connect(function(player, ...)\n\t\nend)\n"),
+];
+
+/// Simple Luau auto-indenter for Script > Format Document.
+pub fn format_luau(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 64);
+    let mut indent: usize = 0;
+    for raw in src.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let first = trimmed.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+        let dedent = matches!(first, "end" | "else" | "elseif" | "until") || trimmed.starts_with('}') || trimmed.starts_with(')');
+        if dedent {
+            indent = indent.saturating_sub(1);
+        }
+        for _ in 0..indent {
+            out.push('\t');
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+        let opens = (trimmed.ends_with("then") || trimmed.ends_with("do") || trimmed.ends_with("else") || trimmed.ends_with("repeat") || trimmed.ends_with('{') || trimmed.starts_with("function ") || trimmed.starts_with("local function "))
+            && !trimmed.ends_with("end");
+        if opens {
+            indent += 1;
+        }
+    }
+    out
+}
+
+/// Built-in Luau + Roblox API autocomplete (fallback when no plugin provides completions).
+fn builtin_completions(text: &str, cursor_chars: usize) -> Vec<(String, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let end = cursor_chars.min(chars.len());
+    let mut start = end;
+    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+        start -= 1;
+    }
+    let prefix: String = chars[start..end].iter().collect();
+    if prefix.len() < 2 {
+        return Vec::new();
+    }
+    let low = prefix.to_ascii_lowercase();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |item: &str| {
+        if item.to_ascii_lowercase().starts_with(&low) && item != prefix && !out.iter().any(|(l, _)| l == item) {
+            out.push((item.to_string(), item.to_string()));
+        }
+    };
+    for &k in KEYWORDS {
+        push(k);
+    }
+    for &g in GLOBALS {
+        push(g);
+    }
+    for svc in [
+        "Players", "Workspace", "ReplicatedStorage", "ServerScriptService", "ServerStorage",
+        "StarterGui", "StarterPack", "StarterPlayer", "Lighting", "RunService",
+        "UserInputService", "TweenService", "PathfindingService", "CollectionService",
+        "PhysicsService", "HttpService", "DataStoreService", "TeleportService",
+        "ContextActionService", "SoundService", "Debris", "MarketplaceService",
+        "KeyframeSequenceProvider", "TextService", "GuiService", "ProximityPromptService",
+        "GetService", "WaitForChild", "FindFirstChild", "FindFirstChildOfClass",
+        "GetChildren", "GetDescendants", "IsA", "Connect", "Once", "Clone", "Destroy",
+    ] {
+        push(svc);
+    }
+    if out.len() < 12 {
+        if let Some(api) = rustudio_core::api::get() {
+            for cname in &api.class_order {
+                push(cname);
+                if out.len() >= 12 {
+                    break;
+                }
+            }
+        }
+    }
+    out.truncate(12);
+    out
 }
 
 impl Editor {
@@ -263,7 +359,30 @@ impl Editor {
         }
     }
 
+    /// Formats the currently active script tab's Luau indentation.
+    pub fn format_active_script(&mut self) {
+        let Some(r) = self.scripts.active else { return };
+        if self.game.play.is_some() {
+            return;
+        }
+        if let Some(buf) = self.scripts.bufs.get_mut(&r) {
+            let formatted = format_luau(&buf.text);
+            if formatted != buf.text {
+                buf.text = formatted.clone();
+                buf.checked = None;
+                self.game.doc.set_props("Format script", vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(formatted))], None);
+            }
+        }
+    }
+
     pub fn script_tab_ui(&mut self, ui: &mut egui::Ui, r: Ref) {
+        self.scripts.active = Some(r);
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.scripts.show_find = !self.scripts.show_find;
+        }
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G)) {
+            self.scripts.show_goto = !self.scripts.show_goto;
+        }
         self.live_draft_toolbar(ui,r);
         let Some(inst) = self.game.doc.dom.get_by_ref(r) else {
             ui.add_space(12.0);
@@ -328,6 +447,7 @@ impl Editor {
         }
         let Some(buf) = self.scripts.bufs.get_mut(&r) else { return };
 
+        let mut toolbar_changed = false;
         ui.horizontal(|ui| {
             icons::class_icon(ui, &class, 16.0);
             ui.label(RichText::new(&full_name).strong());
@@ -346,7 +466,65 @@ impl Editor {
                     ui.label(RichText::new("no syntax errors").small().color(color));
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ComboBox::from_id_salt(("script_snippets", r)).selected_text("+ Snippet").width(84.0).show_ui(ui, |ui| {
+                    for &(sname, scode) in SCRIPT_SNIPPETS {
+                        if ui.selectable_label(false, sname).clicked() {
+                            if !buf.text.ends_with('\n') && !buf.text.is_empty() {
+                                buf.text.push('\n');
+                            }
+                            buf.text.push_str(scode);
+                            buf.edited = Instant::now();
+                            buf.checked = None;
+                            toolbar_changed = true;
+                        }
+                    }
+                });
+                if ui.small_button("Format").on_hover_text("Auto-indent Luau").clicked() {
+                    buf.text = format_luau(&buf.text);
+                    buf.edited = Instant::now();
+                    buf.checked = None;
+                    toolbar_changed = true;
+                }
+                if ui.small_button("Line").on_hover_text("Go to line (Ctrl+G)").clicked() {
+                    self.scripts.show_goto = !self.scripts.show_goto;
+                }
+                if ui.small_button("Find").on_hover_text("Find & Replace (Ctrl+F)").clicked() {
+                    self.scripts.show_find = !self.scripts.show_find;
+                }
+            });
         });
+        if self.scripts.show_find {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.scripts.find_query).hint_text("Find…").desired_width(130.0));
+                ui.add(egui::TextEdit::singleline(&mut self.scripts.replace_with).hint_text("Replace…").desired_width(130.0));
+                let q = &self.scripts.find_query;
+                let hits = if q.is_empty() { 0 } else { buf.text.matches(q.as_str()).count() };
+                ui.label(RichText::new(format!("{hits} hit(s)")).small().color(theme::TEXT_DIM));
+                if ui.small_button("Replace All").clicked() && !q.is_empty() {
+                    buf.text = buf.text.replace(q.as_str(), &self.scripts.replace_with);
+                    buf.edited = Instant::now();
+                    toolbar_changed = true;
+                }
+                if ui.small_button("×").clicked() {
+                    self.scripts.show_find = false;
+                }
+            });
+        }
+        if self.scripts.show_goto {
+            ui.horizontal(|ui| {
+                ui.label("Go to line:");
+                let resp = ui.add(egui::TextEdit::singleline(&mut self.scripts.goto_input).desired_width(64.0));
+                if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.small_button("Go").clicked() {
+                    if let Ok(line_no) = self.scripts.goto_input.trim().parse::<usize>() {
+                        if line_no > 0 {
+                            self.scripts.goto.insert(r, line_no);
+                            self.scripts.show_goto = false;
+                        }
+                    }
+                }
+            });
+        }
         for (line, msg) in &buf.plugin_diags {
             ui.label(RichText::new(format!("⚠ line {line}: {msg}")).small().color(theme::ERROR));
         }
@@ -372,7 +550,7 @@ impl Editor {
         let bg = crate::studio_settings::script_colors().background;
         ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
         let error_line = buf.error.as_ref().map(|e| e.0);
-        let mut changed = false;
+        let mut changed = toolbar_changed;
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .id_salt(("script_scroll", r))
@@ -512,8 +690,13 @@ impl Editor {
                     .unwrap_or_default(),
                 _ => Vec::new(),
             };
+            let final_items = if items.is_empty() {
+                word_end.map(|end| builtin_completions(&text, end)).unwrap_or_default()
+            } else {
+                items
+            };
             if let Some(b) = self.scripts.bufs.get_mut(&r) {
-                b.completions = items;
+                b.completions = final_items;
             }
         }
         if buf_needs_repaint(self.scripts.bufs.get(&r)) {
