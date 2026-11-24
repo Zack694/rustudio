@@ -24,10 +24,12 @@
 
 pub mod bridge;
 mod exec;
+pub mod extra;
 pub mod project_apply;
 pub mod server;
 pub mod sessions;
 pub mod settings;
+pub mod templates;
 pub mod tools;
 pub mod tree;
 pub mod ui;
@@ -129,17 +131,29 @@ impl OutputMirror {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShotMode {
+    /// 3D viewport composited with all 2D ScreenGui / CoreGui / HUD overlays.
+    Viewport,
+    /// Full rustudio window (Explorer, Properties, Output, Ribbon, Viewport).
+    Window,
+    /// Raw 3D wgpu framebuffer without 2D egui overlays.
+    Scene3d,
+}
+
 pub(crate) enum Op {
     /// Luau running; `side` None = the edit DataModel.
     /// `done`: the outcome and frames since (prints arrive a frame or two later).
     Eval { side: Option<rustudio_engine::runtime::Side>, id: u64, out_from: u64, done: Option<(J, u32)> },
-    Shot { save: Option<PathBuf>, requested: bool, settled: bool, asked: Instant },
+    Shot { save: Option<PathBuf>, mode: ShotMode, requested: bool, settled: bool, asked: Instant },
     Play { want: bool },
     Input { until: f32 },
     /// A place opening (live: a Team Create join).
     Load { live: bool, frames: u32 },
     /// `failed_before`: the session's sync_failed when the wait began.
     TcWait { quiet: f32, out_from: u64, failed_before: bool },
+    /// Background network / asset operation (Toolbox, Inventory, Upload/Download, Publish).
+    AsyncJob { rx: std::sync::mpsc::Receiver<extra::AsyncOutcome>, label: String },
 }
 
 pub(crate) struct Pending {

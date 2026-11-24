@@ -2268,6 +2268,19 @@ impl Gui {
         self.vf_size.retain(|r, _| live.contains(r));
         self.vf_walked.retain(|r, _| live.contains(r));
     }
+
+    /// Snapshot of every laid-out GuiObject's last screen-space box
+    /// (AbsolutePosition, AbsoluteSize, rotation, TextBounds), used by
+    /// MCP's `inspect_gui` tool.
+    pub fn laid_out_boxes(&self) -> HashMap<Ref, GuiBox> {
+        let mut out = HashMap::new();
+        for list in self.root_boxes.values() {
+            for &(r, b) in list {
+                out.insert(r, b);
+            }
+        }
+        out
+    }
 }
 
 /// Builds a `vf::Request` for a `ViewportFrame` at `size` (shared by live GUI
