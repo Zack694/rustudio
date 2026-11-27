@@ -45,6 +45,8 @@ pub mod domains;
 pub mod security;
 #[path = "runtime_routes.rs"]
 mod routes;
+#[path = "content_wait.rs"]
+pub(crate) mod content_wait;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -182,6 +184,16 @@ pub struct World {
     pub died: Vec<Ref>,
     /// Players that asked for a new character (Player:LoadCharacter).
     pub load_character: Vec<Ref>,
+    /// Player:Kick messages from this VM's scripts. Per VM, so a kick a
+    /// stopping session makes (PlayerRemoving → a save library's session end
+    /// → Kick) can't reach the next Play's player.
+    pub kicks: Vec<String>,
+    /// game:BindToClose callbacks (server), with their registrant's identity.
+    pub close_callbacks: Vec<(Function, u8)>,
+    /// The DataModel is closing (Stop): BindToClose callbacks are running.
+    pub closing: bool,
+    /// The BindToClose threads begin_close started.
+    pub close_threads: Vec<Thread>,
     /// How this Play session's player arrived (a play-testing teleport's
     /// data: Player:GetJoinData); None for a Play joined without one.
     pub teleport_arrival: Option<crate::play_teleport::Arrival>,
@@ -605,6 +617,11 @@ pub struct Cache {
 
 struct Budget {
     start: Option<Instant>,
+    /// This resume ran out of time. Every call and loop edge then errors
+    /// (the interrupt stays armed) until the resume ends, so a pcall that
+    /// catches the timeout can't keep the thread spinning: the next edge
+    /// outside it errors again and the thread unwinds.
+    timed_out: bool,
 }
 
 /// Runs blocking work (a download a Roblox call would yield for, e.g.
@@ -678,6 +695,15 @@ mod interrupt_watchdog {
         if cb != 0 {
             let cb = cb as *mut ffi::lua_Callbacks;
             unsafe { std::ptr::write_volatile(&mut (*cb).interrupt, None) };
+        }
+    }
+
+    /// Arms `cb`'s interrupt now (a timed-out resume: every edge checks).
+    pub fn rearm(cb: usize) {
+        let vms = VMS.lock().unwrap();
+        if let Some(&(c, proc)) = vms.iter().find(|e| e.0 == cb) {
+            let c = c as *mut ffi::lua_Callbacks;
+            unsafe { std::ptr::write_volatile(&mut (*c).interrupt, Some(std::mem::transmute::<usize, Proc>(proc))) };
         }
     }
 
@@ -757,6 +783,10 @@ impl World {
             velocity_requests: Vec::new(),
             died: Vec::new(),
             load_character: Vec::new(),
+            kicks: Vec::new(),
+            close_callbacks: Vec::new(),
+            closing: false,
+            close_threads: Vec::new(),
             teleport_arrival: None,
             character_set: Vec::new(),
             keys_down: HashSet::new(),
@@ -2391,7 +2421,7 @@ pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal)
         return Some(store_prop_in_world(lua, w, r, *CFRAME, value).map(|_| no_dispatch));
     }
     let canon = info.canon.as_str();
-    if key == "FontSize" || canon == "Disabled" || (canon == "Health" && class == "Humanoid")
+    if key == "FontSize" || canon == "Disabled" || (matches!(canon, "Health" | "MaxHealth") && class == "Humanoid")
         || camera_zoom_opposite(class, canon).is_some()
     {
         return None;
@@ -4215,6 +4245,27 @@ fn newindex_routed(
             w.died.push(r);
         }
         return Ok(());
+    }
+    // MaxHealth lowered under Health: Health follows it (Roblox keeps
+    // Health within [0, MaxHealth], HealthChanged fires for the cut).
+    if class == "Humanoid" && canon == "MaxHealth" {
+        if let Variant::Float32(max) = v {
+            let health = match world(lua)?.d().prop(r, "Health") {
+                Some(Variant::Float32(h)) => h,
+                _ => 100.0,
+            };
+            store_prop(lua, r, canon, Variant::Float32(max))?;
+            if health > max {
+                store_prop(lua, r, "Health", Variant::Float32(max))?;
+                let mut w = world(lua)?;
+                w.fire(r, "HealthChanged", vec![Value::Number(max as f64)]);
+                if max <= 0.0 && health > 0.0 {
+                    w.fire(r, "Died", vec![]);
+                    w.died.push(r);
+                }
+            }
+            return Ok(());
+        }
     }
     let enabling = canon == "Disabled"
         && matches!(v, Variant::Bool(false))
@@ -6121,6 +6172,21 @@ pub fn luau_flags() {
                 eprintln!("rustudio: Luau flag {f} missing");
             }
         }
+        // RUSTUDIO_LUAU_FLAGS="LuauFastpcall,LuauCostModel=false": more
+        // of Luau's own feature flags (vendor/luau0-src/luau, LUAU_FASTFLAG;
+        // off by default in the open-source build), to try one on a device
+        // (adb shell setprop debug.rustudio.env …, docs/ANDROID.md).
+        if let Ok(list) = std::env::var("RUSTUDIO_LUAU_FLAGS") {
+            for item in list.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()) {
+                let (name, on) = match item.split_once('=') {
+                    Some((n, v)) => (n.trim(), !matches!(v.trim(), "0" | "false" | "off")),
+                    None => (item, true),
+                };
+                if Lua::set_fflag(name, on).is_err() {
+                    eprintln!("rustudio: Luau flag {name} missing (RUSTUDIO_LUAU_FLAGS)");
+                }
+            }
+        }
     });
 }
 
@@ -6180,7 +6246,7 @@ impl Runtime {
         sig_mt.raw_set("__mode", "vs").map_err(|e| e.to_string())?;
         sigs.set_metatable(Some(sig_mt)).map_err(|e| e.to_string())?;
         lua.set_app_data(Cache { weak: Some(weak), sigs: Some(sigs), ..Default::default() });
-        lua.set_app_data(Budget { start: None });
+        lua.set_app_data(Budget { start: None, timed_out: false });
         lua.set_app_data(ChildIndex::default());
         lua.set_app_data(ProfileDepth::default());
         security::install_thread_hook(&lua).map_err(|e| e.to_string())?;
@@ -6192,10 +6258,15 @@ impl Runtime {
         }
         .map_err(|e| e.to_string())?;
         lua.set_interrupt(move |lua| {
+            // A resume that timed out stays interrupted at every edge.
+            if lua.app_data_ref::<Budget>().is_some_and(|b| b.timed_out && b.start.is_some()) {
+                return Err(rt_err("Script timeout: exhausted allowed execution time"));
+            }
             // Armed by the watchdog (interrupt_watchdog): one check, then off.
             interrupt_watchdog::disarm(callbacks);
-            if let Some(b) = lua.app_data_ref::<Budget>() {
-                if let Some(s) = b.start {
+            let start = lua.app_data_ref::<Budget>().and_then(|b| b.start);
+            {
+                if let Some(s) = start {
                     // Studio Settings > Debugger > Script Timeout Length
                     // (0 or less: no limit; the default without the store).
                     let limit = domains::settings_host::num(
@@ -6219,6 +6290,11 @@ impl Runtime {
                             .find(|(s, _)| {
                                 !s.is_empty() && !s.starts_with("rustudio.") && s != "[C]"
                             });
+                        if let Some(mut b) = lua.app_data_mut::<Budget>() {
+                            b.timed_out = true;
+                        }
+                        // Keep the interrupt armed (see Budget::timed_out).
+                        interrupt_watchdog::rearm(callbacks);
                         return Err(rt_err(match at {
                             Some((s, Some(l))) => {
                                 format!("{s}:{l}: Script timeout: exhausted allowed execution time")
@@ -7062,6 +7138,7 @@ impl Runtime {
         g.set("__rs_call_action", Value::Nil)?;
         // UserGameSettings' values, for its property hooks (domains/services).
         lua.set_named_registry_value("rs_user_game_settings", g.get::<Table>("__rs_user_game_settings")?)?;
+        content_wait::install(lua)?;
         editable::install(lua)?;
         domains::install(lua)?;
         crate::dtmeta::install_all(lua)?;
@@ -7190,6 +7267,7 @@ impl Runtime {
             }
         }
         crate::globals_parity::sync(lua)?;
+        crate::globals_parity::freeze_libraries(lua)?;
         Ok(())
     }
 
@@ -7226,6 +7304,19 @@ impl Runtime {
     /// `run_script` at identity `ident` (plugins run at security::PLUGIN).
     pub fn run_script_as(&self, r: Ref, ident: u8) {
         let lua = &self.lua;
+        // Fail closed: no security rules, no place scripts.
+        if !security::rules_ready() {
+            if let Ok(mut w) = world(lua) {
+                if w.started.insert(r) {
+                    let full = w.full_name(r);
+                    w.output.push((
+                        Level::Error,
+                        format!("{full} did not run: rustudio's script security rules (api-dump.json) are missing or invalid. Reinstall rustudio."),
+                    ));
+                }
+            }
+            return;
+        }
         if let Ok(mut w) = world(lua) {
             if !w.started.insert(r) {
                 return;
@@ -7642,6 +7733,20 @@ impl Runtime {
         )
     }
 
+    /// Roblox's resumption point after each input it processes ("Input
+    /// processing: resumes once per input", the deferred-events reference):
+    /// the handlers a Deferred place queued for this input run now, before
+    /// the next input of the frame changes its InputObject. There is one
+    /// InputObject per finger and per device (`library.luau`
+    /// `__rs_touch_object` / `__rs_input_event`; the PlayerModule compares
+    /// them by identity), so a handler that ran at the frame's end saw the
+    /// finger's last state: InputChanged with UserInputState End when a
+    /// finger moved and lifted in one frame, which CameraInput:339 asserts
+    /// against (a wall of "assertion failed!" on phones).
+    pub fn input_resumption_point(&self) {
+        self.dispatch();
+    }
+
     /// Runs deferred threads and queued signal fires until both are empty.
     pub fn dispatch(&self) {
         let lua = &self.lua;
@@ -7798,10 +7903,17 @@ fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Optio
                 Some((p, _)) => p,
                 None => frames.first().map(|f| f.0.as_str()).unwrap_or(""),
             };
+            // (By name, segment by segment: `find_child` is by class, which
+            // only ever matched a service's first segment — the game's
+            // handler got nil for every script.)
             let mut cur = root;
             let mut found = !path.is_empty();
             for name in path.split('.') {
-                match d.find_child(cur, name) {
+                let next = d
+                    .dom
+                    .get_by_ref(cur)
+                    .and_then(|p| p.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.name == name)));
+                match next {
                     Some(c) => cur = c,
                     None => {
                         found = false;
@@ -7889,6 +8001,38 @@ fn resume_thread_timed(lua: &Lua, th: &Thread, args: Vec<Value>) {
     }
 }
 
+/// Starts closing this side's DataModel, as a Roblox server does when it
+/// shuts down (Studio: Stop): each game:BindToClose callback runs on its own
+/// thread, at its registrant's identity, with the close reason. The session
+/// keeps stepping until close_pending is false or the shutdown deadline.
+pub fn begin_close(lua: &Lua, reason: &str) -> mlua::Result<()> {
+    let callbacks = {
+        let mut w = world(lua)?;
+        if w.closing {
+            return Ok(());
+        }
+        w.closing = true;
+        std::mem::take(&mut w.close_callbacks)
+    };
+    let reason: Value = lua
+        .load(format!("return Enum.CloseReason.{reason}"))
+        .set_name("=rustudio.close")
+        .eval()
+        .unwrap_or(Value::Nil);
+    for (f, ident) in callbacks {
+        let th = domains::assets_cloud::scene::create_thread(lua, f)?;
+        security::set(&th, ident);
+        world(lua)?.close_threads.push(th.clone());
+        resume(lua, &th, vec![reason.clone()]);
+    }
+    Ok(())
+}
+
+/// Whether a BindToClose callback is still running (yielded).
+pub fn close_pending(lua: &Lua) -> bool {
+    world(lua).is_ok_and(|w| w.close_threads.iter().any(|t| t.status() == ThreadStatus::Resumable))
+}
+
 /// Resumes a coroutine under the script timeout, routing errors to Output.
 pub fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
     if th.status() != ThreadStatus::Resumable {
@@ -7934,6 +8078,7 @@ pub fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
     if outermost {
         if let Some(mut b) = lua.app_data_mut::<Budget>() {
             b.start = None;
+            b.timed_out = false;
         }
     }
     if let Err(e) = r {
@@ -8044,6 +8189,11 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     let env = crate::globals_parity::new_env(lua, Some(inst_value(lua, r)?))?;
     // A Script inside a loaded plugin's tree also gets `plugin`.
     domains::script_env(lua, r, &env)?;
+    // CoreScript modules and plugin scripts don't share game scripts' _G
+    // and shared.
+    if core.is_some() || !matches!(env.raw_get::<Value>("plugin")?, Value::Nil) {
+        crate::globals_parity::use_privileged_globals(lua, &env)?;
+    }
     // A module from Studio's data model patch (CorePackages, RobloxGui's
     // Modules): Roblox's own bytecode.
     if let Some(b) = core {
@@ -8108,7 +8258,7 @@ pub(crate) fn start_core_script(lua: &Lua, name: &str, parent: Ref) -> mlua::Res
         let full = w.full_name(r);
         (r, code, full)
     };
-    let env = crate::globals_parity::new_env(lua, Some(inst_value(lua, r)?))?;
+    let env = crate::globals_parity::new_privileged_env(lua, Some(inst_value(lua, r)?))?;
     let f = lua.load(&code[..]).set_mode(mlua::chunk::ChunkMode::Binary).set_name(format!("={full}")).set_environment(env).into_function()?;
     let th = domains::assets_cloud::scene::create_thread(lua, f)?;
     security::set(&th, security::CORE);
@@ -8782,6 +8932,53 @@ mod tests {
         "#).exec().unwrap();
     }
 
+    /// Roblox clamps a Humanoid's speeds and jumps at 0 (WalkSpeed since
+    /// 2017): a game taking 100 off a WalkSpeed of 8 to hold the player
+    /// still during an emote gets 0, not a walk backwards at 92 studs/s;
+    /// a tween of WalkSpeed passes the same setter. MaxHealth lowered
+    /// under Health takes Health with it.
+    #[test]
+    fn humanoid_speed_and_jump_setters_clamp_at_zero() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local model = Instance.new("Model", workspace)
+            local h = Instance.new("Humanoid", model)
+            h.WalkSpeed = 8
+            h.WalkSpeed = h.WalkSpeed - 100
+            assert(h.WalkSpeed == 0, "WalkSpeed " .. h.WalkSpeed)
+            h.WalkSpeed = 16
+            assert(h.WalkSpeed == 16)
+            h.JumpPower = -5
+            assert(h.JumpPower == 0, "JumpPower " .. h.JumpPower)
+            h.JumpPower = 5000
+            assert(h.JumpPower == 1000, "JumpPower " .. h.JumpPower)
+            h.JumpHeight = -1
+            assert(h.JumpHeight == 0)
+            h.MaxSlopeAngle = 120
+            assert(h.MaxSlopeAngle == 89)
+            h.MaxHealth = 100
+            h.Health = 100
+            h.MaxHealth = 40
+            assert(h.MaxHealth == 40 and h.Health == 40, "Health " .. h.Health)
+            local tween = game:GetService("TweenService"):Create(h, TweenInfo.new(0.2), { WalkSpeed = -30 })
+            tween:Play()
+            _G.h = h
+        "#).exec().unwrap();
+        for _ in 0..30 {
+            // Tweens advance on Heartbeat, as in a play session.
+            let rs = rt
+                .world_mut()
+                .and_then(|w| w.d().find_child(w.d().dom.root_ref(), "RunService"));
+            if let Some(rs) = rs {
+                rt.fire(rs, "Heartbeat", vec![Value::Number(1.0 / 60.0)]);
+            }
+            rt.step(1.0 / 60.0);
+        }
+        rt.lua.load(r#"assert(_G.h.WalkSpeed == 0, "tweened WalkSpeed " .. _G.h.WalkSpeed)"#).exec().unwrap();
+    }
+
     #[test]
     fn input_actions_keep_gamepad_sticks_and_other_held_bindings() {
         let rt = Runtime::new().unwrap();
@@ -9226,6 +9423,72 @@ mod tests {
             out.iter().any(|(_, s)| s.contains("Script timeout")),
             "{out:?}"
         );
+    }
+
+    /// game:BindToClose as on a Roblox server shutting down (Studio Stop):
+    /// each callback runs on its own thread with the close reason, may yield,
+    /// and the session keeps stepping until they return; new binds fail.
+    #[test]
+    fn bind_to_close_runs_yielding_callbacks() {
+        let mut d = Document::new_place();
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let s = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script").with_name("Closer").with_property(
+                "Source",
+                "game:BindToClose(function(reason)
+                    print('close begins', reason)
+                    task.wait(0.25)
+                    print('close saved')
+                    print('rebind', pcall(game.BindToClose, game, function() end))
+                end)"
+                .to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        super::begin_close(&rt.lua, "DeveloperShutdown").unwrap();
+        assert!(super::close_pending(&rt.lua), "the callback is waiting");
+        let mut frames = 0;
+        while super::close_pending(&rt.lua) && frames < 120 {
+            rt.step(1.0 / 60.0);
+            frames += 1;
+        }
+        assert!(!super::close_pending(&rt.lua), "finished within {frames} frames");
+        let out: Vec<String> = rt.leave().output.into_iter().map(|(_, s)| s).collect();
+        let has = |p: &str| out.iter().any(|l| l.starts_with(p));
+        assert!(has("close begins Enum.CloseReason.DeveloperShutdown"), "{out:?}");
+        assert!(has("close saved"), "{out:?}");
+        assert!(has("rebind false BindToClose failed because the model is already being closed."), "{out:?}");
+    }
+
+    #[test]
+    fn bind_to_close_is_server_only() {
+        let mut d = Document::new_place();
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(std::mem::replace(&mut d, Document::new_place()), RunMode::Play);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let err = rt.lua.load("game:BindToClose(function() end)").exec().unwrap_err().to_string();
+        assert!(err.contains("BindToClose can only be called on the server."), "{err}");
+    }
+
+    /// A script that catches its own timeout with pcall and loops still
+    /// stops: once timed out, every edge of that resume errors.
+    #[test]
+    fn timeout_survives_pcall_loops() {
+        let out = run(
+            "local caught = 0
+             while true do
+               local ok, e = pcall(function() while true do end end)
+               if not ok then caught += 1 end
+             end",
+        );
+        assert!(out.iter().any(|(_, s)| s.contains("Script timeout")), "{out:?}");
     }
 }
 
@@ -9719,6 +9982,74 @@ mod legacy_tests {
         assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
     }
 
+    /// A Deferred place (Workspace.SignalBehavior): a finger's handlers see
+    /// the state of the event they are for even when the finger began,
+    /// moved and lifted inside one frame — each input is its own resumption
+    /// point (`input_resumption_point`), as in Roblox, where the handlers
+    /// run before the next input changes the finger's one InputObject.
+    /// (The PlayerModule's CameraInput asserts UserInputState == Change in
+    /// its InputChanged handler: a phone running Forsaken, whose
+    /// SignalBehavior is Deferred, filled the Output with
+    /// "CameraInput:339: assertion failed!".)
+    #[test]
+    fn deferred_finger_handlers_see_their_own_state() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        d.dom
+            .get_by_ref_mut(ws)
+            .unwrap()
+            .properties
+            .insert(ustr("SignalBehavior2"), Variant::Enum(rbx_dom_weak::types::Enum::from_u32(2)));
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        let src = r#"
+            local UIS = game:GetService("UserInputService")
+            local first
+            UIS.InputBegan:Connect(function(io) first = io; print("began", io.UserInputState.Name, io.Position.X) end)
+            UIS.InputChanged:Connect(function(io) print("changed", io.UserInputState.Name, tostring(io == first), io.Position.X) end)
+            UIS.InputEnded:Connect(function(io) print("ended", io.UserInputState.Name, tostring(io == first), io.Position.X) end)
+            print("ready")
+        "#;
+        let s = d.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        let str = |x: &str| Value::String(rt.lua.create_string(x).unwrap());
+        // Begin, Change and End in one frame, as a quick swipe lands.
+        for (state, x) in [("Begin", 100.0), ("Change", 110.0), ("End", 120.0)] {
+            let began_on = rt.lua.create_table().unwrap();
+            rt.spawn_global(
+                "__rs_touch_event",
+                vec![
+                    str(state),
+                    Value::Number(1.0),
+                    Value::Number(x),
+                    Value::Number(200.0),
+                    Value::Number(0.0),
+                    Value::Number(0.0),
+                    Value::Boolean(false),
+                    Value::Table(began_on),
+                ],
+            );
+            rt.input_resumption_point();
+        }
+        rt.step(1.0 / 60.0);
+        let out = rt.leave().output;
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert!(has("ready"), "{out:?}");
+        assert!(has("began Begin 100"), "{out:?}");
+        assert!(has("changed Change true 110"), "{out:?}");
+        assert!(has("ended End true 120"), "{out:?}");
+        assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
+    }
+
     /// UserInputService:GetLastInputType() before any input is the
     /// device's own kind, as Roblox answers it: Touch on a touch screen,
     /// Keyboard on a desktop (library.luau `last_input`). The PlayerModule's
@@ -10022,6 +10353,159 @@ mod legacy_tests {
         assert!(has("button Button_Dash nil nil"), "{out:?}");
         assert!(has("removed Dash Dash! false"), "{out:?}");
         assert!(has("done"), "{out:?}");
+        assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
+    }
+
+    /// Without the CoreScripts, this build's own touch buttons
+    /// (domains/context_action_touch.luau, started by gui_input.luau) stand
+    /// in for ContextActionTouch on a touch screen:
+    /// PlayerGui.ContextActionGui.ContextButtonFrame gets Roblox's 45 × 45
+    /// ImageButton at its first place for an action bound with
+    /// createTouchButton (none for one without), its ActionTitle /
+    /// ActionIcon / Position follow SetTitle / SetImage / SetPosition,
+    /// GetButton gets it, a finger landing on it runs the handler with
+    /// Begin and its lift there with End — a lift elsewhere, after it
+    /// dragged off, with Cancel — through CallFunction (which a game
+    /// script may not call itself), and UnbindAction takes it away.
+    #[test]
+    fn touch_buttons_without_the_core_scripts() {
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(Some(true)));
+        let mut d = Document::new_place();
+        let players = d.find_child(d.dom.root_ref(), "Players").unwrap();
+        let p = d.dom.insert(players, InstanceBuilder::new("Player").with_name("Local"));
+        d.dom.get_by_ref_mut(players).unwrap().properties.insert(ustr("LocalPlayer"), Variant::Ref(p));
+        let pg = d.dom.insert(p, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+        let src = r#"
+            local CAS = game:GetService("ContextActionService")
+            local pg = script.Parent
+            task.wait()
+            CAS:BindAction("Dash", function(name, state, io)
+                print("act", name, state.Name, io.UserInputType.Name, io.Position.X, io.Position.Y)
+                return Enum.ContextActionResult.Sink
+            end, true, Enum.KeyCode.Q)
+            CAS:BindAction("Quiet", function() end, false, Enum.KeyCode.E)
+            CAS:SetTitle("Dash", "Dash!")
+            CAS:SetImage("Dash", "rbxassetid://1234")
+            task.wait()
+            local gui = pg:FindFirstChild("ContextActionGui")
+            local frame = gui and gui:FindFirstChild("ContextButtonFrame")
+            local b = frame and frame:FindFirstChild("ContextActionButton")
+            print("gui", tostring(gui and gui.ResetOnSpawn), tostring(frame and frame.Visible), tostring(b and b.ClassName), #frame:GetChildren())
+            print("button", b.Size.X.Offset, b.Size.Y.Offset, b.Position.X.Offset, b.Position.Y.Offset, tostring(b.Active), b.Image)
+            print("title", b.ActionTitle.Text, b.ActionIcon.Image, b.ActionTitle.Font.Name, b.ActionTitle.TextSize, tostring(b.ActionTitle.TextWrapped))
+            print("get", tostring(CAS:GetButton("Dash") == b), tostring(CAS:GetButton("Quiet")))
+            CAS:SetPosition("Dash", UDim2.fromOffset(10, 20))
+            CAS:SetTitle("Dash", nil)
+            print("moved", b.Position.X.Offset, b.Position.Y.Offset, "[" .. b.ActionTitle.Text .. "]")
+            local ok, err = pcall(function() return CAS:CallFunction("Dash", Enum.UserInputState.Begin, nil) end)
+            print("call", tostring(ok), tostring(err))
+            print("ready")
+            -- (the fingers come now, from the test)
+            for _ = 1, 8 do task.wait() end
+            CAS:UnbindAction("Dash")
+            task.wait()
+            print("gone", tostring(frame:FindFirstChild("ContextActionButton")), tostring(CAS:GetButton("Dash")))
+        "#;
+        let s = d.dom.insert(
+            pg,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Play);
+        w.side = Side::Client;
+        w.input.view_size = [1000.0, 600.0];
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        let printed = |p: &str| rt.world_mut().is_some_and(|w| w.output.iter().any(|(_, t)| t.starts_with(p)));
+        for _ in 0..12 {
+            if printed("ready") {
+                break;
+            }
+            rt.step(1.0 / 60.0);
+        }
+        assert!(printed("ready"), "{:?}", rt.world_mut().map(|w| w.output.clone()));
+        let button = {
+            let w = rt.world_mut().unwrap();
+            let d = w.d();
+            d.dom.descendants_of(d.dom.root_ref()).find(|i| i.name == "ContextActionButton").map(|i| i.referent())
+        }
+        .expect("the touch button");
+        // A finger: its InputObject (the GUI's events get it first, as
+        // play_game.rs fire_gui_events does), then UserInputService's event.
+        let finger = |state: &str, x: f64, y: f64| -> Value {
+            let f: Function = rt.lua.globals().get("__rs_touch_object").unwrap();
+            f.call::<Value>((7.0, state, x, y, 0.0, 0.0)).unwrap()
+        };
+        let str = |x: &str| Value::String(rt.lua.create_string(x).unwrap());
+        let uis = |state: &str, x: f64, y: f64| {
+            let began_on = rt.lua.create_table().unwrap();
+            rt.spawn_global(
+                "__rs_touch_event",
+                vec![
+                    str(state),
+                    Value::Number(7.0),
+                    Value::Number(x),
+                    Value::Number(y),
+                    Value::Number(0.0),
+                    Value::Number(0.0),
+                    Value::Boolean(true),
+                    Value::Table(began_on),
+                ],
+            );
+        };
+        // Lands on the button, lifts on it: Begin, End.
+        let io = finger("Begin", 10.0, 20.0);
+        rt.fire(button, "InputBegan", vec![io]);
+        rt.input_resumption_point();
+        uis("Begin", 10.0, 20.0);
+        rt.step(1.0 / 60.0);
+        let io = finger("End", 11.0, 21.0);
+        rt.fire(button, "InputEnded", vec![io]);
+        rt.input_resumption_point();
+        uis("End", 11.0, 21.0);
+        rt.step(1.0 / 60.0);
+        // Lands on it, drags off, lifts elsewhere: Begin, Cancel.
+        let io = finger("Begin", 12.0, 22.0);
+        rt.fire(button, "InputBegan", vec![io]);
+        rt.input_resumption_point();
+        uis("Begin", 12.0, 22.0);
+        rt.step(1.0 / 60.0);
+        uis("End", 300.0, 300.0);
+        rt.step(1.0 / 60.0);
+        for _ in 0..12 {
+            if printed("gone") {
+                break;
+            }
+            rt.step(1.0 / 60.0);
+        }
+        let out = rt.leave().output;
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(None));
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert!(has("gui false true ImageButton 1"), "{out:?}");
+        assert!(has("button 45 45 123 70 true https://www.roblox.com/asset/?id=97166444"), "{out:?}");
+        assert!(has("title Dash! rbxassetid://1234 SourceSansBold 18 true"), "{out:?}");
+        assert!(has("get true nil"), "{out:?}");
+        assert!(has("moved 10 20 []"), "{out:?}");
+        assert!(has("call false"), "{out:?}");
+        assert!(out.iter().any(|(_, t)| t.starts_with("call false") && t.contains("lacking capability RobloxScript")), "{out:?}");
+        // (a print's line carries its script and line after an em dash)
+        let acts: Vec<&str> = out
+            .iter()
+            .filter(|(_, t)| t.starts_with("act "))
+            .map(|(_, t)| t.split("  \u{2014}").next().unwrap_or(t).trim_end())
+            .collect();
+        assert_eq!(
+            acts,
+            [
+                "act Dash Begin Touch 10 20",
+                "act Dash End Touch 11 21",
+                "act Dash Begin Touch 12 22",
+                "act Dash Cancel Touch 300 300",
+            ],
+            "{out:?}"
+        );
+        assert!(has("gone nil nil"), "{out:?}");
         assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
     }
 
@@ -10988,6 +11472,40 @@ mod weld_offset_tests {
         );
         assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
         assert_eq!(line(&out, "COUNTS"), "0 1 0 1 0", "{out:?}");
+    }
+
+    /// ScriptContext.Error's third argument is the script that erred — the
+    /// one the error's "Full.Name:line:" prefix names (an engine error with
+    /// no prefix: the innermost frame's) — so a game's error reporter can
+    /// call `script:GetFullName()`; it was always nil (the walk down the
+    /// name went by class).
+    #[test]
+    fn script_context_error_passes_the_script() {
+        let out = run(
+            |d| {
+                let rs = d.find_child(d.dom.root_ref(), "ReplicatedStorage").unwrap();
+                d.dom.insert(
+                    rs,
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name("Mod")
+                        .with_property("Source", "local M = {}\nfunction M.go() error('boom mod') end\nreturn M"),
+                );
+            },
+            r#"
+            game:GetService("ScriptContext").Error:Connect(function(m, t, s)
+                print("SCE_" .. (m:match("boom %w+") or "nil index") .. " " .. typeof(s) .. " " .. (typeof(s) == "Instance" and s:GetFullName() or "-") .. " | " .. t:gsub("\n", "/"))
+            end)
+            task.spawn(function() error("boom main") end)
+            task.spawn(function() require(game.ReplicatedStorage.Mod).go() end)
+            task.spawn(function() local x = nil; x:GetFullName() end)
+            "#,
+        );
+        assert_eq!(line(&out, "SCE_boom main"), "Instance ServerScriptService.T | ServerScriptService.T, line 5/");
+        assert_eq!(
+            line(&out, "SCE_boom mod"),
+            "Instance ReplicatedStorage.Mod | ReplicatedStorage.Mod, line 2 - function go/ServerScriptService.T, line 6/"
+        );
+        assert_eq!(line(&out, "SCE_nil index"), "Instance ServerScriptService.T | ServerScriptService.T, line 7/");
     }
 
     #[test]

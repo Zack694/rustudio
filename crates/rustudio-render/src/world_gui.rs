@@ -965,14 +965,37 @@ enum Kind {
     Sparkles,
 }
 
+/// Copies `data` into `target` through the staging belt. False when the
+/// belt's buffer can't be mapped: wgpu destroys every buffer once the device
+/// is lost (a phone's driver reclaiming the GPU after an out-of-memory,
+/// Android crash report 2026-11-24), and `StagingBelt::write_buffer` panics
+/// on one ("Failed to get mapped range for staging belt buffer") in the
+/// frame the loss is reported, before the frame's watch can end the run in
+/// order (src/android gpu_watch). The caller draws nothing instead.
 fn stage(
     staging: &mut wgpu::util::StagingBelt,
     target: &wgpu::Buffer,
     encoder: &mut wgpu::CommandEncoder,
     data: &[u8],
-) {
-    if let Some(size) = wgpu::BufferSize::new(data.len() as u64) {
-        staging.write_buffer(encoder, target, 0, size).copy_from_slice(data);
+) -> bool {
+    let Some(size) = wgpu::BufferSize::new(data.len() as u64) else { return true };
+    if crate::gpu_health::lost().is_some() {
+        return false;
+    }
+    let slice = staging.allocate(size, wgpu::BufferSize::new(wgpu::COPY_BUFFER_ALIGNMENT).expect("non-zero"));
+    match slice.get_mapped_range_mut() {
+        Ok(mut view) => {
+            view.copy_from_slice(data);
+            drop(view);
+            encoder.copy_buffer_to_buffer(slice.buffer(), slice.offset(), target, 0, size.get());
+            true
+        }
+        Err(e) => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| log::error!(target: "rustudio::gpu", "world GUI upload: staging buffer can't be mapped ({e}); the world GUIs and effects stop drawing"));
+            crate::gpu_health::mark_lost(format!("GPU buffers are gone (staging buffer can't be mapped: {e})"));
+            false
+        }
     }
 }
 
@@ -1002,9 +1025,9 @@ fn fill(
     slot: &mut Option<wgpu::Buffer>,
     usage: wgpu::BufferUsages,
     data: &[u8],
-) {
+) -> bool {
     if data.is_empty() {
-        return;
+        return true;
     }
     let need = (data.len() as u64).next_power_of_two().max(4096);
     if slot.as_ref().is_none_or(|b| b.size() < data.len() as u64) {
@@ -1015,8 +1038,9 @@ fn fill(
             mapped_at_creation: false,
         }));
     }
-    if let Some(b) = slot {
-        stage(staging, b, encoder, data);
+    match slot {
+        Some(b) => stage(staging, b, encoder, data),
+        None => true,
     }
 }
 
@@ -1934,17 +1958,27 @@ impl WorldGuiPass {
         if draws.is_empty() {
             return None;
         }
-        {
+        // (a failed upload — the device lost mid-frame — ends the frame's
+        // world GUI with nothing drawn; `stage`)
+        let staged = {
             let _scope = rustudio_core::bench::scope("fx_tone_write");
-            stage(&mut self.staging, &self.tone_buf, encoder, bytemuck::cast_slice(&u));
+            stage(&mut self.staging, &self.tone_buf, encoder, bytemuck::cast_slice(&u))
+        };
+        if !staged {
+            self.staging.finish_and_recall_on_submit(encoder);
+            return None;
         }
         let glass_upload = rustudio_core::bench::scope("fx_glass_upload");
         // (storage bindings can't be empty)
         let st = wgpu::BufferUsages::STORAGE;
         let pad = [FxGlass::default()];
         let [g0, g1] = &mut self.glass;
-        fill(device, &mut self.staging, encoder, g0, st, bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass }));
-        fill(device, &mut self.staging, encoder, g1, st, bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx }));
+        let staged = fill(device, &mut self.staging, encoder, g0, st, bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass }))
+            && fill(device, &mut self.staging, encoder, g1, st, bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx }));
+        if !staged {
+            self.staging.finish_and_recall_on_submit(encoder);
+            return None;
+        }
         let (Some(g0), Some(g1)) = (&self.glass[0], &self.glass[1]) else { return None };
         drop(glass_upload);
         let views = [depth, &self.sun_atlas, &self.sun_grid];
@@ -1978,16 +2012,18 @@ impl WorldGuiPass {
         let _buffers = rustudio_core::bench::scope("fx_draw_buffer_upload");
         let (v, i) = (wgpu::BufferUsages::VERTEX, wgpu::BufferUsages::INDEX);
         let [b0, b1, b2, b3, b4] = &mut self.bufs;
+        let mut staged = true;
         if !indices.is_empty() {
             let _upload = rustudio_core::bench::scope("gui_world_mesh_upload");
-            fill(device, &mut self.staging, encoder, b0, v, bytemuck::cast_slice(&vertices));
-            fill(device, &mut self.staging, encoder, b1, i, bytemuck::cast_slice(&indices));
+            staged = fill(device, &mut self.staging, encoder, b0, v, bytemuck::cast_slice(&vertices))
+                && fill(device, &mut self.staging, encoder, b1, i, bytemuck::cast_slice(&indices));
         }
-        fill(device, &mut self.staging, encoder, b2, v, bytemuck::cast_slice(&f.strips));
-        fill(device, &mut self.staging, encoder, b3, i, bytemuck::cast_slice(&f.indices));
-        fill(device, &mut self.staging, encoder, b4, v, bytemuck::cast_slice(&f.particles));
+        staged = staged
+            && fill(device, &mut self.staging, encoder, b2, v, bytemuck::cast_slice(&f.strips))
+            && fill(device, &mut self.staging, encoder, b3, i, bytemuck::cast_slice(&f.indices))
+            && fill(device, &mut self.staging, encoder, b4, v, bytemuck::cast_slice(&f.particles));
         self.staging.finish_and_recall_on_submit(encoder);
-        Some(Upload { depth_bg, draws })
+        staged.then_some(Upload { depth_bg, draws })
     }
 
     fn record(&self, pass: &mut wgpu::RenderPass<'_>, gui: &wgpu::RenderPipeline, up: &Upload) {

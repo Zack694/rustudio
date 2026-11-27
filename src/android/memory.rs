@@ -10,11 +10,23 @@
 //! memory: 1280 MB resident (+256 MB in 2.1 s), opening Game.rbxl
 //! ```
 //!
+//! Each line is followed by what the editor holds — the renderer's
+//! meshes, textures and items, the shown DataModel's size (`App::ui`
+//! passes it) — and the Play worker logs its own two Lua heaps and
+//! DataModels (play_worker.rs `memory_log`), so a growth can be placed.
+//!
 //! The first line also tells the device's memory (`ActivityManager
 //! .getMemoryInfo`: total, available now, and the level under which the
 //! system starts ending background processes). When the system sends the
 //! low-memory notice (`Activity.onLowMemory`, hooked in lifecycle.rs) the
 //! free heap pages go back at once (`heap::trim`) and a line says so.
+//!
+//! With each line goes the GPU allocator's account ([`gpu_line`]): on a
+//! phone the GPU's memory is system memory — Turnip's device heap is
+//! host memory, counted in the resident size — and a run of 2026-11-25
+//! reached 5.3 GB resident with 29 + 144 MB of Lua heaps and 48 MB of
+//! meshes before the device was lost to `Out of memory`; the resident
+//! size alone could not say whether the rest was the GPU's.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -101,7 +113,7 @@ fn device_line() -> String {
 /// Once a frame: logs the resident size when it has moved a step (the
 /// module comment), and answers the system's low-memory notice. `doing`
 /// names what the app is at (the place opening).
-pub fn tick(doing: &str) {
+pub fn tick(doing: &str, detail: impl FnOnce() -> String) {
     let now = Instant::now();
     if super::lifecycle::take_low_memory() {
         rustudio_core::heap::trim();
@@ -140,4 +152,42 @@ pub fn tick(doing: &str) {
     let device = if first { device_line() } else { String::new() };
     log::info!("memory: {mb} MB resident{change}{doing}{device}");
     w.logged = Some((mb, now));
+    drop(w);
+    // What the editor holds (the renderer's meshes, textures and items;
+    // the shown DataModel), with each line: which of them grew.
+    let detail = detail();
+    if !detail.is_empty() {
+        log::info!("memory: {detail}");
+    }
+}
+
+/// The GPU allocator's account (wgpu's Vulkan backend sub-allocates
+/// through gpu-allocator; `Device::generate_allocator_report`): what is
+/// allocated and what the memory blocks reserve, and the largest
+/// allocations by their label, so a growth can be placed — a texture
+/// pool, the GUI's images, egui's buffers. "" where the backend has no
+/// report (OpenGL).
+pub fn gpu_line(device: &egui_wgpu::wgpu::Device) -> String {
+    let Some(report) = device.generate_allocator_report() else { return String::new() };
+    let mut by_name: std::collections::HashMap<&str, (u64, usize)> = std::collections::HashMap::new();
+    for a in &report.allocations {
+        let e = by_name.entry(a.name.as_str()).or_default();
+        e.0 += a.size;
+        e.1 += 1;
+    }
+    let mut top: Vec<(&str, (u64, usize))> = by_name.into_iter().collect();
+    top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let top: Vec<String> = top
+        .iter()
+        .take(8)
+        .map(|(n, (bytes, count))| format!("{} {} MB ×{count}", if n.is_empty() { "(unnamed)" } else { n }, bytes >> 20))
+        .collect();
+    format!(
+        "gpu: {} MB allocated, {} MB reserved ({} allocations in {} blocks); largest: {}",
+        report.total_allocated_bytes >> 20,
+        report.total_reserved_bytes >> 20,
+        report.allocations.len(),
+        report.blocks.len(),
+        top.join(", ")
+    )
 }

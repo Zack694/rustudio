@@ -8,7 +8,7 @@ pub struct Connection { socket: WebSocket<MaybeTlsStream<TcpStream>>, next: u64 
 impl Connection {
     pub fn connect(session: &Session, context: Context) -> Result<Self> {
         let mut request=format!("wss://csm.roblox.com/v1/router/?id=&universeId={}",context.universe).into_client_request().map_err(|_|Error::new("MessagingService: Invalid connection context"))?;
-        for (key,value) in [("Cookie",session.cookie().header()),("X-Roblox-ChannelType","Test".into()),("Roblox-Place-Id",context.place.to_string()),("Roblox-Universe-Id",context.universe.to_string()),("Roblox-Game-Id",String::new()),("Roblox-Job-Signature",String::new()),("accessKey",String::new()),("User-Agent","RobloxStudio/WinInet RobloxApp/0.744.0.7441077 (GlobalDist; RobloxDirectDownload)".into())] {
+        for (key,value) in [("Cookie",session.cookie().header()),("X-Roblox-ChannelType","Test".into()),("Roblox-Place-Id",context.place.to_string()),("Roblox-Universe-Id",context.universe.to_string()),("Roblox-Game-Id",String::new()),("Roblox-Job-Signature",String::new()),("accessKey",String::new()),("User-Agent",crate::studio_target::user_agent())] {
             request.headers_mut().insert(tungstenite::http::HeaderName::from_bytes(key.as_bytes()).unwrap(),value.parse().map_err(|_|Error::new("MessagingService: Invalid context header"))?);
         }
         let (socket,_) = tungstenite::connect(request).map_err(|e| match e { tungstenite::Error::Http(r)=>Error::new(format!("MessagingService: CSM handshake refused (HTTP {})",r.status().as_u16())),_=>Error::new("MessagingService: CSM connection failed") })?;

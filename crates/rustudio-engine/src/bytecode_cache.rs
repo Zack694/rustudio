@@ -22,11 +22,28 @@ const MIN_DISK: usize = if cfg!(target_os = "android") { 4 * 1024 } else { 256 *
 /// Bytecode held in memory at most (later sources compile as before).
 const MEMORY_CAP: usize = if cfg!(target_os = "android") { 128 * 1024 * 1024 } else { 768 * 1024 * 1024 };
 
+/// Luau's optimization level for every script: Studio's 1 (no inlining,
+/// so Output stacks keep every frame: runtime.rs Runtime::new). Roblox's
+/// live client and server compile at 2 (local function inlining, loop
+/// unrolling, more constant folding: luau.org/performance), so a phone,
+/// which plays rather than debugs, does the same. RUSTUDIO_LUAU_OPT=0|1|2
+/// picks it anywhere (a script's own `--!optimize N` still wins).
+pub fn optimization_level() -> u8 {
+    static L: OnceLock<u8> = OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("RUSTUDIO_LUAU_OPT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|l| *l <= 2)
+            .unwrap_or(if cfg!(target_os = "android") { 2 } else { 1 })
+    })
+}
+
 /// The compiler every script runs through: Studio's options (runtime.rs
 /// Runtime::new explains each).
 pub fn compiler() -> mlua::chunk::Compiler {
     mlua::chunk::Compiler::new()
-        .set_optimization_level(1)
+        .set_optimization_level(optimization_level())
         .set_debug_level(1)
         .set_vector_ctor("Vector3.new")
         .set_vector_type("Vector3")
@@ -54,7 +71,7 @@ local function f(a, ...) local s = `{a}:{select("#", ...)}` for i, v in ipairs(t
 local v = Vector3.new(1, 2, 3) local g = game:GetService("Workspace") workspace.Name = script.Name
 return f(1, 2, 3), math.floor(v.X // 2) % 3, (if t[1] then 1 else 2) + bit32.band(7, 3), string.format("%d", 4)"##;
         let mut h = blake3::Hasher::new();
-        h.update(b"rustudio bytecode 2|O1 D1 Vector3.new Vector3 mutable globals _G|");
+        h.update(format!("rustudio bytecode 2|O{} D1 Vector3.new Vector3 mutable globals _G|", optimization_level()).as_bytes());
         h.update(&compiler().compile(PROBE).unwrap_or_default());
         h.finalize().as_bytes().to_vec()
     })
@@ -117,4 +134,80 @@ pub fn get(source: &str) -> Option<Arc<Vec<u8>>> {
         }
     }
     Some(b)
+}
+
+/// The precompile of an opened place: which one is current (a later
+/// place cancels an earlier one's) and whether one is running.
+static PRECOMPILE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRECOMPILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Compiles a place's scripts into the cache ahead of Play, on one
+/// background thread, as Roblox has a place's scripts compiled by the time
+/// the player is in. Without it the first Play of a place compiles
+/// everything on the main thread as the game starts — a fighting game's
+/// 685 scripts, 7 MB of Luau, several seconds on a phone — and only the
+/// second Play finds the cache (the 2026-11-25 report: Roblox "compiles
+/// the whole game in four seconds", rustudio's Play takes far longer).
+/// Called when a place opens (`Editor::set_document`) with every Script,
+/// LocalScript and ModuleScript source; a new place supersedes the last
+/// one's run, Play's own compiles meet the cache as they would after a
+/// second Play. `RUSTUDIO_NO_PRECOMPILE=1` (or the cache being off) skips
+/// it.
+pub fn precompile(sources: Vec<String>) {
+    use std::sync::atomic::Ordering;
+    let generation = PRECOMPILE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    if !enabled() || std::env::var_os("RUSTUDIO_NO_PRECOMPILE").is_some_and(|v| v != "0") {
+        return;
+    }
+    let sources: Vec<String> = sources.into_iter().filter(|s| s.len() >= MIN_MEMORY).collect();
+    if sources.is_empty() {
+        return;
+    }
+    let total: usize = sources.iter().map(|s| s.len()).sum();
+    let spawned = std::thread::Builder::new().name("luau-precompile".into()).spawn(move || {
+        // One at a time: a place opened over another waits for its turn
+        // (the first run notices the new generation and stops).
+        while PRECOMPILING.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if PRECOMPILE_GEN.load(Ordering::SeqCst) != generation {
+                return;
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let (mut done, mut fresh) = (0usize, 0usize);
+        for s in &sources {
+            if PRECOMPILE_GEN.load(Ordering::SeqCst) != generation {
+                break;
+            }
+            let had = {
+                let mut h = blake3::Hasher::new();
+                h.update(salt());
+                h.update(s.as_bytes());
+                let key: [u8; 32] = *h.finalize().as_bytes();
+                memory().lock().is_ok_and(|m| m.map.contains_key(&key))
+            };
+            if get(s).is_some() {
+                done += 1;
+                if !had {
+                    fresh += 1;
+                }
+            }
+            // A big place's compile shares the CPUs with the editor's own
+            // frames: a breath between scripts keeps the UI responsive on a
+            // two-core phone.
+            std::thread::yield_now();
+        }
+        PRECOMPILING.store(false, Ordering::SeqCst);
+        if PRECOMPILE_GEN.load(Ordering::SeqCst) == generation {
+            eprintln!(
+                "[startup] {done} of {} scripts ({} KB) precompiled for Play in {} ms ({fresh} compiled, the rest were cached)",
+                sources.len(),
+                total / 1024,
+                t0.elapsed().as_millis()
+            );
+        }
+    });
+    if spawned.is_err() {
+        PRECOMPILING.store(false, Ordering::SeqCst);
+    }
 }

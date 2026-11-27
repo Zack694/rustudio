@@ -105,6 +105,24 @@ pub(crate) enum Act {
     Config(profiler::Config),
 }
 
+/// What happens to an exported capture after it is written: the app may
+/// copy it somewhere a user can reach (Android: the shared Download
+/// folder, where the app's own folders are closed to the Files apps) and
+/// answer with the place to show in the toast instead of the path.
+type SavedHook = Box<dyn Fn(&std::path::Path) -> Option<String> + Send + Sync>;
+
+static SAVED_HOOK: std::sync::Mutex<Option<SavedHook>> = std::sync::Mutex::new(None);
+
+/// Installs the hook an export calls once its file is written.
+pub fn on_saved(hook: impl Fn(&std::path::Path) -> Option<String> + Send + Sync + 'static) {
+    *SAVED_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+}
+
+fn saved_hook(path: &std::path::Path) -> Option<String> {
+    let hook = SAVED_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    hook.as_ref().and_then(|h| h(path))
+}
+
 /// The profiler window's state. One per window; `show` draws it.
 pub struct ProfilerWindow {
     pub prefs: Prefs,
@@ -354,7 +372,10 @@ impl ProfilerWindow {
                     cap = cap.slice(t0, t1);
                 }
                 match profiler::export::save(&cap, &path) {
-                    Ok(()) => self.toast(format!("Saved {}", path.display())),
+                    Ok(()) => match saved_hook(&path) {
+                        Some(shown) => self.toast(format!("Saved {shown}")),
+                        None => self.toast(format!("Saved {}", path.display())),
+                    },
                     Err(e) => self.toast(format!("Couldn't save {}: {e}", path.display())),
                 }
             }

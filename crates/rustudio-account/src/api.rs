@@ -40,13 +40,25 @@ pub enum AssetDownloadError {
 }
 
 impl AssetDownloadError {
+    /// A request that didn't get an answer: a timeout or a dropped or
+    /// refused connection may work next time (Transient, status 0); the
+    /// rest (a bad URL, TLS refusal) won't.
+    pub(crate) fn transport(asset_id: u64, stage: &str, error: ureq::Error) -> Self {
+        let message = Error(format!("asset {asset_id}: {stage}: {error}"));
+        if crate::web::transient_error(&error) {
+            Self::Transient { status: 0, retry_after: None, error: message }
+        } else {
+            Self::Other(message)
+        }
+    }
+
     pub(crate) fn transient_response(
         asset_id: u64,
         stage: &str,
         response: &ureq::http::Response<ureq::Body>,
     ) -> Option<Self> {
         let status = response.status().as_u16();
-        if !matches!(status, 429 | 502 | 503) {
+        if !crate::web::transient_status(status) {
             return None;
         }
         let retry_after = response.headers().get("retry-after").cloned();
@@ -110,7 +122,7 @@ fn public_asset_location(a: &ureq::Agent, asset_id: u64) -> std::result::Result<
         .max_redirects_will_error(false)
         .build()
         .call()
-        .map_err(Error::from)?;
+        .map_err(|e| AssetDownloadError::transport(asset_id, "public asset delivery", e))?;
     if let Some(error) = AssetDownloadError::transient_response(asset_id, "public asset delivery", &r) {
         return Err(error);
     }
@@ -140,7 +152,7 @@ fn refusal(text: &str) -> Option<String> {
 /// The v2 descriptor's first location (`locations[0].location`).
 fn public_asset_location_v2(a: &ureq::Agent, asset_id: u64) -> std::result::Result<String, AssetDownloadError> {
     let url = format!("{PUBLIC_ASSET_DELIVERY_URL}/{asset_id}");
-    let mut r = a.get(&url).call().map_err(Error::from)?;
+    let mut r = a.get(&url).call().map_err(|e| AssetDownloadError::transport(asset_id, "asset delivery", e))?;
     if let Some(error) = AssetDownloadError::transient_response(asset_id, "public asset delivery", &r) {
         return Err(error);
     }
@@ -178,7 +190,7 @@ fn download_location(a: &ureq::Agent, asset_id: u64, location: &str) -> std::res
     let mut r = a.get(location)
         .header("Accept-Encoding", "gzip")
         .call()
-        .map_err(Error::from)?;
+        .map_err(|e| AssetDownloadError::transport(asset_id, "download", e))?;
     if let Some(error) = AssetDownloadError::transient_response(asset_id, "download", &r) {
         return Err(error);
     }
@@ -194,7 +206,7 @@ fn download_location(a: &ureq::Agent, asset_id: u64, location: &str) -> std::res
         .limit(256 << 20)
         .reader()
         .read_to_end(&mut bytes)
-        .map_err(Error::from)?;
+        .map_err(|e| AssetDownloadError::transport(asset_id, "download", ureq::Error::Io(e)))?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut out = Vec::new();
         flate2::read::GzDecoder::new(&bytes[..])
@@ -229,7 +241,7 @@ mod asset_tests {
                 .body(ureq::Body::builder().data(Vec::new()))
                 .unwrap();
             let error = AssetDownloadError::transient_response(42, "asset delivery", &response);
-            if matches!(status, 429 | 502 | 503) {
+            if crate::web::transient_status(status) {
                 assert!(matches!(
                     error,
                     Some(AssetDownloadError::Transient {
@@ -251,7 +263,7 @@ mod asset_tests {
 /// mobile link. Clones share the pool.
 pub fn agent() -> ureq::Agent {
     static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
-        let config = ureq::Agent::config_builder()
+        let config = crate::web::install(ureq::Agent::config_builder())
             .http_status_as_error(false)
             .timeout_resolve(Some(std::time::Duration::from_secs(15)))
             .timeout_connect(Some(std::time::Duration::from_secs(10)))

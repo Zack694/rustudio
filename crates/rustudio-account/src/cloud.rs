@@ -738,6 +738,27 @@ impl CloudApi {
         Ok(self.descriptor(place_id, None)?.0)
     }
 
+    /// Like [`Self::download`], but asks which version that is first and
+    /// downloads only when `cached(version)` has no copy: one small request
+    /// when the place hasn't changed since it was last opened. Returns the
+    /// version and the bytes (None: use the cached copy of that version).
+    pub fn download_unless_cached(
+        &self,
+        place_id: u64,
+        version: Option<u64>,
+        cached: impl Fn(u64) -> bool,
+    ) -> Result<(u64, Option<Vec<u8>>)> {
+        let (number, location) = self.descriptor(place_id, version)?;
+        if cached(number) {
+            return Ok((number, None));
+        }
+        let (status, bytes) = self.session.fetch_bytes(&location, false)?;
+        if !(200..300).contains(&status) {
+            return Err(Error(format!("place {place_id}: download answered HTTP {status}")));
+        }
+        Ok((number, Some(bytes)))
+    }
+
     /// A place file: the latest version, or the one asked for. Returns the
     /// bytes and the version they are.
     pub fn download(&self, place_id: u64, version: Option<u64>) -> Result<(Vec<u8>, u64)> {
@@ -1189,8 +1210,17 @@ impl PlaceCache {
         let dir = self.dir(origin.place_id);
         std::fs::create_dir_all(&dir)?;
         let path = self.file(origin.place_id, origin.version, is_xml(bytes));
-        std::fs::write(&path, bytes)?;
-        std::fs::write(dir.join("origin.json"), serde_json::to_string_pretty(origin)?)?;
+        // Whole files only (written beside, then renamed): a cached version
+        // is opened as the place when Roblox's is unchanged.
+        let write = |p: &std::path::Path, b: &[u8]| -> std::io::Result<()> {
+            let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+            std::fs::write(&tmp, b)?;
+            std::fs::rename(&tmp, p).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+        };
+        write(&path, bytes)?;
+        write(&dir.join("origin.json"), serde_json::to_string_pretty(origin)?.as_bytes())?;
         let mut vs = self.cached_versions(origin.place_id);
         while vs.len() > KEEP_VERSIONS {
             let old = vs.remove(vs.len() - 1);

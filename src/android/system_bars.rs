@@ -23,10 +23,9 @@
 //! navigation bar after the IME).
 //!
 //! `RUSTUDIO_SYSTEM_BARS=1` (`debug.rustudio.env`) keeps the bars, as
-//! before. The display cutout is left as it was: the window stays out of
-//! the camera hole's side in landscape (`layoutInDisplayCutoutMode`
-//! default), since the editor's chrome doesn't pad itself by the cutout
-//! inset yet.
+//! before. The display cutout — the camera hole's side, which Android
+//! letterboxed in landscape the same way — is cutout.rs's: the window
+//! goes under it and the editor pads itself by its insets.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

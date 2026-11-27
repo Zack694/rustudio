@@ -218,6 +218,19 @@ fn mouse_input_object_for_event(
     began: bool,
     at: Option<(f32, f32)>,
 ) -> mlua::Result<Value> {
+    mouse_input_object_moving(lua, event_name, button, began, at, (0.0, 0.0))
+}
+
+/// The same with the pointer's motion since the last frame (Delta: the
+/// mouse moving over an object, GuiObject.InputChanged).
+fn mouse_input_object_moving(
+    lua: &mlua::Lua,
+    event_name: Option<&str>,
+    button: u8,
+    began: bool,
+    at: Option<(f32, f32)>,
+    delta: (f32, f32),
+) -> mlua::Result<Value> {
     let t = lua.create_table()?;
     let kind = match button {
         1 => "MouseButton1",
@@ -255,7 +268,7 @@ fn mouse_input_object_for_event(
     )?;
     t.set(
         "Delta",
-        rustudio_engine::ltypes::LVector3(Vec3::ZERO).into_value(),
+        rustudio_engine::ltypes::LVector3(Vec3::new(delta.0, delta.1, 0.0)).into_value(),
     )?;
     // As a real InputObject (a userdata), like UserInputService's.
     match lua.globals().get::<mlua::Function>("__rs_new_input_object") {
@@ -322,6 +335,9 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                             x,
                             y,
                         } => mouse_input_object_for_event(lua, Some(name), *button, *began, Some((*x, *y))).ok(),
+                        GuiArg::InputMove { x, y, dx, dy } => {
+                            mouse_input_object_moving(lua, Some(name), 0, false, Some((*x, *y)), (*dx, *dy)).ok()
+                        }
                         GuiArg::Touch { id, state, x, y, dx, dy } => {
                             touch_input_object(lua, *id, *state, (*x, *y), (*dx, *dy)).ok()
                         }
@@ -334,7 +350,14 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                         }
                     })
                     .collect();
+                let input = args.iter().any(|a| matches!(a, GuiArg::Input { .. } | GuiArg::InputMove { .. } | GuiArg::Touch { .. }));
                 rt.fire(r, name, vals);
+                if input {
+                    // A finger's InputObject is one for its life: its
+                    // handlers run before its next event changes it
+                    // (runtime.rs input_resumption_point).
+                    rt.input_resumption_point();
+                }
                 // UserInputService.TextBoxFocused / TextBoxFocusReleased(textBox)
                 // go with a TextBox's Focused / FocusLost.
                 let uis_ev = match name {
@@ -726,7 +749,15 @@ impl Game {
                 }
             }
         }
-        if let Some(msg) = pc::take_kick() {
+        let kick = self
+            .with_side(Side::Server, |rt, _, _| pc::take_kick(&rt.lua))
+            .flatten()
+            .or_else(|| self.with_side(Side::Client, |rt, _, _| pc::take_kick(&rt.lua)).flatten());
+        // While the session closes the player has already left (Studio's
+        // client closed first): a kick then (a save library ending the
+        // session in PlayerRemoving) has nobody to disconnect.
+        let kick = kick.filter(|_| self.play.as_ref().is_some_and(|s| s.closing.is_none()));
+        if let Some(msg) = kick {
             if let Some(s) = self.play.as_mut() {
                 if s.game.kicked.is_none() {
                     s.game.kicked = Some(msg.clone());
@@ -734,22 +765,7 @@ impl Game {
                     // Studio: the kick logged, CharacterRemoving, then
                     // PlayerRemoving(player, Enum.PlayerExitReason.CreatorKick).
                     self.error(format!("Server Kick Message: {msg}; Metadata:"));
-                    let model = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model);
-                    if let Some(m) = model {
-                        self.fire_character_removing(m);
-                    }
-                    let players = self.doc.find_child(self.doc.dom.root_ref(), "Players");
-                    if let Some(ps) = players {
-                        self.with_side(Side::Server, |rt, _, _| {
-                            let reason = rt
-                                .lua
-                                .load("return Enum.PlayerExitReason.CreatorKick")
-                                .eval::<Value>()
-                                .unwrap_or(Value::Nil);
-                            rt.fire(ps, "PlayerRemoving", vec![rt.inst(player), reason]);
-                            rt.dispatch();
-                        });
-                    }
+                    self.player_leaves("CreatorKick");
                 }
             }
         }
@@ -2558,7 +2574,7 @@ impl Game {
                 }
             }
             // "." opens the emote wheel (Roblox's Emotes menu key).
-            if taps.contains(&Period) {
+            if self.show_core_gui && taps.contains(&Period) {
                 crate::emote_wheel::toggle();
             }
         }
@@ -2575,8 +2591,8 @@ impl Game {
         }
         // The open menu has the mouse and keys: none of it reaches the game
         // (SettingsHub's Modal shield and RbxSettingsHubStopCharacter).
-        let menu = self.play.as_ref().is_some_and(|s| s.game.menu_open);
-        if core_menu {
+        let menu = self.show_core_gui && self.play.as_ref().is_some_and(|s| s.game.menu_open);
+        if self.show_core_gui && core_menu {
             slots.clear();
         }
         if menu {
@@ -2644,7 +2660,7 @@ impl Game {
 
         // Hotbar (native fallback only when CoreScripts aren't running).
         let info = self.play_hotbar();
-        if !core_scripts && backpack_on && !info.is_empty() {
+        if !core_scripts && self.show_core_gui && backpack_on && !info.is_empty() {
             let doc_dir = self.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
             let rects = self.gui.draw_hotbar(&ctx, &painter, &mut self.assets, doc_dir.as_deref(), rect, &info);
             for (n, r) in rects.into_iter().enumerate() {
@@ -2676,7 +2692,7 @@ impl Game {
                 }
             }
         }
-        if !core_scripts {
+        if !core_scripts && self.show_core_gui {
             self.game_menu(ui, rect);
             if !menu {
                 self.emote_wheel(ui, rect, &mut slots);

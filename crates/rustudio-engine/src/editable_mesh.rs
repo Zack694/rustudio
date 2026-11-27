@@ -1781,18 +1781,51 @@ pub fn call(lua: &Lua, m: &mut Mesh, name: &str, args: &MultiValue) -> mlua::Res
         "MergeVertices" => {
             let tol = num(&a1).ok_or_else(|| rt_err("Argument 1 missing or nil"))? as f32;
             let vs: Vec<(u64, Vec3)> = m.verts.iter().map(|(i, v)| (i, v.p)).collect();
+            // Greedy, in id order: every later vertex within `tol` of a
+            // surviving earlier one goes into it. The candidates come from
+            // a grid of `tol`-sized cells (the 27 about a vertex hold all
+            // within `tol` of it) instead of every later vertex: the same
+            // result as the pairwise walk, linear in the vertices where
+            // that was quadratic (a 100k-vertex mesh took minutes).
+            let cell = if tol > 0.0 { tol } else { 1e-6 };
+            let key = |p: Vec3| -> (i64, i64, i64) { ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64, (p.z / cell).floor() as i64) };
+            let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+            for (i, (_, p)) in vs.iter().enumerate() {
+                grid.entry(key(*p)).or_default().push(i);
+            }
             let mut map: Vec<(u64, u64)> = Vec::new();
-            let mut gone: HashSet<u64> = HashSet::new();
+            let mut gone = vec![false; vs.len()];
+            let mut merged: Vec<usize> = Vec::new();
             for (i, (a, pa)) in vs.iter().enumerate() {
-                if gone.contains(a) {
+                if gone[i] {
                     continue;
                 }
-                for (b, pb) in &vs[i + 1..] {
-                    if !gone.contains(b) && pa.distance(*pb) <= tol {
-                        gone.insert(*b);
-                        map.push((*b, *a));
+                let (kx, ky, kz) = key(*pa);
+                merged.clear();
+                for dx in -1..=1i64 {
+                    for dy in -1..=1i64 {
+                        for dz in -1..=1i64 {
+                            let Some(list) = grid.get_mut(&(kx.wrapping_add(dx), ky.wrapping_add(dy), kz.wrapping_add(dz))) else {
+                                continue;
+                            };
+                            // (a vertex up to this one, or gone, is of no
+                            // further use to the cell)
+                            list.retain(|&j| {
+                                if j <= i || gone[j] {
+                                    return false;
+                                }
+                                if pa.distance(vs[j].1) <= tol {
+                                    gone[j] = true;
+                                    merged.push(j);
+                                    return false;
+                                }
+                                true
+                            });
+                        }
                     }
                 }
+                merged.sort_unstable();
+                map.extend(merged.iter().map(|&j| (vs[j].0, *a)));
             }
             let lookup: HashMap<u64, u64> = map.iter().copied().collect();
             for s in m.faces.order.clone() {

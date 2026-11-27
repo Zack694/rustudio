@@ -7,7 +7,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.5.1"
+version = "0.5.2"
 
 [package]
 name = "rustudio"
@@ -49,7 +49,9 @@ egui_dock = { version = "0.21", features = ["serde"] }
 rbx_dom_weak = "4"
 rbx_binary = "3"
 rbx_xml = "3"
-rbx_reflection_database = "3"
+# Only the bundled database: never a machine-wide .rbxreflection file another
+# tool left (it also feeds rbx_binary / rbx_xml), so the version is the one we ship.
+rbx_reflection_database = { version = "3", features = ["debug_always_use_bundled"] }
 rbx_reflection = "7"
 rbx_types = "3"
 glam = { version = "0.30", features = ["bytemuck"] }
@@ -182,6 +184,10 @@ egui_dock = { path = "vendor/egui_dock" }
 # end-first child removal: bulk Destroy / ClearAllChildren without a scan
 # of the parent's child list per child (round 2 perf, bulk).
 rbx_dom_weak = { path = "vendor/rbx_dom_weak" }
+# rbx_binary 3.0.1 + Deserializer::skip_defaults (marked rustudio): a
+# property value equal to what the reader falls back to isn't stored
+# (doc.rs implied_default). A 44 MB place parsed to 4.8 GB, 69% defaults.
+rbx_binary = { path = "vendor/rbx_binary" }
 # rapier3d 0.36.1 + CollisionPipeline::contact_recycle_distance (marked
 # rustudio): the Studio solver port (the default; src/solver) runs
 # rapier's collision detection alone and needs its contact recycling to cost

@@ -20,6 +20,12 @@
 //!
 //! [`RuppSocket`] wraps a UDP socket as a `quinn::AsyncUdpSocket` that adds
 //! the header on send and strips it on receive, so quinn speaks plain QUIC.
+//!
+//! Some join scripts [seen live 2026-11-24, us-central] carry no
+//! `UdmuxEndpoints`, no `NetStackTokenValue` and `DirectServerReturn: true`:
+//! the client dials the RCC itself. A socket built with no join token
+//! ([`RuppSocket::bind`] with `None`) is that direct mode: datagrams go to the
+//! RCC as they are, with no RUPP header either way.
 
 use std::fmt;
 use std::io::{self, IoSliceMut};
@@ -85,7 +91,8 @@ pub struct RuppSocket {
     io: tokio::net::UdpSocket,
     relay: SocketAddr,
     rcc: (Ipv4Addr, u16),
-    state: Mutex<TokenState>,
+    /// The RUPP token to send; `None` for a direct dial (no relay, no header).
+    state: Mutex<Option<TokenState>>,
     /// Counters for diagnostics: datagrams in, datagrams out, token switches.
     pub stats: Mutex<(u64, u64, u64)>,
 }
@@ -98,14 +105,16 @@ impl fmt::Debug for RuppSocket {
 
 impl RuppSocket {
     /// Bind an ephemeral UDP socket for a relay. Must run inside a tokio runtime.
-    pub fn bind(relay: SocketAddr, rcc: (Ipv4Addr, u16), join_token: [u8; 16]) -> io::Result<Arc<RuppSocket>> {
+    /// With no `join_token` the socket dials `relay` (then the RCC itself)
+    /// directly and adds or strips no RUPP header.
+    pub fn bind(relay: SocketAddr, rcc: (Ipv4Addr, u16), join_token: Option<[u8; 16]>) -> io::Result<Arc<RuppSocket>> {
         let std = std::net::UdpSocket::bind("0.0.0.0:0")?;
         std.set_nonblocking(true)?;
         Ok(Arc::new(RuppSocket {
             io: tokio::net::UdpSocket::from_std(std)?,
             relay,
             rcc,
-            state: Mutex::new(TokenState { kind: TOKEN_TYPE_JOIN, token: join_token }),
+            state: Mutex::new(join_token.map(|token| TokenState { kind: TOKEN_TYPE_JOIN, token })),
             stats: Mutex::new((0, 0, 0)),
         }))
     }
@@ -125,8 +134,10 @@ impl AsyncUdpSocket for RuppSocket {
     }
 
     fn try_send(&self, t: &Transmit) -> io::Result<()> {
-        let st = self.state.lock().unwrap().clone();
-        let hdr = client_header(st.kind, &st.token, self.rcc);
+        let hdr = match self.state.lock().unwrap().as_ref() {
+            Some(st) => client_header(st.kind, &st.token, self.rcc),
+            None => Vec::new(),
+        };
         // one datagram per segment (max_transmit_segments is 1, but be safe)
         let seg = t.segment_size.unwrap_or(t.contents.len()).max(1);
         for chunk in t.contents.chunks(seg) {
@@ -157,15 +168,23 @@ impl AsyncUdpSocket for RuppSocket {
             if from != self.relay {
                 continue;
             }
-            let Some((hl, tok)) = parse_header(d) else { continue };
-            if let Some((kind, token)) = tok {
-                let mut st = self.state.lock().unwrap();
-                if st.kind != kind || st.token != token {
-                    st.kind = kind;
-                    st.token = token;
-                    self.stats.lock().unwrap().2 += 1;
+            let hl = {
+                let mut state = self.state.lock().unwrap();
+                match state.as_mut() {
+                    None => 0,
+                    Some(st) => {
+                        let Some((hl, tok)) = parse_header(d) else { continue };
+                        if let Some((kind, token)) = tok {
+                            if st.kind != kind || st.token != token {
+                                st.kind = kind;
+                                st.token = token;
+                                self.stats.lock().unwrap().2 += 1;
+                            }
+                        }
+                        hl
+                    }
                 }
-            }
+            };
             let q = &d[hl..];
             if q.is_empty() || q.len() > bufs[0].len() {
                 continue;

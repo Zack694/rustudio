@@ -117,6 +117,17 @@ pub struct GuiShare {
     pub tb_script_sel: Vec<(Ref, Option<i32>, Option<i32>)>,
     /// Initial 1-based caret position from a mouse click that focused a TextBox.
     pub tb_focus_click: Option<(Ref, usize)>,
+    /// The focused TextBox as the UI left it this frame, for the soft
+    /// keyboard's editor (Android, src/android/ime.rs): text, cursor and
+    /// selection anchor (1-based bytes, -1 none), MultiLine. None while no
+    /// TextBox has the focus.
+    pub tb_live: Option<(String, i32, i32, bool)>,
+    /// What the soft keyboard typed into the focused TextBox, in order:
+    /// code points [a, b) of its text become the string (ime.rs).
+    pub tb_ime: Vec<(usize, usize, String)>,
+    /// Where the soft keyboard put the TextBox's selection (code points,
+    /// sorted), after the UI's own moves.
+    pub tb_ime_sel: Option<(usize, usize)>,
     pub hovered: HashSet<Ref>,
     pub pressed: Option<Ref>,
     /// Image content ids decoded for drawing.
@@ -126,9 +137,11 @@ pub struct GuiShare {
     pub mouse_edges: Vec<(u8, bool, bool)>,
     /// Mouse buttons held over the view (1, 2, 3).
     pub buttons: [bool; 3],
-    /// Mouse drags of Draggable objects / UIDragDetectors for the scripts:
-    /// (object, 0 begin / 1 move / 2 end, GUI x, y).
-    pub drags: Vec<(Ref, u8, f32, f32)>,
+    /// Drags of Draggable objects / UIDragDetectors for the scripts:
+    /// (object, 0 begin / 1 move / 2 end, GUI x, y, a finger's rather than
+    /// the mouse's: domains/gui_input.luau `step_drags` ends a mouse drag
+    /// when no button is held, a finger's only with its lift).
+    pub drags: Vec<(Ref, u8, f32, f32, bool)>,
     /// The 3D view's texture and where it was drawn this frame (UIBlur).
     pub scene: Option<(egui::TextureId, Rect)>,
     /// ParticleEmitter2D:Emit(n) / Clear() from the scripts (n = 0: clear).
@@ -248,6 +261,15 @@ pub enum GuiArg {
         x: f32,
         y: f32,
     },
+    /// The mouse moving over an object (GuiObject.InputChanged with a
+    /// MouseMovement InputObject): its position and its motion (Delta),
+    /// which scripts dragging the object by the pointer's travel read.
+    InputMove {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
     /// A finger's InputObject (UserInputType.Touch; one object per finger
     /// for its whole life, `__rs_touch_object`): the finger, its state,
     /// position and motion since its last event.
@@ -349,6 +371,10 @@ struct TouchFinger {
     scroll: Option<Ref>,
     /// It has dragged the canvas past the tap slop: no click on the lift.
     scrolled: bool,
+    /// The draggable object it landed on (GuiObject.Draggable, or a
+    /// UIDragDetector's parent): it moves with the finger
+    /// (`share().drags`, as the mouse's `dragging`).
+    drag: Option<Ref>,
     /// Its speed over the last moves (GUI pixels a second), and when the
     /// last move was.
     speed: (f32, f32),
@@ -465,6 +491,11 @@ pub struct Gui {
     pub topbar_chat: Option<bool>,
     /// Free rectangle published by the client CoreScripts, in viewport pixels.
     pub topbar_inset: Option<crate::ltypes::LRect>,
+    /// The Modal buttons (gui_modal.rs): asked each frame the game holds the mouse.
+    pub modal: crate::gui_modal::ModalIndex,
+    /// Hide Play Core UI (`CoreGui`: topbar, leaderboard, chat, backpack, …)
+    /// while keeping game UI (`PlayerGui` and world GUIs) visible.
+    pub hide_core_gui: bool,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
     pub world_batches: Vec<rustudio_render::world_gui::GuiBatch>,
@@ -3264,7 +3295,7 @@ fn text_face(font: &FaceKey) -> Option<(&'static egui::Context, FontFamily, f32)
 struct FaceText;
 
 impl walk::AutoText for FaceText {
-    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
+    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2 {
         let mut text = text_prop(d, r, "Text");
         if text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox") {
             text = text_prop(d, r, "PlaceholderText");
@@ -3272,7 +3303,10 @@ impl walk::AutoText for FaceText {
         let rich = boolp(d, r, "RichText", false);
         let font = font_of(d, r);
         let legacy_scale = legacy_text_scale(&font);
-        let mut size = num(d, r, "TextSize", 14.0) * scale * legacy_scale;
+        let mut size = match fit_height {
+            Some(h) => walk::scaled_text_size(h, scale),
+            None => num(d, r, "TextSize", 14.0) * scale * legacy_scale,
+        };
         if let Some(c) = child_of_class(d, r, "UITextSizeConstraint") {
             size = size.clamp(
                 num(d, c, "MinTextSize", 1.0) * scale,

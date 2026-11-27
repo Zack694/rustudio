@@ -1837,10 +1837,30 @@ impl Physics {
             // one world tick. An adaptive body may integrate it over several
             // ticks at once, so a rigid correction can overshoot and grow.
             // Use the same solver rows as for server-created constraints.
-            if self.studio.is_some() && matches!(m.law, Law::LinearVelocity { .. } | Law::AlignOrientation { .. }) {
+            // The legacy movers too (Roblox: LBG's Savage Fangs, a LocalScript's
+            // BodyPosition P 160 D 22 then a BodyVelocity of 44 studs/s on its
+            // own HumanoidRootPart): as rows they move the character the way
+            // Studio's do (the BodyPosition a spring on the assembly, the
+            // BodyVelocity reaching its speed within MaxForce), where the
+            // fallback's force fought the Humanoid's own floor control, which
+            // closes any velocity it did not ask for at up to its friction
+            // acceleration: the character slid at 33 of 44 studs/s.
+            if self.studio.is_some()
+                && matches!(
+                    m.law,
+                    Law::LinearVelocity { .. }
+                        | Law::AlignOrientation { .. }
+                        | Law::BodyVelocity { .. }
+                        | Law::BodyPosition { .. }
+                        | Law::BodyGyro { .. }
+                        | Law::BodyAngularVelocity { .. }
+                )
+            {
                 let parts = [m.att0, m.att1].into_iter().flatten()
                     .filter_map(|a| rustudio_core::body::attachment_part(cd, a));
                 self.hums.desc_remap.extend(parts.filter_map(|p| c2s.get(&p).map(|s| (p, *s))));
+                // (a legacy mover's end is its parent part: `mover_end`)
+                self.hums.desc_remap.insert(m.part, sp);
                 let desc = self.studio_desc(cd, cws, r);
                 self.hums.desc_remap.clear();
                 if let Some(desc) = desc {

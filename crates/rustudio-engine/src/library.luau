@@ -972,6 +972,22 @@ end
 function M.FireActionButtonFoundSignal(self, name, button)
     action_buttons[name] = button or false
 end
+-- CallFunction (RobloxScriptSecurity): a touch button's press — the
+-- CoreScript's, or this build's own (domains/context_action_touch.luau)
+-- — runs the action's handler with (name, state, inputObject) on its own,
+-- outside the input dispatch, and returns what it returned. The handler
+-- runs at the binder's identity, as from an input; an error in it is the
+-- script's error, not the caller's.
+function M.CallFunction(self, name, state, input)
+    local a = actions[name] or core_actions[name]
+    if not a then return nil end
+    local ok, r = rs_call_action(a.ident, a.fn, name, state, input)
+    if not ok then
+        task.spawn(error, r, 0)
+        return nil
+    end
+    return r
+end
 -- SetTitle / SetImage / SetDescription / SetPosition: kept on the action and
 -- told to the touch-button CoreScript (an empty string or nil clears).
 for field, method in { title = "SetTitle", image = "SetImage", description = "SetDescription", position = "SetPosition" } do

@@ -365,6 +365,7 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("GetAllBoundActionInfo", "ContextActionService"),
     ("GetButton", "ContextActionService"),
     ("FireActionButtonFoundSignal", "ContextActionService"),
+    ("CallFunction", "ContextActionService"),
     ("Emit", "ParticleEmitter"),
     ("Clear", "ParticleEmitter"),
     ("SetTitle", "ContextActionService"),
@@ -824,26 +825,40 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
             let b = (rg.max / terrain::VOXEL).round().as_ivec3();
             let n = (b - a).max(glam::IVec3::ZERO);
             if name == "ReadVoxels" {
-                let mats = lua.create_table()?;
-                let occs = lua.create_table()?;
+                // (a 64-stud cube is 262,144 voxels: the enum items are
+                // looked up once a material, the rows built in one go, the
+                // chunk found once a run rather than a voxel)
+                let sampler = voxels.sampler();
+                let mut items: Vec<Option<Value>> = vec![None; 256];
+                let mats = lua.create_table_with_capacity(n.x.max(0) as usize, 1)?;
+                let occs = lua.create_table_with_capacity(n.x.max(0) as usize, 1)?;
+                let nz = n.z.max(0) as usize;
                 for x in 0..n.x {
-                    let (mx, ox) = (lua.create_table()?, lua.create_table()?);
+                    let (mx, ox) = (lua.create_table_with_capacity(n.y.max(0) as usize, 0)?, lua.create_table_with_capacity(n.y.max(0) as usize, 0)?);
                     for y in 0..n.y {
-                        let (my, oy) = (lua.create_table()?, lua.create_table()?);
+                        let mut row_m: Vec<Value> = Vec::with_capacity(nz);
+                        let mut row_o: Vec<f64> = Vec::with_capacity(nz);
                         for z in 0..n.z {
                             let v = a + glam::IVec3::new(x, y, z);
-                            let (m, o) = voxels.get(v.x, v.y, v.z);
-                            let w = voxels.water(v.x, v.y, v.z);
+                            let (m, o) = sampler.get(v.x, v.y, v.z);
+                            let w = sampler.water(v.x, v.y, v.z);
                             let (m, o) = if m == 0 && w > 0.0 { (terrain::WATER, w) } else { (m, o) };
-                            let item = LEnumItem::from_name("Material", terrain::material_name(m))
-                                .map(|e| crate::ltypes::enum_value(lua, e))
-                                .transpose()?
-                                .unwrap_or(Value::Nil);
-                            my.raw_set(z + 1, item)?;
-                            oy.raw_set(z + 1, o as f64)?;
+                            let item = match &items[m as usize] {
+                                Some(item) => item.clone(),
+                                None => {
+                                    let item = LEnumItem::from_name("Material", terrain::material_name(m))
+                                        .map(|e| crate::ltypes::enum_value(lua, e))
+                                        .transpose()?
+                                        .unwrap_or(Value::Nil);
+                                    items[m as usize] = Some(item.clone());
+                                    item
+                                }
+                            };
+                            row_m.push(item);
+                            row_o.push(o as f64);
                         }
-                        mx.raw_set(y + 1, my)?;
-                        ox.raw_set(y + 1, oy)?;
+                        mx.raw_set(y + 1, lua.create_sequence_from(row_m)?)?;
+                        ox.raw_set(y + 1, lua.create_sequence_from(row_o)?)?;
                     }
                     mats.raw_set(x + 1, mx)?;
                     occs.raw_set(x + 1, ox)?;
@@ -857,16 +872,31 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
             let (Value::Table(mats), Value::Table(occs)) = (arg(args, 3), arg(args, 4)) else {
                 return Err(rt_err("Terrain:WriteVoxels: material and occupancy arrays expected"));
             };
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity((n.x.max(0) * n.y.max(0) * n.z.max(0)) as usize);
+            // (an enum item's material, by the item: the same userdata is
+            // passed a few hundred thousand times in a big write)
+            let mut by_item: HashMap<*const std::ffi::c_void, u8> = HashMap::new();
             for x in 0..n.x {
-                let (mx, ox): (Table, Table) = (mats.get(x + 1)?, occs.get(x + 1)?);
+                let (mx, ox): (Table, Table) = (mats.raw_get(x + 1)?, occs.raw_get(x + 1)?);
                 for y in 0..n.y {
-                    let (my, oy): (Table, Table) = (mx.get(y + 1)?, ox.get(y + 1)?);
+                    let (my, oy): (Table, Table) = (mx.raw_get(y + 1)?, ox.raw_get(y + 1)?);
                     for z in 0..n.z {
-                        let m = opt_ud::<LEnumItem>(&my.get::<Value>(z + 1)?)
-                            .and_then(|e| terrain::material_index(&e.name))
-                            .ok_or_else(|| rt_err("Terrain:WriteVoxels: Enum.Material expected"))?;
-                        let o: f64 = oy.get::<Option<f64>>(z + 1)?.unwrap_or(0.0);
+                        let mv = my.raw_get::<Value>(z + 1)?;
+                        let m = match &mv {
+                            Value::UserData(u) => match by_item.get(&u.to_pointer()) {
+                                Some(m) => Some(*m),
+                                None => {
+                                    let m = opt_ud::<LEnumItem>(&mv).and_then(|e| terrain::material_index(&e.name));
+                                    if let Some(m) = m {
+                                        by_item.insert(u.to_pointer(), m);
+                                    }
+                                    m
+                                }
+                            },
+                            _ => None,
+                        };
+                        let m = m.ok_or_else(|| rt_err("Terrain:WriteVoxels: Enum.Material expected"))?;
+                        let o: f64 = oy.raw_get::<Option<f64>>(z + 1)?.unwrap_or(0.0);
                         let v = a + glam::IVec3::new(x, y, z);
                         // WriteVoxels truncates to the byte (FillBlock rounds):
                         // 0.1 / 0.25 / 0.3 / 0.5 / 0.7 / 0.9 read back as
@@ -3164,6 +3194,13 @@ pub(crate) fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value>
                         }) {
                             return Ok(Value::Buffer(lua.create_buffer(b)?));
                         }
+                        // `zbase64` is the same payload zstd-compressed first.
+                        if let Some(b) = m.get("zbase64").and_then(|b| b.as_str()).and_then(|b| {
+                            let z = crate::runtime::domains::services::encoding::base64_decode(b.as_bytes())?;
+                            zstd_unbounded_frame(&z)
+                        }) {
+                            return Ok(Value::Buffer(lua.create_buffer(b)?));
+                        }
                     }
                     _ => {}
                 }
@@ -3175,6 +3212,24 @@ pub(crate) fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value>
             Value::Table(t)
         }
     })
+}
+
+/// Decompresses a zstd payload for JSONDecode's `zbase64` buffers. Frames
+/// that don't record their content size (streaming compressors) are read
+/// through the stream decoder, capped at Luau's 1 GiB buffer limit.
+fn zstd_unbounded_frame(z: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: u64 = 1 << 30;
+    if let Ok(b) = crate::runtime::domains::services::encoding::decompress(z) {
+        return Some(b);
+    }
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::new(z)
+        .ok()?
+        .take(LIMIT + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() as u64 <= LIMIT).then_some(out)
 }
 
 fn guid() -> String {
@@ -5579,8 +5634,22 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         | "SetNetworkOwnershipAuto"
         | "ApplyAngularImpulse"
         | "ApplyDescription"
-        | "ClearCharacterAppearance"
-        | "BindToClose" => none(),
+        | "ClearCharacterAppearance" => none(),
+        "BindToClose" => {
+            let Value::Function(f) = arg(args, 1) else {
+                return Err(rt_err("Unable to cast value to function"));
+            };
+            let ident = super::security::current(lua);
+            let mut w = world(lua)?;
+            if w.side == Side::Client {
+                return Err(rt_err("BindToClose can only be called on the server."));
+            }
+            if w.closing {
+                return Err(rt_err("BindToClose failed because the model is already being closed."));
+            }
+            w.close_callbacks.push((f, ident));
+            none()
+        }
         "SetCore" => {
             if let Value::String(k) = arg(args, 1) {
                 if let Ok(ks) = k.to_str() {
@@ -6993,6 +7062,14 @@ mod tests {
             assert(d.a ~= d.a and d.b == -math.huge)
             local b = H:JSONDecode('{"m":null,"t":"buffer","base64":"AAA="}')
             assert(typeof(b) == "buffer" and buffer.len(b) == 2)
+            -- zbase64: zstd frame of "hello" (content size recorded)
+            local z = H:JSONDecode('{"m":null,"t":"buffer","zbase64":"KLUv/SAFKQAAaGVsbG8="}')
+            assert(typeof(z) == "buffer" and buffer.tostring(z) == "hello", typeof(z))
+            local enc = game:GetService("EncodingService")
+            local big = buffer.fromstring(string.rep("abc", 5000))
+            local zz = enc:CompressBuffer(big, Enum.CompressionAlgorithm.Zstd, 3)
+            local round = H:JSONDecode(`\{"m":null,"t":"buffer","zbase64":"{buffer.tostring(enc:Base64Encode(zz))}"}`)
+            assert(buffer.tostring(round) == string.rep("abc", 5000))
             local arr = H:JSONDecode("[1,null,3]")
             assert(arr[1] == 1 and arr[2] == nil and arr[3] == 3)
             ok, err = pcall(H.JSONDecode, H, "{a:1}")

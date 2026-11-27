@@ -32,6 +32,10 @@ pub struct Game {
     /// The place the next `start_play` plays instead of the edit document,
     /// and how its player arrives (a teleport).
     pub teleport_to: Option<crate::play_teleport::Teleport>,
+    /// `doc` is already Play's server copy (a play worker's, made by
+    /// `start_play_threaded`): `start_play` takes it as the server DataModel
+    /// instead of copying it again.
+    pub doc_is_play_copy: bool,
     /// The live Team Create (universe, place) the Play session began on.
     pub(crate) play_origin: Option<(u64, u64)>,
     /// Stop without the "■ Stopped" line (a teleport's session change).
@@ -135,6 +139,9 @@ pub struct Game {
     pub extra_adorn: Vec<rustudio_render::adorn::AdornDraw>,
     /// Extra Highlight draws for this frame (Team Create collaborator selections).
     pub extra_highlights: Vec<rustudio_render::highlight::HighlightDraw>,
+    /// Whether Play Core UI (`CoreGui`: topbar, leaderboard, chat, backpack, …)
+    /// is shown (View > Show Core UI; off by default in `--headless` runs).
+    pub show_core_gui: bool,
     /// Fingers (touch screens): what the viewport laid out for them and the
     /// movement stick's state (crates/rustudio-engine/src/touch_input.rs).
     pub touch: rustudio_engine::touch_input::Touch,
@@ -178,6 +185,7 @@ impl Game {
             play_thread: None,
             teleport_job: None,
             teleport_to: None,
+            doc_is_play_copy: false,
             quiet_stop: false,
             play_origin: None,
             play_input_pose_due: false,
@@ -237,6 +245,7 @@ impl Game {
             view_render_size: None,
             extra_adorn: Vec::new(),
             extra_highlights: Vec::new(),
+            show_core_gui: true,
             touch: Default::default(),
         }
     }
@@ -313,14 +322,16 @@ impl Game {
             // When a TextBox is focused, Escape blurs the TextBox instead of
             // toggling the Roblox in-game menu.
             let textbox_focused = self.gui.focus.is_some();
-            if esc && !core_scripts && !textbox_focused {
+            if esc && !core_scripts && !textbox_focused && self.show_core_gui {
                 self.toggle_game_menu();
             }
             // Presses this frame: a tap pressed and released within one frame
             // never shows in keys_down, yet scripts must see it. The key
             // positions are physical, like Roblox's KeyCodes (src/keys.rs).
             // (When CoreScripts run and no TextBox is focused, Escape goes to
-            // the client runtime so SettingsHub's ContextActionService handles it.)
+            // the client runtime so SettingsHub's ContextActionService handles it.
+            // Not while Core UI is hidden: SettingsHub would open unseen and its
+            // RbxSettingsHubStopCharacter binding would hold the character.)
             let taps: Vec<Key> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -331,7 +342,7 @@ impl Game {
                             pressed: true,
                             repeat: false,
                             ..
-                        } if (core_scripts && !textbox_focused) || physical_key.unwrap_or(*key) != Key::Escape => {
+                        } if (core_scripts && !textbox_focused && self.show_core_gui) || physical_key.unwrap_or(*key) != Key::Escape => {
                             Some(physical_key.unwrap_or(*key))
                         }
                         _ => None,

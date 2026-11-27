@@ -347,8 +347,15 @@ fn prepare_and_run(
     );
     let raw: serde_json::Value = serde_json::from_str(joined.raw.expose())
         .map_err(|_| NetError::Other("Roblox returned invalid join information".into()))?;
-    let target = QuicTarget::from_join(&joined.join)
-        .map_err(|_| NetError::Other("Roblox returned unsupported transport information".into()))?;
+    let target = QuicTarget::from_join(&joined.join).map_err(|error| {
+        // The reason names a join-script field, never a secret value.
+        log::warn!("Team Create transport for place {place} is unsupported: {error}");
+        NetError::Other("Roblox returned unsupported transport information".into())
+    })?;
+    log::info!(
+        "Team Create transport for place {place}: {}",
+        if target.is_direct() { "direct to the server" } else { "through a UDMUX relay" }
+    );
     let (sync, ticket) = templates();
     let opening = vec![
         Hello::from_client_ticket(joined.join.client_ticket.expose())
@@ -697,8 +704,10 @@ async fn run(
 ) -> Result<()> {
     emit(&tx, &cancel, LiveEvent::Stage(JoinStage::Connecting)).await;
     let (_endpoint, connection, _socket) = tokio::select! {
-        connected = connect_quic(&target) => connected
-            .map_err(|_| NetError::Other("Could not connect to the Team Create server".into()))?,
+        connected = connect_quic(&target) => connected.map_err(|error| {
+            log::warn!("Team Create connection for place {place} failed: {error}");
+            NetError::Other("Could not connect to the Team Create server".into())
+        })?,
         _ = wait_cancelled(&cancel) => return Ok(()),
     };
     if cancel.load(Ordering::Acquire) {

@@ -407,6 +407,35 @@ fn style_prop(name: &str) -> bool {
     )
 }
 
+/// A part property no draw reads: a change to it re-reads nothing. (A
+/// script regrouping or unanchoring the whole map used to rebuild every
+/// part's draw.)
+fn non_visual_prop(name: &str) -> bool {
+    matches!(
+        name,
+        "CollisionGroup"
+            | "CollisionGroupId"
+            | "CanCollide"
+            | "CanTouch"
+            | "CanQuery"
+            | "Anchored"
+            | "Massless"
+            | "CustomPhysicalProperties"
+            | "AssemblyLinearVelocity"
+            | "AssemblyAngularVelocity"
+            | "Velocity"
+            | "RotVelocity"
+            | "RootPriority"
+            | "Locked"
+            | "Attributes"
+            | "Tags"
+            | "EnableFluidForces"
+            | "AudioCanCollide"
+            | "PivotOffset"
+            | "Archivable"
+    )
+}
+
 /// The parts to draw, kept up to date from the document's change journal so
 /// only changed parts are re-read each frame.
 #[derive(Default)]
@@ -690,10 +719,12 @@ impl Scene {
                             moved.insert(r);
                         } else if style_prop(name.as_str()) {
                             restyled.insert(r);
-                        } else {
+                        } else if !non_visual_prop(name.as_str()) {
                             full.insert(r);
                         }
-                    } else if doc.class_of(r).is_some_and(|c| self.is_part_class(c)) {
+                    } else if !non_visual_prop(name.as_str())
+                        && doc.class_of(r).is_some_and(|c| self.is_part_class(c))
+                    {
                         full.insert(r);
                     }
                     if let Some(o) = self.owners.get(&r) {

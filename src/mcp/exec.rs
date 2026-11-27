@@ -68,6 +68,21 @@ impl Editor {
             "get_source" => self.mcp_get_source(a).map(Into::into),
             "grep_scripts" => self.mcp_grep(a).map(Into::into),
             "read_output" => Ok(self.mcp_read_output(a).into()),
+            "web_stats" => {
+                let stats = rustudio_account::web::stats();
+                if a.get("reset").and_then(|v| v.as_bool()) == Some(true) {
+                    rustudio_account::web::reset_stats();
+                }
+                let (batches, resolved, cache_hits) = rustudio_account::asset_batch::counters();
+                Ok(ToolResult::json(&serde_json::json!({
+                    "hosts": stats,
+                    "asset_batch": { "batches": batches, "resolved": resolved, "cache_hits": cache_hits },
+                    "thumbs": rustudio_account::thumbs::counters(),
+                    "users": rustudio_account::users::counters().0,
+                    "usernames": rustudio_account::users::counters().1,
+                }))
+                .into())
+            }
             "screenshot" => {
                 let mode = match s(a, "mode").unwrap_or("viewport").to_ascii_lowercase().as_str() {
                     "window" | "full" => ShotMode::Window,
@@ -702,8 +717,10 @@ impl Editor {
         if self.game.play.is_none() {
             return Ok(Step::Done(ToolResult::text("Not playing")));
         }
-        self.stop_play();
-        Ok(Step::Wait(Op::Play { want: false }, Duration::from_secs(60)))
+        // As the Stop button: BindToClose callbacks get up to the shutdown
+        // deadline (30 s) before the session ends.
+        self.request_stop();
+        Ok(Step::Wait(Op::Play { want: false }, Duration::from_secs(90)))
     }
 
     fn mcp_play_state(&self) -> J {

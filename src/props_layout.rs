@@ -218,7 +218,7 @@ mod tests {
             ("Surface", &["BackSurface", "BottomSurface", "FrontSurface", "LeftSurface", "RightSurface", "TopSurface"]),
         ]));
         assert_eq!(names("Model"), want(&[
-            ("Appearance", &["LevelOfDetail"]),
+            ("Appearance", &["ExplorerIconContent", "LevelOfDetail"]),
             ("Data", &["Archivable", "ClassName", "Name", "Parent", "UniqueId"]),
             ("Transform", &["Origin"]),
             ("Pivot", &["PrimaryPart", "Scale", "WorldPivot"]),
@@ -231,15 +231,37 @@ mod tests {
         ]));
         assert_eq!(names("ScreenGui"), want(&[
             ("Appearance", &["ClipToDeviceSafeArea", "SafeAreaCompatibility", "ScreenInsets"]),
-            ("Data", &["Archivable", "AbsolutePosition", "AbsoluteRotation", "AbsoluteSize", "ClassName", "DisplayOrder", "Enabled", "IgnoreGuiInset", "Name", "Parent", "ResetOnSpawn", "UniqueId", "ZIndexBehavior"]),
+            ("Data", &["Archivable", "AbsolutePosition", "AbsoluteRotation", "AbsoluteSize", "ClassName", "DisplayOrder", "Enabled", "IgnoreGuiInset", "InputSinkEnabled", "Name", "Parent", "ResetOnSpawn", "UniqueId", "ZIndexBehavior"]),
             ("Localization", &["AutoLocalize", "RootLocalizationTable"]),
             ("Selection", &["SelectionGroup"]),
         ]));
         assert_eq!(names("Lighting"), want(&[
-            ("Appearance", &["Ambient", "Brightness", "ColorShift_Bottom", "ColorShift_Top", "EnvironmentDiffuseScale", "EnvironmentSpecularScale", "GlobalShadows", "LightingStyle", "OutdoorAmbient", "PrioritizeLightingQuality", "ShadowSoftness"]),
+            ("Appearance", &["Ambient", "Brightness", "ColorShift_Bottom", "ColorShift_Top", "EnvironmentDiffuseScale", "EnvironmentSpecularScale", "GlobalShadows", "LightAttenuationMode", "LightingStyle", "OutdoorAmbient", "PrioritizeLightingQuality", "ShadowSoftness"]),
             ("Data", &["Archivable", "ClassName", "ClockTime", "GeographicLatitude", "Name", "Parent", "TimeOfDay", "UniqueId"]),
             ("Exposure", &["ExposureCompensation"]),
             ("Fog", &["FogColor", "FogEnd", "FogStart"]),
         ]));
+    }
+
+    #[test]
+    fn gui_classes_match_studio_category_order() {
+        if crate::studio_panels::member_meta().is_empty() {
+            return;
+        }
+        let cat_names = |cls: &str| rows(cls, true).into_iter().map(|c| c.name).collect::<Vec<_>>();
+        assert_eq!(cat_names("Frame"), vec!["Appearance", "Data", "Behavior", "Localization", "Selection", "State"]);
+        assert_eq!(cat_names("TextLabel"), vec!["Appearance", "Data", "Behavior", "Localization", "Selection", "State", "Text"]);
+        assert_eq!(cat_names("ImageLabel"), vec!["Appearance", "Data", "Behavior", "Image", "Localization", "Selection", "State"]);
+        assert_eq!(cat_names("UIGradient"), vec!["Appearance", "Data"]);
+        // Key GUI properties appear in their expected categories.
+        let tl = names("TextLabel");
+        let text_rows = &tl.iter().find(|(c, _)| c == "Text").unwrap().1;
+        assert!(text_rows.contains(&"FontFace".to_string()));
+        assert!(text_rows.contains(&"Text".to_string()));
+        assert!(!text_rows.contains(&"Font".to_string()), "deprecated legacy Font should stay hidden");
+        let il = names("ImageLabel");
+        let img_rows = &il.iter().find(|(c, _)| c == "Image").unwrap().1;
+        assert!(img_rows.contains(&"SliceCenter".to_string()));
+        assert!(img_rows.contains(&"Image".to_string()));
     }
 }

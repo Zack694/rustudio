@@ -471,8 +471,10 @@ pub struct AssetStore {
     pending: HashSet<AssetRef>,
     failed: HashMap<AssetRef, String>,
     memory: HashMap<AssetRef, Arc<Vec<u8>>>,
-    tx: Sender<(AssetRef, Result<(), String>)>,
-    rx: Receiver<(AssetRef, Result<(), String>)>,
+    /// Finished jobs: the bytes (downloaded or read from the disk cache on
+    /// a worker), straight into `memory`, so the frame never reads files.
+    tx: Sender<(AssetRef, Result<Arc<Vec<u8>>, String>)>,
+    rx: Receiver<(AssetRef, Result<Arc<Vec<u8>>, String>)>,
     /// Lines for the Output panel.
     pub messages: Vec<String>,
     /// Said once: Roblox wants a signed-in session for these downloads.
@@ -481,8 +483,24 @@ pub struct AssetStore {
     /// sign-in: handed back from `poll` for the caches to retry.
     deferred: Vec<AssetRef>,
     /// Results `wait_pending` took off the channel, for the next `poll`.
-    early: Vec<(AssetRef, Result<(), String>)>,
+    early: Vec<(AssetRef, Result<Arc<Vec<u8>>, String>)>,
+    /// The downloads since the queue was last empty: one progress figure
+    /// and one summary line instead of a line per asset.
+    burst: Burst,
 }
+
+#[derive(Default)]
+struct Burst {
+    started: Option<Instant>,
+    /// The last time an asset was asked for or finished: a burst ends after
+    /// a quiet second, so assets asked a few frames apart count as one load.
+    last_activity: Option<Instant>,
+    queued: usize,
+    loaded: usize,
+    failed: usize,
+}
+
+const BURST_QUIET: Duration = Duration::from_secs(1);
 
 impl Default for AssetStore {
     fn default() -> Self {
@@ -499,6 +517,7 @@ impl Default for AssetStore {
             auth_told: false,
             deferred: Vec::new(),
             early: Vec::new(),
+            burst: Burst::default(),
         }
     }
 }
@@ -508,6 +527,19 @@ static SESSION: Mutex<Option<SharedClient>> = Mutex::new(None);
 
 pub fn session_client() -> Option<SharedClient> {
     SESSION.lock().ok()?.clone()
+}
+
+/// Signed in: starts resolving where `id` is (batched with everything else
+/// wanted now, rustudio_account::asset_batch) while its download waits for
+/// a worker, which then only fetches the bytes.
+fn resolve_ahead(id: u64, version: Option<u64>) {
+    if crate::sim_clock::on() {
+        return; // (fixed-step runs fetch in order, as they always have)
+    }
+    let session = session_client().and_then(|c| Some(c.lock().ok()?.as_ref()?.session.downloader()));
+    if let Some(s) = session {
+        rustudio_account::asset_batch::prefetch(&Arc::new(s), id, version);
+    }
 }
 
 /// Whether a session is signed in (for downloads that wait).
@@ -641,8 +673,9 @@ pub enum Priority {
 }
 
 /// Preloads downloading at once, out of [`MAX_ASSET_DOWNLOADS`]: the rest
-/// of the slots stay free for what is needed now.
-pub const MAX_PRELOAD_DOWNLOADS: usize = 4;
+/// of the slots stay free for what is needed now. (With locations resolved
+/// in batches ahead, a slot only fetches bytes from the CDN.)
+pub const MAX_PRELOAD_DOWNLOADS: usize = 8;
 
 struct Scheduler {
     state: Mutex<Queues>,
@@ -765,6 +798,9 @@ pub fn preload_content(id: &str, done: Arc<Mutex<Option<bool>>>) {
         map.insert(key.clone(), vec![done]);
     }
     let id = id.to_string();
+    if let Some(n) = id.rsplit(['/', '=']).next().and_then(|n| n.trim().parse::<u64>().ok()) {
+        resolve_ahead(n, None);
+    }
     schedule(Priority::Preload, move || {
         let ok = script_content_blocking(&id).is_ok();
         let waiters = WAITERS
@@ -821,7 +857,7 @@ pub fn remote_cached(id: u64) -> Result<Arc<Vec<u8>>, String> {
 
 fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     let a = AssetRef { id, version: None };
-    if let Ok(b) = std::fs::read(cache_path(a)) {
+    if let Some(b) = crate::asset_cache::read(a) {
         return Ok(Arc::new(b));
     }
     // The upload ledger's source files first (the person's own uploads);
@@ -832,7 +868,7 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     let fetched = match refused(id) {
         Some(why) => Err(why),
         None => download_shared(a, || {
-            if let Ok(b) = std::fs::read(cache_path(a)) {
+            if let Some(b) = crate::asset_cache::read(a) {
                 return Ok(b);
             }
             let b = download_asset_bytes(id)?;
@@ -851,16 +887,13 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     }
 }
 
-/// Saves downloaded bytes under the asset's cache path.
+/// Saves downloaded bytes under the asset's cache path (atomically, with
+/// their CDN content key: asset_cache.rs).
 fn write_cache(a: AssetRef, bytes: &[u8]) {
-    let path = cache_path(a);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&path, bytes);
+    let _ = crate::asset_cache::write_asset(a, bytes);
 }
 
-const MAX_ASSET_DOWNLOADS: usize = 12;
+const MAX_ASSET_DOWNLOADS: usize = 16;
 const ASSET_BACKOFF: [Duration; 4] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -895,7 +928,12 @@ static ASSET_WORKERS: LazyLock<()> = LazyLock::new(|| {
             let (job, priority) = SCHEDULER.next();
             {
                 let _p = crate::profiler::scope("asset_download", crate::profiler::Cat::Assets);
-                job();
+                // The shared web layer lets visible content ahead of preloads.
+                let web_priority = match priority {
+                    Priority::Needed => rustudio_account::web::Priority::Visible,
+                    Priority::Preload => rustudio_account::web::Priority::Prefetch,
+                };
+                rustudio_account::web::with_priority(web_priority, job);
             }
             SCHEDULER.finished(priority);
         });
@@ -980,7 +1018,8 @@ impl AssetDownloads {
                 return result;
             };
             // Even a 429 on the last attempt pauses everyone else.
-            let backoff = self.backoff[attempt.min(self.backoff.len() - 1)];
+            // (jittered, so a burst of failures doesn't retry in lockstep)
+            let backoff = rustudio_account::web::jittered(self.backoff[attempt.min(self.backoff.len() - 1)]);
             let delay = retry_after
                 .as_ref()
                 .and_then(|header| header.to_str().ok())
@@ -1209,6 +1248,18 @@ fn content_blocking_inner(id: &str, paths: bool) -> Result<Arc<Vec<u8>>, String>
     }
 }
 
+/// Whether a script asking for `id` now has to wait for a download, which
+/// this starts on the asset workers if it isn't under way. Only Roblox asset
+/// ids ever wait: generated, local and `rbxasset://` content is at hand.
+/// (Studio's `*Async` loads yield the calling thread while the asset comes
+/// in; rustudio's methods read the bytes once this says they're there.)
+pub fn script_fetch_pending(id: &str) -> bool {
+    match asset_ref(id) {
+        Some(a) if a.version.is_none() && !cache_path(a).exists() => matches!(public_prefetch(a.id), Fetch::Pending),
+        _ => false,
+    }
+}
+
 /// Non-blocking [`public_cached`]: Ready once the bytes are on disk (or in
 /// the local store), Pending while a background thread downloads them.
 /// Scripts use it so an asset load never stalls a frame (Roblox loads
@@ -1261,6 +1312,7 @@ fn public_prefetch_inner(id: u64) -> Fetch {
     }
     map.insert(id, None);
     drop(g);
+    resolve_ahead(id, None);
     // On the asset workers, ahead of preloads (a track was made for this
     // clip, a sound was told to play): a thread per id made a client
     // warming 1400 animations spawn 1400 threads.
@@ -1324,52 +1376,31 @@ fn fetch_rbxthumb(uri: &str) -> Fetch {
             return Fetch::Ready(b);
         }
     }
-    let api_url = match kind {
-        "AvatarHeadShot" => format!(
-            "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "AvatarBust" => format!(
-            "https://thumbnails.roblox.com/v1/users/avatar-bust?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "Avatar" => format!(
-            "https://thumbnails.roblox.com/v1/users/avatar?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "Asset" => format!(
-            "https://thumbnails.roblox.com/v1/assets?assetIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "GameIcon" => format!(
-            "https://thumbnails.roblox.com/v1/games/icons?universeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "BadgeIcon" => format!(
-            "https://thumbnails.roblox.com/v1/badges/icons?badgeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "GroupIcon" => format!(
-            "https://thumbnails.roblox.com/v1/groups/icons?groupIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        "Outfit" => format!(
-            "https://thumbnails.roblox.com/v1/users/outfits?userOutfitIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
-        ),
-        _ => return Fetch::Unavailable(format!("unsupported rbxthumb type '{kind}'")),
-    };
+    // (The thumbnails batch takes these types; a typo'd one fails here.)
+    const KINDS: &[&str] = &["AvatarHeadShot", "AvatarBust", "Avatar", "Asset", "GameIcon", "BadgeIcon", "GroupIcon", "Outfit"];
+    if !KINDS.contains(&kind) {
+        return Fetch::Unavailable(format!("unsupported rbxthumb type '{kind}'"));
+    }
+    let thumb: rustudio_account::thumbs::Key = (kind.to_string(), id, sz);
     map.insert(key.clone(), None);
     std::thread::spawn(move || {
         let r = (|| -> Result<Arc<Vec<u8>>, String> {
+            // Batched with every other thumbnail asked for meanwhile; one
+            // Roblox is still rendering is asked again, backing off.
+            let mut wait = std::time::Duration::from_millis(500);
+            let mut tries = 0;
+            let img_url = loop {
+                match rustudio_account::thumbs::url(&thumb) {
+                    Err(e) if e == rustudio_account::thumbs::PENDING && tries < 6 => {
+                        std::thread::sleep(wait);
+                        wait *= 2;
+                        tries += 1;
+                    }
+                    r => break r?,
+                }
+            };
             let agent = rustudio_account::api::agent();
-            let mut resp = agent.get(&api_url).call().map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("HTTP {}", resp.status().as_u16()));
-            }
-            let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
-            let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            let img_url = v
-                .get("data")
-                .and_then(|d| d.as_array())
-                .and_then(|a| a.first())
-                .and_then(|e| e.get("imageUrl"))
-                .and_then(|u| u.as_str())
-                .filter(|u| !u.is_empty())
-                .ok_or_else(|| "thumbnail not ready".to_string())?;
-            let mut img_resp = agent.get(img_url).call().map_err(|e| e.to_string())?;
+            let mut img_resp = agent.get(&img_url).call().map_err(|e| e.to_string())?;
             if !img_resp.status().is_success() {
                 return Err(format!("image HTTP {}", img_resp.status().as_u16()));
             }
@@ -1382,7 +1413,7 @@ fn fetch_rbxthumb(uri: &str) -> Fetch {
             if let Some(parent) = disk.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&disk, &bytes);
+            let _ = crate::asset_cache::write_atomic(&disk, &bytes);
             Ok(Arc::new(bytes))
         })();
         if let Ok(mut g) = STATES.lock() {
@@ -1490,10 +1521,15 @@ impl AssetStore {
         if self.pending.contains(&a) {
             return Fetch::Pending;
         }
-        if let Ok(b) = std::fs::read(cache_path(a)) {
-            let b = Arc::new(b);
-            self.memory.insert(a, b.clone());
-            return Fetch::Ready(b);
+        // The disk cache is read on a worker (below) rather than in the
+        // frame, except in fixed-step runs, which count frames exactly.
+        let sync_disk = crate::sim_clock::on();
+        if sync_disk {
+            if let Some(b) = crate::asset_cache::read(a) {
+                let b = Arc::new(b);
+                self.memory.insert(a, b.clone());
+                return Fetch::Ready(b);
+            }
         }
         // The person's own upload's source file; the local store only once
         // Roblox's copy failed (`poll`, `local_store_path`).
@@ -1524,11 +1560,15 @@ impl AssetStore {
         // The check's worker sets SESSION a frame before `set_client` runs.
         let client = self.client.clone().or_else(session_client);
         self.pending.insert(a);
+        self.burst.started.get_or_insert_with(Instant::now);
+        self.burst.last_activity = Some(Instant::now());
+        self.burst.queued += 1;
         let tx = self.tx.clone();
+        resolve_ahead(a.id, a.version);
         schedule(Priority::Needed, move || {
             let result = download_shared(a, || {
                 // (a preload may have cached it while this job queued)
-                if let Ok(bytes) = std::fs::read(cache_path(a)) {
+                if let Some(bytes) = crate::asset_cache::read(a) {
                     return Ok(bytes);
                 }
                 // Copy the session out so downloads run side by side.
@@ -1541,14 +1581,9 @@ impl AssetStore {
                         || public_asset_typed(a.id),
                     )
                     .map_err(|error| download_error(a.id, error))?;
-                let path = cache_path(a);
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                }
-                std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+                crate::asset_cache::write_asset(a, &bytes).map_err(|e| e.to_string())?;
                 Ok(bytes)
-            })
-            .map(|_| ());
+            });
             content_track(
                 &format!(
                     "rbxassetid://{}{}",
@@ -1573,8 +1608,10 @@ impl AssetStore {
         for (a, r) in got {
             self.pending.retain(|p| *p != a);
             match r {
-                Ok(()) => {
-                    self.messages.push(format!("Downloaded asset {}", a.id));
+                Ok(bytes) => {
+                    self.burst.loaded += 1;
+                    self.burst.last_activity = Some(Instant::now());
+                    self.memory.insert(a, bytes);
                     done.push(a);
                 }
                 Err(e) => {
@@ -1599,11 +1636,36 @@ impl AssetStore {
                     }
                     self.messages
                         .push(format!("Asset {} could not be downloaded: {e}", a.id));
+                    self.burst.failed += 1;
+                    self.burst.last_activity = Some(Instant::now());
                     self.failed.insert(a, e);
                 }
             }
         }
+        let quiet = self.burst.last_activity.is_none_or(|t| t.elapsed() >= BURST_QUIET);
+        if self.pending.is_empty() && quiet {
+            if let Some(t0) = self.burst.started.take() {
+                let elapsed = self.burst.last_activity.map_or(t0.elapsed(), |t| t.duration_since(t0));
+                let b = std::mem::take(&mut self.burst);
+                if b.loaded + b.failed > 0 {
+                    let failed = if b.failed > 0 { format!(", {} could not be loaded", b.failed) } else { String::new() };
+                    self.messages.push(format!(
+                        "Loaded {} asset{} in {:.1} s{failed}",
+                        b.loaded,
+                        if b.loaded == 1 { "" } else { "s" },
+                        elapsed.as_secs_f64()
+                    ));
+                }
+            }
+        }
         done
+    }
+
+    /// While downloads are under way: (finished, asked for) since the queue
+    /// was last empty, for a progress readout.
+    pub fn progress(&self) -> Option<(usize, usize)> {
+        (self.burst.started.is_some() && !self.pending.is_empty())
+            .then(|| (self.burst.loaded + self.burst.failed, self.burst.queued.max(1)))
     }
 
     pub fn busy(&self) -> bool {

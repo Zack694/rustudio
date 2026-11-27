@@ -255,9 +255,35 @@ fn parse(text: &str) -> Option<Rules> {
 
 fn rules() -> Option<&'static Rules> {
     static RULES: OnceLock<Option<Rules>> = OnceLock::new();
-    RULES
-        .get_or_init(|| parse(&std::fs::read_to_string(dump_path()).ok()?))
-        .as_ref()
+    RULES.get_or_init(|| load_rules().map_err(|e| eprintln!("{e}")).ok()).as_ref()
+}
+
+/// The member security rules, from the pinned Studio's own API dump only: a
+/// missing, unreadable or different dump is an error, not "no rules".
+fn load_rules() -> Result<Rules, String> {
+    load_rules_from(&dump_path())
+}
+
+fn load_rules_from(path: &std::path::Path) -> Result<Rules, String> {
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Script security rules unavailable: {}: {e}", path.display()))?;
+    let normalized = text.replace(char::from(13), "");
+    let got = rustudio_core::studio_target::sha256_hex(normalized.as_bytes());
+    if got != rustudio_core::studio_target::API_DUMP {
+        return Err(format!(
+            "Script security rules unavailable: {} is not Studio {}'s API dump (sha256 {got})",
+            path.display(),
+            rustudio_core::studio_target::VERSION,
+        ));
+    }
+    parse(&text).ok_or_else(|| format!("Script security rules unavailable: {} did not parse", path.display()))
+}
+
+/// Whether the member security rules loaded. Place scripts don't run without
+/// them (run_script_as): every restricted-member check depends on them, and
+/// running with none would let a game script call anything.
+pub fn rules_ready() -> bool {
+    rules().is_some()
 }
 
 /// Every restricted member name (any class): the hot path's one lookup.
@@ -722,6 +748,22 @@ pub fn seal(lua: &Lua) -> mlua::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Missing or tampered rules are an error (scripts then don't run),
+    /// never "no restrictions"; the bundled pinned dump loads.
+    #[test]
+    fn security_rules_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("rs-sec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.json");
+        assert!(super::load_rules_from(&missing).is_err());
+        let tampered = dir.join("tampered.json");
+        std::fs::write(&tampered, r#"{"Classes":[],"Enums":[],"Version":1}"#).unwrap();
+        assert!(super::load_rules_from(&tampered).err().unwrap_or_default().contains("is not Studio"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(super::load_rules_from(&rustudio_core::paths::resource("api-dump.json")).is_ok());
+        assert!(super::rules_ready());
+    }
     use super::*;
 
     /// A client runtime with a LocalScript `src` in StarterPlayerScripts
@@ -922,6 +964,44 @@ mod tests {
         assert!(as_cmd.is_err());
         let as_core: f64 = with_main_identity(&rt.lua, CORE, || rt.lua.load(code).eval()).unwrap();
         assert!((as_core - 0.3).abs() < 1e-6, "{as_core}");
+    }
+
+    /// A game script's SetCore value reaches a CoreScript handler the way a
+    /// Bindable argument would (copied, no metatable, no raw functions), and
+    /// the handler runs at the CoreScript's identity on its own thread.
+    #[test]
+    fn set_core_copies_values_and_runs_at_registrant_identity() {
+        let (rt, _) = client("");
+        with_main_identity(&rt.lua, CORE, || {
+            rt.lua
+                .load(
+                    r#"game:GetService("StarterGui"):RegisterSetCore("ProbeCore", function(v)
+                        _G.probe = {
+                            privileged = pcall(settings),
+                            mt = getmetatable(v),
+                            fn = v.f,
+                            x = v.x,
+                            nested = v.t and getmetatable(v.t),
+                        }
+                    end)"#,
+                )
+                .exec()
+        })
+        .unwrap();
+        let out: String = with_main_identity(&rt.lua, GAME, || {
+            rt.lua
+                .load(
+                    r#"local hits = 0
+                    local evil = setmetatable({}, {__index = function() hits += 1 end})
+                    local v = setmetatable({x = 1, f = print, t = evil}, {__index = function() hits += 1 end})
+                    game:GetService("StarterGui"):SetCore("ProbeCore", v)
+                    local p = _G.probe
+                    return string.format("%s %s %s %s %s %d", tostring(p.privileged), tostring(p.mt), tostring(p.fn), tostring(p.x), tostring(p.nested), hits)"#,
+                )
+                .eval()
+        })
+        .unwrap();
+        assert_eq!(out, "true nil nil 1 nil 0");
     }
 
     /// A module's name can't impersonate an engine chunk (#16): game

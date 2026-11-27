@@ -71,6 +71,15 @@ pub fn lost() -> Option<&'static str> {
     LOST.get().map(String::as_str)
 }
 
+/// Records the device as lost (for a handler that replaces `watch`'s, like
+/// the Android build's, and for a renderer step that finds the device's
+/// buffers gone before wgpu has said why): `lost` answers from here on and
+/// uploads that would panic on destroyed buffers are skipped
+/// (world_gui.rs `stage`).
+pub fn mark_lost(text: String) {
+    let _ = LOST.set(text);
+}
+
 /// Call at the top of a frame: once the device is lost nothing more can be
 /// drawn, so stop with the reason in the crash report (shown on the next
 /// start) instead of a frozen window.

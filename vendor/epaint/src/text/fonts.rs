@@ -951,6 +951,11 @@ impl FontsView<'_> {
         self.fonts.atlas.fill_ratio()
     }
 
+    /// rustudio: the atlas generation; it changes whenever every glyph moves.
+    pub fn atlas_generation(&self) -> u64 {
+        self.fonts.generation
+    }
+
     /// Will wrap text at the given width and line break at `\n`.
     ///
     /// The implementation uses memoization so repeated calls are cheap.
@@ -1008,7 +1013,16 @@ pub struct FontsImpl {
 
     /// Recycled `harfrust` shaping buffer to avoid per-layout allocations.
     shape_buffer: Option<harfrust::UnicodeBuffer>,
+
+    /// rustudio: which atlas this is (unique per `FontsImpl`). A new one
+    /// (fonts added, options changed, atlas almost full) re-packs every glyph,
+    /// so anything that kept painted text (rustudio's panel snapshots) must
+    /// not be replayed across a change of generation.
+    generation: u64,
 }
+
+/// rustudio: source of [`FontsImpl`] atlas generations.
+static ATLAS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl FontsImpl {
     /// Create a new [`FontsImpl`] for text layout.
@@ -1057,7 +1071,13 @@ impl FontsImpl {
             fonts_by_name,
             family_cache: Default::default(),
             shape_buffer: Some(harfrust::UnicodeBuffer::new()),
+            generation: ATLAS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// rustudio: this atlas's generation (see the field).
+    pub fn atlas_generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn options(&self) -> &TextOptions {

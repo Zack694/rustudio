@@ -581,10 +581,27 @@ impl CloudUi {
                 return;
             }
             origin.local_copy = as_copy && st.enabled == Some(true);
-            let opened = match a.download(place, version) {
-                Ok((bytes, v)) => {
+            // The version on disk is reused when it's the one Roblox has
+            // (a place file can be big; it used to be downloaded every open).
+            let have = |v: u64| cache.load(place, Some(v)).is_some();
+            let fetched = a.download_unless_cached(place, version, have).and_then(|(v, bytes)| match bytes {
+                Some(bytes) => Ok((v, bytes, None)),
+                None => cache
+                    .load(place, Some(v))
+                    .map(|(_, bytes, path)| (v, bytes, Some(path)))
+                    .ok_or_else(|| rustudio_account::Error(format!("place {place}: cached version {v} went missing"))),
+            });
+            let opened = match fetched {
+                Ok((v, bytes, cached_path)) => {
                     origin.version = v;
-                    let cache_file = cache.store(&origin, &bytes).ok();
+                    let reused = cached_path.is_some();
+                    let cache_file = match cached_path {
+                        Some(p) => Some(p),
+                        None => cache.store(&origin, &bytes).ok(),
+                    };
+                    if reused {
+                        let _ = tx.send(Msg::Log(Level::Info, format!("Opened {what} version {v} from the local copy (unchanged on Roblox)")));
+                    }
                     Opened {
                         origin,
                         bytes,
@@ -621,19 +638,45 @@ impl CloudUi {
         self.save_error = None;
         self.conflict = None;
         self.save_pending = true;
-        let (dom, roots) = doc.save_snapshot();
+        // Studio compresses uploaded place chunks with zstd
+        // (DFFlagStudioZstdPlaceUploadCompressionRollout).
+        let encode = |dom: &rbx_dom_weak::WeakDom, roots: &[rbx_types::Ref]| -> Result<Vec<u8>, String> {
+            let mut bytes = Vec::new();
+            rbx_binary::Serializer::new()
+                .compression_type(rbx_binary::CompressionType::Zstd)
+                .serialize(&mut bytes, dom, roots)
+                .map_err(|err| format!("Could not encode the place: {err}"))?;
+            Ok(bytes)
+        };
+        // On a desktop the tree is copied and encoded on the upload's
+        // thread, so the editor goes on while a big place is encoded. A
+        // phone has no room for the copy: a place of some size doubled in
+        // memory at the press of Publish and the system killed the process
+        // on the spot, with no report (the kill is the kernel's, not a
+        // crash of ours). There the place is encoded here, from the tree
+        // itself, as Save to File does — a pause of a second or two on a
+        // big place — and only the bytes go to the thread.
+        let encoded: Option<Result<Vec<u8>, String>> = cfg!(target_os = "android").then(|| {
+            let started = std::time::Instant::now();
+            let r = encode(&doc.dom, &doc.save_roots());
+            if let Ok(b) = &r {
+                log::info!("cloud: place encoded for the upload in {:.2}s, {} bytes", started.elapsed().as_secs_f32(), b.len());
+            }
+            r
+        });
+        let snapshot = if encoded.is_none() { Some(doc.save_snapshot()) } else { None };
         let cache = self.cache.clone();
         self.spawn(self.factory(client), move |api, tx| {
             let result = (|| {
                 let mut api = api.ok_or_else(|| "Sign in to save or publish places to Roblox".to_owned())?;
                 api.session = api.session.with_timeout(std::time::Duration::from_secs(20));
-                // Studio compresses uploaded place chunks with zstd
-                // (DFFlagStudioZstdPlaceUploadCompressionRollout).
-                let mut bytes = Vec::new();
-                rbx_binary::Serializer::new()
-                    .compression_type(rbx_binary::CompressionType::Zstd)
-                    .serialize(&mut bytes, &dom, &roots)
-                    .map_err(|err| format!("Could not encode the place: {err}"))?;
+                let bytes = match encoded {
+                    Some(bytes) => bytes?,
+                    None => {
+                        let (dom, roots) = snapshot.expect("a snapshot or the encoded place");
+                        encode(&dom, &roots)?
+                    }
+                };
                 let (mut origin, outcome) = if let Some(origin) = job.origin.take() {
                     let outcome = api.save_place(&origin, &bytes, false, job.vt, overwrite)
                         .map_err(|err| err.0)?;
@@ -1402,7 +1445,8 @@ impl Editor {
                             && live_terrain_without_voxels(&self.game.doc).is_some())
                             || live_missing_terrain_style(&self.game.doc)
                         {
-                            live.saved_terrain = self.game.account.shared_client().and_then(|client| saved_terrain(client, live.place));
+                            let endpoints = self.cloud.endpoints.clone();
+                            live.saved_terrain = self.game.account.shared_client().and_then(|client| saved_terrain(client, endpoints, live.place));
                         }
                         self.report_live_conflicts(&mut live);
                     }
@@ -2725,6 +2769,70 @@ pub(crate) struct SavedPlaceTerrain {
 }
 
 impl SavedPlaceTerrain {
+    const MAGIC: &'static [u8] = b"RSPT1";
+
+    /// A compact file form for the per-version cache (`saved_terrain`).
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Self::MAGIC.to_vec();
+        for bytes in [&self.smooth_grid, &self.material_colors] {
+            match bytes {
+                Some(b) => {
+                    out.push(1);
+                    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    out.extend_from_slice(b);
+                }
+                None => out.push(0),
+            }
+        }
+        match self.grass_length {
+            Some(g) => {
+                out.push(1);
+                out.extend_from_slice(&g.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        for flag in [self.decoration, self.use_2022_materials] {
+            out.push(match flag {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            });
+        }
+        out
+    }
+
+    fn decode(b: &[u8]) -> Option<Self> {
+        let b = b.strip_prefix(Self::MAGIC)?;
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Option<Vec<u8>> {
+            let head = b.get(at..at + n)?.to_vec();
+            at += n;
+            Some(head)
+        };
+        let mut blob = || -> Option<Option<Vec<u8>>> {
+            if take(1)?[0] == 0 {
+                return Some(None);
+            }
+            let len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+            Some(Some(take(len)?))
+        };
+        let smooth_grid = blob()?;
+        let material_colors = blob()?;
+        drop(blob);
+        let grass_length = match take(1)?[0] {
+            0 => None,
+            _ => Some(f32::from_le_bytes(take(4)?.try_into().ok()?)),
+        };
+        let flag = |v: u8| match v {
+            0 => None,
+            1 => Some(false),
+            _ => Some(true),
+        };
+        let decoration = flag(take(1)?[0]);
+        let use_2022_materials = flag(take(1)?[0]);
+        Some(SavedPlaceTerrain { smooth_grid, material_colors, grass_length, decoration, use_2022_materials })
+    }
+
     fn is_empty(&self) -> bool {
         self.smooth_grid.is_none()
             && self.material_colors.is_none()
@@ -2734,16 +2842,36 @@ impl SavedPlaceTerrain {
     }
 }
 
-/// Fetches the place's latest saved version on a worker and hands back its
-/// Terrain voxels and material/grass styling properties.
-fn saved_terrain(client: rustudio_core::assets::SharedClient, place: u64) -> Option<std::sync::mpsc::Receiver<SavedPlaceTerrain>> {
+/// Hands back, on a worker, the Terrain voxels and material/grass styling
+/// of the place's latest saved version. They are kept per place version
+/// (`place-terrain/{place}_v{version}.bin`, tiny next to the place file), so
+/// a join only asks which version is current; the place file is downloaded
+/// once per published version (a place with no terrain used to be
+/// downloaded whole on every join).
+fn saved_terrain(
+    client: rustudio_core::assets::SharedClient,
+    endpoints: Endpoints,
+    place: u64,
+) -> Option<std::sync::mpsc::Receiver<SavedPlaceTerrain>> {
     let session = client.lock().ok()?.as_ref()?.session.downloader();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("tc-saved-terrain".into())
         .spawn(move || {
-            let Ok(bytes) = session.download_asset(place, None) else { return };
-            if let Some(saved) = saved_place_terrain_of_place(&bytes) {
+            let api = CloudApi::new(session, endpoints, None);
+            let Ok(version) = api.latest_version(place) else { return };
+            let path = rustudio_core::assets::cache_dir().join("place-terrain").join(format!("{place}_v{version}.bin"));
+            if let Some(saved) = std::fs::read(&path).ok().and_then(|b| SavedPlaceTerrain::decode(&b)) {
+                if !saved.is_empty() {
+                    let _ = tx.send(saved);
+                }
+                return;
+            }
+            let Ok((bytes, got)) = api.download(place, Some(version)) else { return };
+            let saved = saved_place_terrain_of_place(&bytes).unwrap_or_default();
+            let path = path.with_file_name(format!("{place}_v{got}.bin"));
+            let _ = rustudio_core::asset_cache::write_atomic(&path, &saved.encode());
+            if !saved.is_empty() {
                 let _ = tx.send(saved);
             }
         })
@@ -2924,4 +3052,23 @@ mod saved_terrain_tests {
         assert_eq!(saved.decoration, Some(true));
         assert_eq!(saved.use_2022_materials, Some(true));
     }
+}
+
+/// The per-version saved-terrain cache round-trips every field, and an
+/// empty one (a place with no terrain) is remembered too.
+#[cfg(test)]
+#[test]
+fn saved_terrain_cache_round_trips() {
+    let full = SavedPlaceTerrain {
+        smooth_grid: Some(vec![1, 2, 3, 250]),
+        material_colors: Some(vec![9; 69]),
+        grass_length: Some(0.7),
+        decoration: Some(true),
+        use_2022_materials: Some(false),
+    };
+    assert_eq!(SavedPlaceTerrain::decode(&full.encode()), Some(full));
+    let empty = SavedPlaceTerrain::default();
+    assert_eq!(SavedPlaceTerrain::decode(&empty.encode()), Some(empty));
+    assert_eq!(SavedPlaceTerrain::decode(&[b'R', b'S', b'P', b'T', b'1', 1]), None);
+    assert_eq!(SavedPlaceTerrain::decode(b"nope"), None);
 }

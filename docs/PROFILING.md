@@ -25,6 +25,24 @@ rustudio-player PLACE.rbxl --headless --profile-capture out.rsprof --seconds 8
   Windows counts CPU cycles (`capture.instr_unit`): never compare
   the two.
 - `RUSTUDIO_PROFILE_NO_GPU=1`: no GPU timestamp queries.
+- `--profile-convert in.rsprof out.json` writes the Chrome trace of a
+  capture; `tools/probes/trace-window.py out.json T0 T1 [TOP] [lane]`
+  (seconds) lists what one lane did in a window (lanes `main`,
+  `rustudio-gameplay`, `physics-par-0`, …; counters on tid 0:
+  `physics awake bodies`, `physics contact pairs`, `parts`, `instances`).
+- `RUSTUDIO_SNAPSHOT_LOG=1`: stderr lines for the mass edits a capture
+  shows as one long frame — `[snapshot] big delta` (a worker → viewport
+  publication of more than 1000 property edits: which properties, how
+  many), `[physics] big rebuild` (a `sync` rebuild of more than 300
+  parts: how many it woke, the seeds' classes) and `[physics] tree mark`
+  (a Tree mark whose subtree has more than 200 instances). LBG's server
+  init regroups 6500 map parts and flips CanCollide on 2600 at once;
+  these lines say so, a profile only shows the stall.
+- Bursts of property writes from Lua cost 1–25 µs each
+  (`tools/probes/propset.luau`, 4000 anchored parts: a changed
+  CollisionGroup 23 µs, Color 17 µs, Transparency 4 µs, CFrame 2 µs, an
+  unchanged value 1 µs) — a script that writes 6500 of them in one
+  resumption is a 150 ms Heartbeat whatever the engine does after.
 
 ## Report
 

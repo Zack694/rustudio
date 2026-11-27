@@ -12,13 +12,13 @@ fn main() {
     let universe: u64 = a[0].parse().unwrap();
     let place: u64 = a[1].parse().unwrap();
     let secs: u64 = a.get(2).map(|s| s.parse().unwrap()).unwrap_or(8);
-    let (cookie, _) = rustudio_account::session::load_cookie(false).unwrap().unwrap();
+    let (cookie, _) = rustudio_account::session::load_cookie(true).unwrap().unwrap();
     let s = rustudio_account::Session::validate(cookie).unwrap();
     let r = Matchmaker::new(&s)
         .join(universe, place, LiveJoinConsent::user_requested_live_join(), PollBudget::default())
         .unwrap_or_else(|e| panic!("join: {e}"));
     let t = QuicTarget::from_join(&r.join).unwrap();
-    println!("relay {} rcc {}:{}", t.relay, t.rcc.0, t.rcc.1);
+    println!("direct {} relay {} rcc {}:{}", t.is_direct(), t.relay, t.rcc.0, t.rcc.1);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async move {
         let (_ep, conn, sock) = match connect_quic(&t).await {

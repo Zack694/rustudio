@@ -1788,7 +1788,9 @@ local function rbx_api_url(path)
 	if type(path) ~= "string" then fail("Invalid URL") end
 	if path:sub(1, 7) == "http://" or path:sub(1, 8) == "https://" then return path end
 	if path:sub(1, 1) == "/" then path = path:sub(2) end
-	return "https://api.roblox.com/" .. path
+	-- The client's base URL (Roblox retired api.roblox.com: its name no
+	-- longer resolves, and Studio has no reference to it).
+	return "https://www.roblox.com/" .. path
 end
 local function rbx_api_req(method, url, body, ct, headers)
 	local h = {}

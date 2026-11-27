@@ -89,7 +89,13 @@ android:
           # API 33 android.jar xbuild compiles the manifest against.
           config_changes: orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode|touchscreen|navigation|mcc|mnc|colorMode|fontWeightAdjustment
           # The soft keyboard shrinks the window (UserInputService
-          # .OnScreenKeyboardSize) instead of covering it.
+          # .OnScreenKeyboardSize) instead of covering it. What it types
+          # comes through an InputConnection the app adds to the activity
+          # at start (src/android/ime.rs: a Java view out of
+          # assets/android/ImeBridge.dex, built into the library), not
+          # through NativeActivity's key-event fallback, which lost the
+          # keyboard's composed and swiped words; the activity itself stays
+          # android.app.NativeActivity.
           window_soft_input_mode: adjustResize
           meta_data:
             # NativeActivity calls this symbol of the library instead of

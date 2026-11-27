@@ -223,19 +223,22 @@ pub struct Sampler<'a> {
     last: std::cell::Cell<Option<([i32; 3], Option<&'a Chunk>)>>,
 }
 
-impl Sampler<'_> {
-    pub fn get(&self, x: i32, y: i32, z: i32) -> (u8, f32) {
-        let v = [x, y, z];
+impl<'a> Sampler<'a> {
+    fn chunk(&self, v: [i32; 3]) -> Option<&'a Chunk> {
         let k = chunk_key(v);
-        let c = match self.last.get() {
+        match self.last.get() {
             Some((lk, c)) if lk == k => c,
             _ => {
                 let c = self.v.chunks.get(&k);
                 self.last.set(Some((k, c)));
                 c
             }
-        };
-        match c {
+        }
+    }
+
+    pub fn get(&self, x: i32, y: i32, z: i32) -> (u8, f32) {
+        let v = [x, y, z];
+        match self.chunk(v) {
             None => (0, 0.0),
             Some(c) => {
                 let i = local_index(v);
@@ -246,12 +249,30 @@ impl Sampler<'_> {
             }
         }
     }
+
+    /// `Voxels::water`, with the last chunk remembered.
+    pub fn water(&self, x: i32, y: i32, z: i32) -> f32 {
+        let v = [x, y, z];
+        let Some(c) = self.chunk(v) else {
+            return 0.0;
+        };
+        let i = local_index(v);
+        if c.mat[i] == WATER {
+            return occupancy_from_byte(c.occ[i]);
+        }
+        match &c.water {
+            Some(w) if w[i] != 0 => w[i] as f32 / 256.0,
+            _ => 0.0,
+        }
+    }
 }
 
 pub struct Voxels {
     // (FxHash: a ray asks `chunk_near` 27 lookups for every chunk it crosses.)
     chunks: rustc_hash::FxHashMap<[i32; 3], Chunk>,
     count: usize,
+    /// Chunks a write since the last `prune` may have left all Air.
+    emptied: rustc_hash::FxHashSet<[i32; 3]>,
 }
 
 impl std::fmt::Debug for Voxels {
@@ -293,6 +314,7 @@ impl Voxels {
         Voxels {
             chunks: Default::default(),
             count: 0,
+            emptied: Default::default(),
         }
     }
 
@@ -396,6 +418,8 @@ impl Voxels {
         self.chunks.entry(key).or_insert_with(Chunk::new)
     }
 
+    /// Drops all-Air chunks and counts the voxels from scratch: after
+    /// `decode`, whose runs go to the chunks directly.
     fn finish(&mut self) {
         self.chunks.retain(|_, c| c.mat.iter().any(|&m| m != 0));
         self.count = self
@@ -403,6 +427,40 @@ impl Voxels {
             .values()
             .map(|c| c.mat.iter().filter(|&&m| m != 0).count())
             .sum();
+        self.emptied.clear();
+    }
+
+    /// Writes one cell — material, occupancy byte, shoreline water — keeping
+    /// the count as it goes; Air into a chunk that isn't there is nothing.
+    /// The edits (`set_many`, `edit`, `fill`, `replace`, `set_raw_many`) go
+    /// through here and end with [`Self::prune`]: a FillBall a frame on a
+    /// big terrain used to count every voxel of every chunk again each time
+    /// (tens of milliseconds for thousands of chunks).
+    #[inline]
+    fn put(&mut self, v: [i32; 3], mat: u8, occ: u8, water: u16) {
+        use std::collections::hash_map::Entry;
+        let key = chunk_key(v);
+        let c = match self.chunks.entry(key) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(_) if mat == 0 => return,
+            Entry::Vacant(e) => e.insert(Chunk::new()),
+        };
+        let i = local_index(v);
+        let old = c.mat[i];
+        c.write(i, 1, mat, occ, water);
+        self.count = self.count + usize::from(mat != 0) - usize::from(old != 0);
+        if mat == 0 && old != 0 {
+            self.emptied.insert(key);
+        }
+    }
+
+    /// Drops the chunks the writes since the last call left all Air.
+    fn prune(&mut self) {
+        for k in std::mem::take(&mut self.emptied) {
+            if self.chunks.get(&k).is_some_and(|c| c.mat.iter().all(|&m| m == 0)) {
+                self.chunks.remove(&k);
+            }
+        }
     }
 
     /// Writes one voxel: SmoothGrid material index and occupancy (0..1);
@@ -412,7 +470,7 @@ impl Voxels {
     }
 
     /// Writes many voxels (Terrain:WriteVoxels): (voxel, material, occupancy),
-    /// as `set`, with one recount at the end.
+    /// as `set`.
     pub fn set_many(&mut self, voxels: impl IntoIterator<Item = ([i32; 3], u8, f32)>) {
         for (v, mat, occupancy) in voxels {
             // No occupancy is Air whatever the material.
@@ -420,34 +478,15 @@ impl Voxels {
                 Some(b) if mat != 0 => (mat, b),
                 _ => (0, 0),
             };
-            self.chunk_mut(chunk_key(v)).write(local_index(v), 1, mat, occ, 0);
+            self.put(v, mat, occ, 0);
         }
-        self.finish();
+        self.prune();
     }
 
-    /// Writes voxels as `set_many`, keeping the count as it goes (no full
-    /// recount): the Terrain Editor's brush, every frame on big places.
+    /// Writes voxels as `set_many` (the Terrain Editor's brush, every
+    /// frame on big places).
     pub fn edit(&mut self, voxels: impl IntoIterator<Item = ([i32; 3], u8, f32)>) {
-        let mut touched: std::collections::HashSet<[i32; 3]> = std::collections::HashSet::new();
-        for (v, mat, occupancy) in voxels {
-            let (mat, occ) = match occupancy_to_byte(occupancy) {
-                Some(b) if mat != 0 => (mat, b),
-                _ => (0, 0),
-            };
-            let (old, _) = self.get(v[0], v[1], v[2]);
-            if old == 0 && mat == 0 {
-                continue;
-            }
-            let key = chunk_key(v);
-            self.chunk_mut(key).write(local_index(v), 1, mat, occ, 0);
-            self.count = self.count + usize::from(mat != 0) - usize::from(old != 0);
-            touched.insert(key);
-        }
-        for k in touched {
-            if self.chunks.get(&k).is_some_and(|c| c.mat.iter().all(|&m| m == 0)) {
-                self.chunks.remove(&k);
-            }
-        }
+        self.set_many(voxels);
     }
 
     /// Number of non-Air voxels (Water included).
@@ -770,7 +809,7 @@ impl Voxels {
                 }
             }
         }
-        self.finish();
+        self.prune();
     }
 
     /// Terrain:ReplaceMaterial: `from` becomes `to` inside the voxel box.
@@ -792,13 +831,14 @@ impl Voxels {
                 }
             }
         }
-        self.finish();
+        self.prune();
     }
 
     /// Terrain:Clear.
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.count = 0;
+        self.emptied.clear();
     }
 
     fn write_one(&mut self, v: [i32; 3], mat: u8, occupancy: f32) {
@@ -806,7 +846,7 @@ impl Voxels {
             Some(b) if mat != 0 => (mat, b),
             _ => (0, 0),
         };
-        self.chunk_mut(chunk_key(v)).write(local_index(v), 1, mat, occ, 0);
+        self.put(v, mat, occ, 0);
     }
 }
 
@@ -835,13 +875,9 @@ impl Voxels {
     pub fn set_raw_many(&mut self, cells: impl IntoIterator<Item = ([i32; 3], (u8, u8, u16))>) {
         for (v, (mat, occ, water)) in cells {
             let (occ, water) = if mat == 0 { (0, 0) } else { (occ, water) };
-            let key = chunk_key(v);
-            if mat == 0 && !self.chunks.contains_key(&key) {
-                continue;
-            }
-            self.chunk_mut(key).write(local_index(v), 1, mat, occ, water);
+            self.put(v, mat, occ, water);
         }
-        self.finish();
+        self.prune();
     }
 }
 
@@ -2178,6 +2214,42 @@ pub fn collision_mesh(meshes: &[MaterialMesh]) -> (Vec<[f32; 3]>, Vec<u32>) {
 
 #[cfg(test)]
 mod tests {
+    /// The edits keep the voxel count as they go and drop the chunks they
+    /// empty (no recount of every chunk after each: a FillBall a frame on a
+    /// big terrain paid for one).
+    #[test]
+    fn edits_keep_the_count_and_prune_emptied_chunks() {
+        let recount = |v: &Voxels| -> usize {
+            v.chunk_keys().map(|k| v.chunk_bytes(k).map_or(0, |(m, _)| m.iter().filter(|&&b| b != 0).count())).sum()
+        };
+        let mut v = Voxels::empty();
+        v.fill([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0], 2, |c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt() - 10.0);
+        assert!(v.count() > 0);
+        assert_eq!(v.count(), recount(&v), "after a fill");
+        // Writes over the ball, into its chunks and a chunk of their own.
+        v.set_many((0..40).map(|i| ([i, 0, 0], 6, 0.5)));
+        assert_eq!(v.count(), recount(&v), "after set_many");
+        let chunks = v.chunk_count();
+        v.set_many((32..40).map(|i| ([i, 0, 0], 0, 0.0)));
+        assert_eq!(v.count(), recount(&v), "after clearing");
+        assert_eq!(v.chunk_count(), chunks - 1, "the emptied chunk is dropped");
+        assert_eq!(v.get(35, 0, 0), (0, 0.0));
+        v.replace([-12, -12, -12], [12, 12, 12], 2, 0);
+        assert_eq!(v.count(), recount(&v), "after replace");
+        // Air into a chunk that isn't there makes none.
+        v.set([500, 500, 500], 0, 0.0);
+        assert!(!v.chunk_has_voxels([500, 500, 500]));
+        // Carving the whole ball out leaves nothing.
+        v.fill([-12.0, -12.0, -12.0], [12.0, 12.0, 12.0], 0, |c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt() - 14.0);
+        let (m, _) = v.get(0, 0, 0);
+        assert!(m == 0 || v.get(0, 0, 0).1 < 1.0);
+        assert_eq!(v.count(), recount(&v), "after carving");
+        // The round trip through SmoothGrid agrees.
+        let back = Voxels::decode(&v.encode()).unwrap();
+        assert_eq!(back.count(), v.count());
+        assert_eq!(back.chunk_count(), v.chunk_count());
+    }
+
     // The water mesh skips dry chunks without changing a byte of it.
     #[test]
     fn water_mesh_skips_dry_chunks_exactly() {

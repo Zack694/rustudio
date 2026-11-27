@@ -2978,6 +2978,29 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// What the renderer holds, for the memory log (src/android/memory.rs):
+    /// meshes and their slabs, textures, items, the instance buffers and the
+    /// static rebuild count — what grows when memory does.
+    pub fn memory_summary(&self) -> String {
+        let slabs = self.pool.slabs.len();
+        let slab_mb = slabs as u64 * (SLAB_VERTEX_BYTES + SLAB_INDEX_BYTES) >> 20;
+        let mesh_bytes: u64 = self.meshes.iter().map(|m| m.count as u64 * 4).sum();
+        format!(
+            "render: {} meshes ({} slabs, {slab_mb} MB; {} MB of corners), {} textures, {} items ({} per frame), static {} instances (cap {}), per-frame cap {}, {} rebuilds, {} draw calls",
+            self.meshes.len(),
+            slabs,
+            mesh_bytes >> 20,
+            self.textures.len(),
+            self.items.len(),
+            self.per_frame.len(),
+            self.stats.static_instances,
+            self.static_cap,
+            self.instance_cap,
+            self.stats.rebuilds,
+            self.stats.draw_calls,
+        )
+    }
+
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         Self::with_caps(device, queue, &crate::gpu_caps::GpuCaps::of_device(device))
     }

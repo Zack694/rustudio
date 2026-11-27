@@ -1,6 +1,6 @@
-//! Studio's own API dump (app/api-dump.json, written by Studio
-//! 0.744.0.7441077's `-API`: 942 classes, 3796 properties, 3374 functions,
-//! 849 events, 652 enums), indexed for the gap telemetry and the
+//! Studio's own API dump (app/api-dump.json, written by the pinned Studio's
+//! `-API`, crate::studio_target: 0.748.0.7481526, 955 classes, 3846
+//! properties, 3462 functions, 854 events, 664 enums), indexed for the gap telemetry and the
 //! coverage table: which members exist, where they are declared, and what a
 //! game script may touch (Security None).
 
@@ -246,17 +246,42 @@ mod tests {
     fn dump_counts_match_studio() {
         let Some(api) = super::get() else { return };
         use super::Kind::*;
-        // Studio 0.744.0.7441077's own `-API` dump.
-        assert_eq!(api.classes.len(), 942);
-        // (+1: DataModel.ServerRegion, from Studio's current dump.)
-        assert_eq!(api.count(Property, false), 3797);
-        assert_eq!(api.count(Function, false), 3374);
-        assert_eq!(api.count(Event, false), 849);
+        // Studio 0.748.0.7481526's own `-API` dump (crate::studio_target).
+        assert_eq!(api.classes.len(), 955);
+        assert_eq!(api.count(Property, false), 3846);
+        assert_eq!(api.count(Function, false), 3462);
+        assert_eq!(api.count(Event, false), 854);
         let (decl, m) = api.lookup("Part", "Anchored").unwrap();
         assert_eq!(decl, "BasePart");
         assert_eq!(m.kind, Property);
         assert!(api.lookup("Part", "Destroy").is_some());
-        assert_eq!(api.enums.len(), 652);
+        assert_eq!(api.enums.len(), 664);
+        // New in 0.748: the class 0.744's dump lacked (PlaceSettings had no IsA).
+        assert!(api.classes.contains_key("PlaceSettings"));
         assert!(api.lookup("UserInputService", "IsWindowFocused").is_none());
+    }
+
+    /// The bundled dump is the pinned Studio's (crate::studio_target::API_DUMP).
+    #[test]
+    fn bundled_dump_is_the_pinned_version() {
+        let path = crate::paths::resource("api-dump.json");
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8(bytes).unwrap().replace(char::from(13), "");
+        assert_eq!(
+            crate::studio_target::sha256_hex(text.as_bytes()),
+            crate::studio_target::API_DUMP,
+            "{} is not Studio {}'s -API dump: re-dump it or update studio_target",
+            path.display(),
+            crate::studio_target::VERSION,
+        );
+    }
+
+    /// Classes, properties and enums come from the bundled reflection
+    /// database, never a machine-wide `.rbxreflection` file.
+    #[test]
+    fn reflection_database_is_bundled() {
+        let db = rbx_reflection_database::get().unwrap();
+        assert!(std::ptr::eq(db, rbx_reflection_database::get_bundled()));
+        assert!(std::ptr::eq(crate::doc::db(), rbx_reflection_database::get_bundled()));
     }
 }

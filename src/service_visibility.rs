@@ -184,9 +184,9 @@ pub fn studio_superclass(class: &str) -> Option<String> {
             return c.superclass.clone();
         }
     }
-    rbx_reflection_database::get()
-        .ok()
-        .and_then(|db| db.classes.get(class))
+    rustudio_core::doc::db()
+        .classes
+        .get(class)
         .and_then(|c| c.superclass.as_ref().map(|s| s.to_string()))
 }
 

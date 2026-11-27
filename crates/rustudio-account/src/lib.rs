@@ -23,6 +23,12 @@ pub mod plugins;
 pub mod quick_login;
 pub mod session;
 pub mod store;
+pub mod studio_target;
+pub mod web;
+pub mod asset_batch;
+pub mod batch;
+pub mod thumbs;
+pub mod users;
 pub mod web_social;
 
 pub use api::{
