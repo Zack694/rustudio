@@ -205,7 +205,7 @@ impl Editor {
                 changed |= ui.checkbox(&mut self.mcp.settings.require_token, "Required").changed();
                 let shown = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("mcp_show_token"))).unwrap_or(false);
                 let t = &self.mcp.settings.token;
-                let text = if shown { t.clone() } else { format!("{}…", &t[..t.len().min(4)]) };
+                let text = if shown { t.clone() } else { format!("{}…", t.chars().take(4).collect::<String>()) };
                 ui.monospace(text);
                 if ui.small_button(if shown { "Hide" } else { "Show" }).clicked() {
                     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("mcp_show_token"), !shown));
@@ -322,10 +322,7 @@ impl Editor {
                     if a.ok.is_some() {
                         ui.label(RichText::new("Result").small().color(theme::TEXT_DIM));
                         let mut r = a.result.clone();
-                        if r.len() > 1500 {
-                            r.truncate(1500);
-                            r.push('…');
-                        }
+                        super::truncate_utf8(&mut r, 1500);
                         ui.label(RichText::new(r).monospace().small());
                     } else if self.mcp.confirm.iter().any(|(_, id, _)| *id == a.id) {
                         ui.horizontal(|ui| {
@@ -349,10 +346,7 @@ impl Editor {
         let Some((job, act, at)) = self.mcp.confirm.front() else { return };
         let (tool, client, act) = (job.tool.clone(), job.client.clone(), *act);
         let mut args = serde_json::to_string_pretty(&job.args).unwrap_or_default();
-        if args.len() > 4000 {
-            args.truncate(4000);
-            args.push('…');
-        }
+        super::truncate_utf8(&mut args, 4000);
         let left = 120.0 - at.elapsed().as_secs_f32();
         let live = self.live_team_create_ids().is_some();
         let mut answer = None;

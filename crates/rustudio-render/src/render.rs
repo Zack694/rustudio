@@ -566,6 +566,7 @@ pub mod gpu_check {
         for &samples in sample_counts {
             drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
+            drop(crate::adorn::AdornPass::new(&device, &queue, DISPLAY_FORMAT, samples));
         }
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         drop(r);

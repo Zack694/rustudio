@@ -291,7 +291,7 @@ impl Editor {
         clip.text(
             Pos2::new(x0 + 2.0, top + 231.0),
             egui::Align2::LEFT_CENTER,
-            format!("\u{23E3}{}", view.robux),
+            format!("R$ {}", view.robux),
             font(&ctx, 16.0, Weight::Regular),
             white(0.85),
         );
@@ -310,7 +310,7 @@ impl Editor {
                     white(1.0),
                 );
                 let p = match price {
-                    Some(p) => format!("\u{23E3}{p}"),
+                    Some(p) => format!("R$ {p}"),
                     None => "Off sale".to_string(),
                 };
                 clip.text(

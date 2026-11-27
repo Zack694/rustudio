@@ -387,8 +387,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     if in.mode > 0.5 {
         // ForceField Fresnel energy-shield rim: transparent center, luminous edge.
-        let view = normalize(p.cam_pos.xyz - in.world);
-        let rim = pow(1.0 - clamp(abs(dot(n, view)), 0.0, 1.0), 2.1);
+        let vdir = p.cam_pos.xyz - in.world;
+        let view = vdir / max(length(vdir), 1e-5);
+        let rim = pow(max(1.0 - clamp(abs(dot(n, view)), 0.0, 1.0), 1e-4), 2.1);
         let alpha = clamp(in.color.a * (0.14 + rim * 1.65), 0.0, 0.92);
         return vec4<f32>(in.color.rgb * (0.75 + rim * 1.1), alpha);
     }
@@ -401,14 +402,18 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 const DEPTH_MSAA: &str = r#"
 @group(0) @binding(1) var depth_tex: texture_depth_multisampled_2d;
 fn sample_depth(px: vec2<i32>) -> f32 {
-    return textureLoad(depth_tex, px, 0);
+    let dims = vec2<i32>(textureDimensions(depth_tex));
+    let q = clamp(px, vec2<i32>(0, 0), max(dims - vec2<i32>(1, 1), vec2<i32>(0, 0)));
+    return textureLoad(depth_tex, q, 0);
 }
 "#;
 
 const DEPTH_SINGLE: &str = r#"
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
 fn sample_depth(px: vec2<i32>) -> f32 {
-    return textureLoad(depth_tex, px, 0);
+    let dims = vec2<i32>(textureDimensions(depth_tex));
+    let q = clamp(px, vec2<i32>(0, 0), max(dims - vec2<i32>(1, 1), vec2<i32>(0, 0)));
+    return textureLoad(depth_tex, q, 0);
 }
 "#;
 
@@ -613,16 +618,18 @@ impl AdornPass {
             });
             pass.set_pipeline(&self.pipe);
             pass.set_bind_group(0, &bg, &[]);
-            pass.set_vertex_buffer(1, self.insts.slice(..));
+            let inst_stride = std::mem::size_of::<AdornInst>() as u64;
             for (idx, item) in list.iter().enumerate() {
                 let mesh = match item.shape {
                     AdornShape::Sphere | AdornShape::ForceFieldSphere => &self.sphere,
                     AdornShape::Cylinder => &self.cylinder,
                     AdornShape::Cone => &self.cone,
                 };
+                let byte_off = idx as u64 * inst_stride;
                 pass.set_vertex_buffer(0, mesh.vb.slice(..));
+                pass.set_vertex_buffer(1, self.insts.slice(byte_off..));
                 pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.indices, 0, idx as u32..(idx as u32 + 1));
+                pass.draw_indexed(0..mesh.indices, 0, 0..1);
             }
         }
         queue.submit(Some(enc.finish()));

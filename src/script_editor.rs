@@ -651,6 +651,7 @@ impl Editor {
         }
         if let (Some(insert), Some(end)) = (accept, word_end) {
             let chars: Vec<char> = buf.text.chars().collect();
+            let end = end.min(chars.len());
             let mut start = end;
             while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
                 start -= 1;
@@ -674,7 +675,7 @@ impl Editor {
             );
             let typing_word = word_end.is_some_and(|i| {
                 let c: Vec<char> = text.chars().collect();
-                i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_' || c[i - 1] == '.' || c[i - 1] == ':')
+                i > 0 && i <= c.len() && (c[i - 1].is_alphanumeric() || c[i - 1] == '_' || c[i - 1] == '.' || c[i - 1] == ':')
             });
             let items = match (pos, typing_word) {
                 (Some((line, ch)), true) => self

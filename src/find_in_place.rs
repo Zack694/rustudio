@@ -105,10 +105,7 @@ impl Editor {
                 let hit = if cs { line.contains(&query) } else { line.to_ascii_lowercase().contains(&q_low) };
                 if hit {
                     let mut preview = line.trim().to_string();
-                    if preview.len() > 140 {
-                        preview.truncate(140);
-                        preview.push('…');
-                    }
+                    crate::mcp::truncate_utf8(&mut preview, 140);
                     hits.push((r, path.clone(), i + 1, preview));
                     if hits.len() >= 400 {
                         break;

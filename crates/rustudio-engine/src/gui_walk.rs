@@ -1547,17 +1547,20 @@ impl<M: AutoText> Sizer<'_, M> {
         }
         // Measure direct children and any nested Folder-held layout groups
         // (matching `Walk::children` — closes ENGINE-GAPS AutomaticSize Folder gap).
-        fn collect_folders(d: &Document, parent: Ref, out: &mut Vec<Ref>) {
+        fn collect_folders(d: &Document, parent: Ref, out: &mut Vec<Ref>, nested: usize) {
+            if nested >= 64 {
+                return;
+            }
             for c in children(d, parent) {
                 if d.class_of(c).as_deref() == Some("Folder") {
                     out.push(c);
-                    collect_folders(d, c, out);
+                    collect_folders(d, c, out, nested + 1);
                 }
             }
         }
         ext = ext.max(self.measure_group(r, inner, scale, auto, depth));
         let mut folders = Vec::new();
-        collect_folders(d, r, &mut folders);
+        collect_folders(d, r, &mut folders, 0);
         for folder in folders {
             ext = ext.max(self.measure_group(folder, inner, scale, auto, depth));
         }

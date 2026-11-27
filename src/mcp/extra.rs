@@ -50,7 +50,16 @@ fn req<'a>(a: &'a J, k: &str) -> R<&'a str> {
 }
 
 fn num(a: &J, k: &str) -> Option<f64> {
-    a.get(k).and_then(|v| v.as_f64())
+    a.get(k).and_then(|v| v.as_f64()).filter(|n| n.is_finite())
+}
+
+fn u64_arg(a: &J, k: &str) -> Option<u64> {
+    let v = a.get(k)?;
+    if let Some(u) = v.as_u64() {
+        return Some(u);
+    }
+    let f = v.as_f64()?;
+    (f.is_finite() && f >= 0.0 && f <= u64::MAX as f64).then_some(f as u64)
 }
 
 fn flag(a: &J, k: &str, d: bool) -> bool {
@@ -62,7 +71,37 @@ fn vec3_arg(a: &J, k: &str) -> Option<[f32; 3]> {
     if arr.len() < 3 {
         return None;
     }
-    Some([arr[0].as_f64()? as f32, arr[1].as_f64()? as f32, arr[2].as_f64()? as f32])
+    let x = arr[0].as_f64().filter(|n| n.is_finite())? as f32;
+    let y = arr[1].as_f64().filter(|n| n.is_finite())? as f32;
+    let z = arr[2].as_f64().filter(|n| n.is_finite())? as f32;
+    Some([x, y, z])
+}
+
+/// Spawns a named background MCP worker thread wrapped in `crash::recoverable`
+/// so OS thread-spawn failure or unexpected worker panics return a clean MCP
+/// error instead of crashing the editor.
+fn spawn_mcp_worker(
+    name: &'static str,
+    label: impl Into<String>,
+    timeout: Duration,
+    work: impl FnOnce() -> AsyncOutcome + Send + 'static,
+) -> R<Step> {
+    let label = label.into();
+    let (tx, rx) = mpsc::channel();
+    let err_label = label.clone();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let outcome = match rustudio_core::crash::recoverable(work) {
+                Ok(out) => out,
+                Err(_) => AsyncOutcome::Ready(ToolResult::error(format!(
+                    "{err_label} failed due to an internal worker error"
+                ))),
+            };
+            let _ = tx.send(outcome);
+        })
+        .map_err(|e| format!("Failed to start {label} worker thread: {e}"))?;
+    Ok(Step::Wait(Op::AsyncJob { rx, label }, timeout))
 }
 
 fn parse_tb_kind(raw: Option<&str>) -> R<TbKind> {
@@ -433,8 +472,7 @@ impl Editor {
             filters,
         };
 
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_mcp_worker("mcp-toolbox", "Toolbox search", Duration::from_secs(45), move || {
             let http = SessionHttp(session);
             let res = match tb_api::fetch_page(&http, &req, cursor.as_deref(), &|| false) {
                 Ok(page) => ToolResult::json(&json!({
@@ -444,15 +482,14 @@ impl Editor {
                 })),
                 Err(e) => ToolResult::error(format!("Toolbox search failed: {}", e.describe())),
             };
-            let _ = tx.send(AsyncOutcome::Ready(res));
-        });
-        Ok(Step::Wait(Op::AsyncJob { rx, label: "Toolbox search".into() }, Duration::from_secs(45)))
+            AsyncOutcome::Ready(res)
+        })
     }
 
     pub(super) fn mcp_browse_inventory(&mut self, a: &J) -> R<Step> {
         let session = self.mcp_require_session()?;
         let kind = parse_tb_kind(s(a, "kind"))?;
-        let group = num(a, "group_id").map(|g| g as u64);
+        let group = u64_arg(a, "group_id");
         let source = match s(a, "source").unwrap_or("inventory").to_ascii_lowercase().as_str() {
             "creations" | "my_creations" => Source::Creations { group },
             "recent" => Source::Recent,
@@ -469,8 +506,7 @@ impl Editor {
             filters: Filters::default(),
         };
 
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_mcp_worker("mcp-inventory", "Browse inventory", Duration::from_secs(45), move || {
             let http = SessionHttp(session);
             let res = match tb_api::fetch_page(&http, &req, cursor.as_deref(), &|| false) {
                 Ok(page) => ToolResult::json(&json!({
@@ -480,16 +516,15 @@ impl Editor {
                 })),
                 Err(e) => ToolResult::error(format!("Inventory browse failed: {}", e.describe())),
             };
-            let _ = tx.send(AsyncOutcome::Ready(res));
-        });
-        Ok(Step::Wait(Op::AsyncJob { rx, label: "Browse inventory".into() }, Duration::from_secs(45)))
+            AsyncOutcome::Ready(res)
+        })
     }
 
     pub(super) fn mcp_get_asset_details(&mut self, a: &J) -> R<Step> {
         let ids: Vec<u64> = if let Some(arr) = a.get("asset_ids").and_then(|v| v.as_array()) {
             arr.iter().filter_map(|v| v.as_u64()).collect()
-        } else if let Some(id) = num(a, "asset_id") {
-            vec![id as u64]
+        } else if let Some(id) = u64_arg(a, "asset_id") {
+            vec![id]
         } else {
             return Err("Provide \"asset_id\" (integer) or \"asset_ids\" (array of integers)".into());
         };
@@ -497,8 +532,7 @@ impl Editor {
             return Err("Provide between 1 and 30 asset IDs".into());
         }
         let session = self.mcp_session();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_mcp_worker("mcp-asset-details", "Get asset details", Duration::from_secs(30), move || {
             let res = match session {
                 Some(s) => tb_api::fetch_details(&SessionHttp(s), &ids, &|| false),
                 None => tb_api::fetch_details(&AnonHttp, &ids, &|| false),
@@ -510,16 +544,14 @@ impl Editor {
                 })),
                 Err(e) => ToolResult::error(format!("Asset details failed: {}", e.describe())),
             };
-            let _ = tx.send(AsyncOutcome::Ready(tr));
-        });
-        Ok(Step::Wait(Op::AsyncJob { rx, label: "Get asset details".into() }, Duration::from_secs(30)))
+            AsyncOutcome::Ready(tr)
+        })
     }
 
     pub(super) fn mcp_insert_asset(&mut self, a: &J) -> R<Step> {
         self.mcp_writable()?;
-        let asset_id = num(a, "asset_id")
-            .filter(|n| *n > 0.0)
-            .map(|n| n as u64)
+        let asset_id = u64_arg(a, "asset_id")
+            .filter(|&n| n > 0)
             .ok_or("missing positive \"asset_id\" (integer)")?;
         let parent = match s(a, "parent") {
             Some(p) => Some(self.mcp_resolve(p)?),
@@ -529,8 +561,7 @@ impl Editor {
         let kind_override = s(a, "kind").map(|k| parse_tb_kind(Some(k))).transpose()?;
         let session = self.mcp_session();
 
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_mcp_worker("mcp-insert-asset", format!("Insert asset {asset_id}"), Duration::from_secs(60), move || {
             let http_box: Box<dyn Http> = match session {
                 Some(s) => Box::new(SessionHttp(s)),
                 None => Box::new(AnonHttp),
@@ -551,41 +582,34 @@ impl Editor {
             });
 
             match kind {
-                TbKind::Audio | TbKind::Video | TbKind::Font => {
-                    let _ = tx.send(AsyncOutcome::InsertAsset {
-                        asset_id,
-                        name,
-                        kind,
-                        bytes: None,
-                        parent,
-                        position,
-                    });
-                }
+                TbKind::Audio | TbKind::Video | TbKind::Font => AsyncOutcome::InsertAsset {
+                    asset_id,
+                    name,
+                    kind,
+                    bytes: None,
+                    parent,
+                    position,
+                },
                 _ => {
                     let dl = tb_insert::download(http_box.as_ref(), asset_id, &|| false)
                         .or_else(|_| rustudio_account::public_asset(asset_id).map_err(|e| tb_api::Failure::Other(e.0)));
                     match dl {
-                        Ok(bytes) => {
-                            let _ = tx.send(AsyncOutcome::InsertAsset {
-                                asset_id,
-                                name,
-                                kind,
-                                bytes: Some(bytes),
-                                parent,
-                                position,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = tx.send(AsyncOutcome::Ready(ToolResult::error(format!(
-                                "Failed to download asset {asset_id}: {}",
-                                e.describe()
-                            ))));
-                        }
+                        Ok(bytes) => AsyncOutcome::InsertAsset {
+                            asset_id,
+                            name,
+                            kind,
+                            bytes: Some(bytes),
+                            parent,
+                            position,
+                        },
+                        Err(e) => AsyncOutcome::Ready(ToolResult::error(format!(
+                            "Failed to download asset {asset_id}: {}",
+                            e.describe()
+                        ))),
                     }
                 }
             }
-        });
-        Ok(Step::Wait(Op::AsyncJob { rx, label: format!("Insert asset {asset_id}") }, Duration::from_secs(60)))
+        })
     }
 
     pub(super) fn finish_insert_asset(
@@ -697,17 +721,15 @@ impl Editor {
     }
 
     pub(super) fn mcp_download_asset(&mut self, a: &J) -> R<Step> {
-        let asset_id = num(a, "asset_id")
-            .filter(|n| *n > 0.0)
-            .map(|n| n as u64)
+        let asset_id = u64_arg(a, "asset_id")
+            .filter(|&n| n > 0)
             .ok_or("missing positive \"asset_id\" (integer)")?;
         let out_path = PathBuf::from(req(a, "path")?);
         if !out_path.is_absolute() {
             return Err("\"path\" must be an absolute file path".into());
         }
         let session = self.mcp_session();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_mcp_worker("mcp-download-asset", format!("Download asset {asset_id}"), Duration::from_secs(60), move || {
             let dl = match session {
                 Some(s) => tb_insert::download(&SessionHttp(s), asset_id, &|| false)
                     .map_err(|e| e.describe())
@@ -730,9 +752,8 @@ impl Editor {
                 }
                 Err(e) => ToolResult::error(format!("Download asset {asset_id} failed: {e}")),
             };
-            let _ = tx.send(AsyncOutcome::Ready(tr));
-        });
-        Ok(Step::Wait(Op::AsyncJob { rx, label: format!("Download asset {asset_id}") }, Duration::from_secs(60)))
+            AsyncOutcome::Ready(tr)
+        })
     }
 
     pub(super) fn mcp_upload_asset(&mut self, a: &J) -> R<Step> {
@@ -746,12 +767,11 @@ impl Editor {
             .map(String::from)
             .unwrap_or_else(|| file.file_stem().and_then(|x| x.to_str()).unwrap_or("Asset").to_string());
         let description = s(a, "description").unwrap_or("").to_string();
-        let group_id = num(a, "group_id").map(|g| g as u64);
+        let group_id = u64_arg(a, "group_id");
         let filename = file.file_name().and_then(|x| x.to_str()).unwrap_or("asset").to_string();
         let bytes = std::fs::read(&file).map_err(|e| format!("Read {}: {e}", file.display()))?;
 
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_mcp_worker("mcp-upload-asset", "Upload asset to Roblox", Duration::from_secs(120), move || {
             let api = CloudApi { session, ep: Endpoints::default() };
             let tr = match api.upload_asset(asset_type, &display_name, &description, group_id, &filename, mime, &bytes) {
                 Ok(id) => ToolResult::json(&json!({
@@ -763,9 +783,8 @@ impl Editor {
                 })),
                 Err(e) => ToolResult::error(format!("Upload asset failed: {}", e.0)),
             };
-            let _ = tx.send(AsyncOutcome::Ready(tr));
-        });
-        Ok(Step::Wait(Op::AsyncJob { rx, label: "Upload asset to Roblox".into() }, Duration::from_secs(120)))
+            AsyncOutcome::Ready(tr)
+        })
     }
 
     pub(super) fn mcp_publish_place(&mut self, a: &J) -> R<Step> {
@@ -774,20 +793,17 @@ impl Editor {
         let linked = self
             .live_team_create_ids()
             .or_else(|| self.game.doc.cloud.as_ref().map(|c| (c.universe_id, c.place_id)));
-        let universe_id = num(a, "universe_id")
-            .map(|n| n as u64)
+        let universe_id = u64_arg(a, "universe_id")
             .or_else(|| linked.map(|(u, _)| u))
             .ok_or("Provide \"universe_id\" (or open a Roblox cloud place first)")?;
-        let place_id = num(a, "place_id")
-            .map(|n| n as u64)
+        let place_id = u64_arg(a, "place_id")
             .or_else(|| linked.map(|(_, p)| p))
             .ok_or("Provide \"place_id\" (or open a Roblox cloud place first)")?;
         let publish = flag(a, "publish", true);
         let vt = if publish { VersionType::Published } else { VersionType::Saved };
         let bytes = self.game.doc.encode_all(false)?;
 
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        spawn_mcp_worker("mcp-publish-place", "Publish place to Roblox", Duration::from_secs(120), move || {
             let api = CloudApi { session, ep: Endpoints::default() };
             let tr = match api.upload_place(universe_id, place_id, &bytes, false, vt) {
                 Ok(version) => ToolResult::json(&json!({
@@ -799,15 +815,17 @@ impl Editor {
                 })),
                 Err(e) => ToolResult::error(format!("Roblox place save/publish failed: {}", e.0)),
             };
-            let _ = tx.send(AsyncOutcome::Ready(tr));
-        });
-        Ok(Step::Wait(Op::AsyncJob { rx, label: "Publish place to Roblox".into() }, Duration::from_secs(120)))
+            AsyncOutcome::Ready(tr)
+        })
     }
 
     // ---------------------------------------- Fast game building power tools
 
     /// Recursively constructs an `InstanceBuilder` from a JSON tree spec.
-    fn build_node(spec: &J) -> R<InstanceBuilder> {
+    fn build_node(spec: &J, depth: usize) -> R<InstanceBuilder> {
+        if depth > 64 {
+            return Err("build_tree nesting depth exceeded 64".into());
+        }
         let class = req(spec, "class")?;
         if !doc::db().classes.contains_key(class) {
             return Err(format!("{class:?} is not a known Roblox class"));
@@ -847,7 +865,7 @@ impl Editor {
         }
         if let Some(kids) = spec.get("children").and_then(|c| c.as_array()) {
             for kid in kids {
-                b.add_child(Self::build_node(kid)?);
+                b.add_child(Self::build_node(kid, depth + 1)?);
             }
         }
         Ok(b)
@@ -867,7 +885,7 @@ impl Editor {
         }
         let mut builders = Vec::with_capacity(specs.len());
         for sp in specs {
-            builders.push(Self::build_node(sp)?);
+            builders.push(Self::build_node(sp, 0)?);
         }
         let mut created = Vec::new();
         for b in builders {
@@ -949,7 +967,11 @@ impl Editor {
                 let c = vec3_arg(a, "center").ok_or("fill_block needs \"center\": [x, y, z]")?;
                 let sz = vec3_arg(a, "size").ok_or("fill_block needs \"size\": [x, y, z]")?;
                 let mat = mat_of(s(a, "material").unwrap_or("Grass"))?;
-                let half = [sz[0].abs() * 0.5, sz[1].abs() * 0.5, sz[2].abs() * 0.5];
+                let half = [
+                    (sz[0].abs() * 0.5).clamp(0.5, 256.0),
+                    (sz[1].abs() * 0.5).clamp(0.5, 256.0),
+                    (sz[2].abs() * 0.5).clamp(0.5, 256.0),
+                ];
                 let lo = [c[0] - half[0], c[1] - half[1], c[2] - half[2]];
                 let hi = [c[0] + half[0], c[1] + half[1], c[2] + half[2]];
                 vox.fill(lo, hi, mat, |p| {
@@ -962,7 +984,7 @@ impl Editor {
             }
             "fill_ball" => {
                 let c = vec3_arg(a, "center").ok_or("fill_ball needs \"center\": [x, y, z]")?;
-                let r = num(a, "radius").ok_or("fill_ball needs \"radius\"")? as f32;
+                let r = (num(a, "radius").ok_or("fill_ball needs \"radius\"")? as f32).abs().clamp(0.5, 256.0);
                 let mat = mat_of(s(a, "material").unwrap_or("Grass"))?;
                 let lo = [c[0] - r, c[1] - r, c[2] - r];
                 let hi = [c[0] + r, c[1] + r, c[2] + r];
@@ -974,10 +996,10 @@ impl Editor {
             }
             "fill_cylinder" => {
                 let c = vec3_arg(a, "center").ok_or("fill_cylinder needs \"center\": [x, y, z]")?;
-                let r = num(a, "radius").ok_or("fill_cylinder needs \"radius\"")? as f32;
-                let h = num(a, "height").ok_or("fill_cylinder needs \"height\"")? as f32;
+                let r = (num(a, "radius").ok_or("fill_cylinder needs \"radius\"")? as f32).abs().clamp(0.5, 256.0);
+                let h = (num(a, "height").ok_or("fill_cylinder needs \"height\"")? as f32).abs().clamp(0.5, 512.0);
                 let mat = mat_of(s(a, "material").unwrap_or("Grass"))?;
-                let hh = h.abs() * 0.5;
+                let hh = h * 0.5;
                 let lo = [c[0] - r, c[1] - hh, c[2] - r];
                 let hi = [c[0] + r, c[1] + hh, c[2] + r];
                 vox.fill(lo, hi, mat, |p| {

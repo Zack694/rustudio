@@ -46,6 +46,21 @@ use serde_json::{json, Value as J};
 use server::{Job, Server, Shared, ToolResult};
 use settings::{Confirm, Group, McpSettings};
 
+/// Truncates `s` to at most `max_bytes` bytes on a valid UTF-8 character
+/// boundary and appends `'…'` if it was shortened. Never panics on multi-byte
+/// characters (emojis, smart quotes, CJK, etc.).
+pub(crate) fn truncate_utf8(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push('…');
+}
+
 /// Calls kept in the activity log.
 const ACTIVITY: usize = 200;
 /// Output lines kept for read_output.
@@ -296,7 +311,7 @@ impl Mcp {
         let want = self.wanted();
         let port = self.env_port.unwrap_or(self.settings.port);
         {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             s.token = self.settings.token.clone();
             s.require_token = self.settings.require_token;
             s.ctx = Some(ctx.clone());
@@ -323,7 +338,7 @@ impl Mcp {
 
     fn stop_server(&mut self) {
         self.server = None;
-        self.shared.lock().unwrap().clients.clear();
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).clients.clear();
         // Calls still queued or running get an answer.
         for p in self.pending.drain(..) {
             let _ = p.reply.send(ToolResult::error("rustudio's MCP server was turned off"));
@@ -347,10 +362,7 @@ impl Mcp {
         let id = self.next_id;
         self.next_id += 1;
         let mut args = job.args.to_string();
-        if args.len() > 300 {
-            args.truncate(300);
-            args.push('…');
-        }
+        truncate_utf8(&mut args, 300);
         self.activity.push_front(Activity {
             id,
             at: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -370,10 +382,7 @@ impl Mcp {
         if let Some(a) = self.activity.iter_mut().find(|a| a.id == id) {
             a.ok = Some(!r.is_error);
             let mut s = r.summary();
-            if s.len() > 2000 {
-                s.truncate(2000);
-                s.push('…');
-            }
+            truncate_utf8(&mut s, 2000);
             a.result = s;
             a.ms = Some(a.started.elapsed().as_millis());
         }
@@ -426,7 +435,7 @@ impl crate::app::Editor {
         }
         // Calls the person didn't answer in time.
         while self.mcp.confirm.front().is_some_and(|(_, _, at)| at.elapsed() > CONFIRM_TIMEOUT) {
-            let (job, act, _) = self.mcp.confirm.pop_front().unwrap();
+            let Some((job, act, _)) = self.mcp.confirm.pop_front() else { break };
             self.mcp_finish(job.reply, act, ToolResult::error("Nobody allowed this call in rustudio within 2 minutes (the MCP panel asks the person to allow writes)."));
         }
         let pending = std::mem::take(&mut self.mcp.pending);
@@ -464,7 +473,7 @@ impl crate::app::Editor {
     /// The person answered a confirmation.
     pub fn mcp_answer(&mut self, act: u64, allow: bool) {
         let Some(i) = self.mcp.confirm.iter().position(|(_, a, _)| *a == act) else { return };
-        let (job, act, _) = self.mcp.confirm.remove(i).unwrap();
+        let Some((job, act, _)) = self.mcp.confirm.remove(i) else { return };
         if allow {
             self.mcp_run(job, act);
         } else {
@@ -594,5 +603,23 @@ mod tests {
         // Nothing new: nothing added.
         m.sync(&log, 2);
         assert_eq!(m.next, 6);
+    }
+
+    #[test]
+    fn truncate_utf8_never_splits_multibyte_chars() {
+        // Exercise 3-byte ('—') and 4-byte ('👻') UTF-8 characters at every byte boundary.
+        let sample = format!("{}👻—👻{}", "a".repeat(10), "b".repeat(10));
+        for limit in 0..=sample.len() + 2 {
+            let mut s = sample.clone();
+            truncate_utf8(&mut s, limit);
+            if limit < sample.len() {
+                assert!(s.ends_with('…'), "limit {limit}: expected ellipsis");
+                let prefix = s.strip_suffix('…').unwrap();
+                assert!(prefix.len() <= limit, "limit {limit}: prefix {} > {limit}", prefix.len());
+                assert!(sample.starts_with(prefix));
+            } else {
+                assert_eq!(s, sample);
+            }
+        }
     }
 }

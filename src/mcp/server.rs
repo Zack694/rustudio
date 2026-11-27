@@ -131,7 +131,11 @@ impl Server {
                 }
                 let Ok(stream) = stream else { continue };
                 let (tx, shared, stop) = (tx.clone(), shared2.clone(), stop2.clone());
-                let _ = std::thread::Builder::new().name("mcp-conn".into()).spawn(move || connection(stream, &tx, &shared, &stop));
+                let _ = std::thread::Builder::new().name("mcp-conn".into()).spawn(move || {
+                    if rustudio_core::crash::recoverable(|| connection(stream, &tx, &shared, &stop)).is_err() {
+                        log::error!("MCP connection thread recovered from an unexpected panic");
+                    }
+                });
             }
         });
         log::info!("MCP server listening on 127.0.0.1:{port}");
@@ -183,7 +187,7 @@ fn read_request(r: &mut BufReader<TcpStream>) -> Result<Option<Request>, String>
             let mut size = String::new();
             r.read_line(&mut size).map_err(|e| e.to_string())?;
             let n = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16).map_err(|e| e.to_string())?;
-            if req.body.len() + n > MAX_BODY {
+            if req.body.len().saturating_add(n) > MAX_BODY {
                 return Err("body too large".into());
             }
             let start = req.body.len();
@@ -261,7 +265,7 @@ fn handle(req: &Request, out: &mut TcpStream, tx: &Sender<Job>, shared: &Arc<Mut
         return respond(out, "403 Forbidden", &[], b"Origin not allowed");
     }
     let (token, require) = {
-        let s = shared.lock().unwrap();
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
         (s.token.clone(), s.require_token)
     };
     if require && !token_ok(req.header("authorization"), &token) {
@@ -280,7 +284,7 @@ fn handle(req: &Request, out: &mut TcpStream, tx: &Sender<Job>, shared: &Arc<Mut
         "GET" => respond(out, "405 Method Not Allowed", &[("Allow", "POST, DELETE".into())], b""),
         "DELETE" => {
             if let Some(id) = session {
-                shared.lock().unwrap().clients.remove(&id);
+                shared.lock().unwrap_or_else(|e| e.into_inner()).clients.remove(&id);
             }
             respond(out, "200 OK", &[], b"")
         }
@@ -295,19 +299,19 @@ fn handle(req: &Request, out: &mut TcpStream, tx: &Sender<Job>, shared: &Arc<Mut
             let client = session
                 .as_ref()
                 .and_then(|id| {
-                    let mut s = shared.lock().unwrap();
+                    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     let c = s.clients.get_mut(id)?;
                     c.last_seen = Instant::now();
                     Some(c.name.clone())
                 })
                 .unwrap_or_else(|| "client".into());
-            let info = shared.lock().unwrap().info.clone();
+            let info = shared.lock().unwrap_or_else(|e| e.into_inner()).info.clone();
             let mut call = |tool: &str, args: J| call_editor(tx, shared, tool, args, &client);
             let reply = handle_message(&msg, &info, &mut call);
             let mut headers = vec![("Content-Type", "application/json".to_string())];
             if let Some(name) = reply.initialized {
                 let id = super::settings::new_token();
-                shared.lock().unwrap().clients.insert(id.clone(), ClientInfo { name, last_seen: Instant::now() });
+                shared.lock().unwrap_or_else(|e| e.into_inner()).clients.insert(id.clone(), ClientInfo { name, last_seen: Instant::now() });
                 headers.push(("Mcp-Session-Id", id));
             }
             match reply.response {
@@ -324,7 +328,7 @@ fn call_editor(tx: &Sender<Job>, shared: &Arc<Mutex<Shared>>, tool: &str, args: 
     if tx.send(Job { tool: tool.to_string(), args, client: client.to_string(), reply }).is_err() {
         return ToolResult::error("rustudio's MCP server stopped");
     }
-    if let Some(ctx) = shared.lock().unwrap().ctx.clone() {
+    if let Some(ctx) = shared.lock().unwrap_or_else(|e| e.into_inner()).ctx.clone() {
         ctx.request_repaint();
     }
     rx.recv_timeout(CALL_TIMEOUT).unwrap_or_else(|_| ToolResult::error("rustudio didn't answer the call (the window closed, or its frame loop is stuck)"))

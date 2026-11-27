@@ -180,10 +180,7 @@ pub fn list(doc: &Document, root: Ref, q: &TreeQuery) -> J {
 pub fn value_json(class: &str, prop: &str, v: &Variant) -> J {
     rustudio_core::project_values::to_json(class, prop, v).unwrap_or_else(|| {
         let mut s = format!("{v:?}");
-        if s.len() > 400 {
-            s.truncate(400);
-            s.push('…');
-        }
+        super::truncate_utf8(&mut s, 400);
         J::String(s)
     })
 }
@@ -270,5 +267,16 @@ mod tests {
         assert!(rest["next_offset"].is_null());
         let scripts = list(&d, d.dom.root_ref(), &TreeQuery { name: Some("OPE".into()), ..q(Some("LuaSourceContainer"), 0, 10) });
         assert_eq!(scripts["items"][0]["path"], "Workspace.Map.Open");
+    }
+
+    #[test]
+    fn value_json_truncates_multibyte_utf8_safely() {
+        let mut big = "a".repeat(390);
+        for _ in 0..20 {
+            big.push_str("👻—");
+        }
+        let v = Variant::BinaryString(rbx_dom_weak::types::BinaryString::from(big.into_bytes()));
+        let j = value_json("Part", "UnknownProp", &v);
+        assert!(j.as_str().is_some_and(|s| s.ends_with('…')));
     }
 }
