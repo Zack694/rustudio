@@ -438,7 +438,8 @@ fn session_agent_with_timeout(timeout: Option<std::time::Duration>) -> ureq::Age
     // "Confirmed, signing in…" that never ended). The connect budget is
     // shared by a host's addresses (crate::http): short enough that one
     // that doesn't answer costs seconds, not the better part of a minute.
-    let config = ureq::Agent::config_builder()
+    // (web::install: host limits, cooldowns, stats for every call)
+    let config = crate::web::install(ureq::Agent::config_builder())
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(timeout)
@@ -470,7 +471,10 @@ pub struct Session {
     cookie: Arc<Mutex<Cookie>>,
     agent: ureq::Agent,
     /// X-CSRF-TOKEN from the last 403, reused until the session rotates it.
-    csrf: Mutex<Option<String>>,
+    /// Shared with every [`Session::downloader`] copy (one sign-in, one
+    /// token, as Studio keeps it): a fresh copy used to start without one,
+    /// so each of its writes was refused once (403) and sent again.
+    csrf: Arc<Mutex<Option<String>>>,
     /// Store a rotation where `load_cookie` finds it. Off for
     /// [`Session::unchecked`]: a mock server's `Set-Cookie` must never
     /// replace the person's stored session.
@@ -592,7 +596,7 @@ impl Session {
         Ok(Session {
             cookie: Arc::new(Mutex::new(cookie)),
             agent,
-            csrf: Mutex::new(None),
+            csrf: Arc::new(Mutex::new(None)),
             persist: true,
             profile,
         })
@@ -605,7 +609,7 @@ impl Session {
         Session {
             cookie: self.cookie.clone(),
             agent: self.agent.clone(),
-            csrf: Mutex::new(None),
+            csrf: self.csrf.clone(),
             persist: self.persist,
             profile: self.profile.clone(),
         }
@@ -625,7 +629,7 @@ impl Session {
         Session {
             cookie: Arc::new(Mutex::new(cookie)),
             agent: session_agent(),
-            csrf: Mutex::new(None),
+            csrf: Arc::new(Mutex::new(None)),
             persist: false,
             profile,
         }
@@ -1054,43 +1058,18 @@ impl Session {
         asset_id: u64,
         version: Option<u64>,
     ) -> std::result::Result<Vec<u8>, AssetDownloadError> {
-        let url = match version {
-            Some(v) => format!("{ASSET_V2_URL}/{asset_id}/version/{v}"),
-            None => format!("{ASSET_V2_URL}/{asset_id}"),
-        };
-        // Studio asks asset delivery in the open place's context
-        // (`Roblox-Place-Id`): assets the place's creator owns (private
-        // animations, audio) are then served to its collaborators.
-        let place = PLACE_CONTEXT.load(std::sync::atomic::Ordering::Relaxed);
-        let mut req = self.agent.get(&url).header("Cookie", &self.held().header());
-        if place != 0 {
-            req = req.header("Roblox-Place-Id", &place.to_string());
-        }
-        let r = req.call().map_err(Error::from)?;
-        self.apply_rotation(&r);
-        if let Some(error) = AssetDownloadError::transient_response(asset_id, "asset delivery", &r) {
-            return Err(error);
-        }
-        let (status, text) = text_of(r)?;
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
-            Error(format!(
-                "asset {asset_id}: asset delivery returned HTTP {status}"
-            ))
-        })?;
-        let Some(location) = v.pointer("/locations/0/location").and_then(|l| l.as_str()) else {
-            let why = v.pointer("/errors/0/message").and_then(|m| m.as_str());
-            // v2 answers 200 with the refusal in the body (see `public_asset_typed`).
-            let http = if status == 200 { String::new() } else { format!(" (HTTP {status})") };
-            let error = Error(format!(
-                "asset {asset_id}: asset delivery: {}{http}",
-                why.unwrap_or("no download location")
-            ));
-            return Err(match why {
-                Some(_) => AssetDownloadError::Refused(error),
-                None => AssetDownloadError::Other(error),
-            });
-        };
-        let response = self.get_bytes_response(location, false)?;
+        // Where it is: from Studio's batched resolution (many assets per
+        // request, in the open place's context: `Roblox-Place-Id` makes the
+        // creator's private animations and audio reach collaborators),
+        // usually already answered because the asset was queued ahead.
+        let resolved = crate::asset_batch::resolve(&std::sync::Arc::new(self.downloader()), asset_id, version)?;
+        let location = resolved.location.as_str();
+        let response = self
+            .agent
+            .get(location)
+            .header("Accept-Encoding", "gzip")
+            .call()
+            .map_err(|e| AssetDownloadError::transport(asset_id, "download", e))?;
         if let Some(error) = AssetDownloadError::transient_response(asset_id, "download", &response) {
             return Err(error);
         }
@@ -1387,6 +1366,18 @@ mod rotation {
     /// The reply Roblox sends when it hands out the next `.ROBLOSECURITY`.
     const ROTATED: &str = ".ROBLOSECURITY=rotated-value; Domain=.roblox.com; Path=/; \
         Expires=Mon, 15 Nov 2027 10:25:03 GMT; Secure; HttpOnly";
+
+    /// Downloader copies share the session's CSRF token: one 403 handshake
+    /// per sign-in, not one per copy (every write paid it twice).
+    #[test]
+    fn downloader_copies_share_the_csrf_token() {
+        let s = Session::unchecked(Cookie::new("value").unwrap(), mock(""));
+        let copy = s.downloader();
+        assert!(!copy.csrf_token_held());
+        *s.csrf.lock().unwrap() = Some("token".into());
+        assert!(copy.csrf_token_held());
+        assert!(s.downloader().csrf_token_held());
+    }
 
     #[test]
     fn a_reply_rotates_the_cookie_and_every_copy_uses_it() {

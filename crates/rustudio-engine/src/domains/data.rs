@@ -175,12 +175,13 @@ pub fn scratch_universe() -> u64 {
 
 
 /// Whether this Play keeps DataStores, MemoryStores and Messaging in memory.
-/// A published place other than the scratch experience does, unless the
-/// user opts in (RUSTUDIO_LIVE_DATA=1 or Studio Settings > rustudio > Use
-/// live DataStores, crates/rustudio-core/src/rustudio_settings.rs; latched at Play start). RUSTUDIO_LOCAL_DATASTORE=1
-/// (a test aid) keeps everything in memory regardless: a Play of a live game must never
-/// read-modify-write real players' saves (the local player's own save
-/// included) or publish to its live servers.
+/// As Studio: a published place uses its real data (whether writes are
+/// allowed is the game's "Enable Studio Access to API Services", checked
+/// per write, rustudio_account::data::StudioAccess), unless Studio Settings
+/// > rustudio > Data in Play is "In memory only" (or RUSTUDIO_DATA_MODE=memory;
+/// latched at Play start). RUSTUDIO_LOCAL_DATASTORE=1 (a test aid) keeps
+/// everything in memory regardless. An unpublished place gets Studio's
+/// "must publish" errors.
 pub fn local_mode_for(universe: u64) -> bool {
     if std::env::var("RUSTUDIO_LOCAL_DATASTORE").as_deref() == Ok("1") {
         return true;

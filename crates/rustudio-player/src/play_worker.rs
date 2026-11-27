@@ -486,6 +486,8 @@ struct Presentation {
     cursor_image: Option<String>,
     clickable: bool,
     kicked: Option<String>,
+    /// The session's close (Stop) finished.
+    close_done: bool,
     flashes: Vec<Flash>,
     /// Roblox's CoreScripts started on the worker's client (Escape and the
     /// Play chrome then belong to them, not rustudio's own menu).
@@ -822,10 +824,15 @@ impl Publication {
                 cursor_image: s.cursor_image.clone(),
                 clickable: s.game.clickable,
                 kicked: s.game.kicked.clone(),
+                close_done: s.close_done,
                 core_scripts_active: s.game.core_scripts_active,
                 flashes: s.game.flashes.clone(),
             })
         };
+        if let PublishedFrame::Updated(p) = &frame {
+            let (replaces, serial) = (p.snapshot.replaces_document(), p.snapshot.serial());
+            memory_log(game, replaces, serial);
+        }
         Self {
             frame,
             log: std::mem::take(&mut game.log),
@@ -861,6 +868,7 @@ impl Publication {
         }
         let _ = game.doc.marks_for(Reader::RenderSnapshot);
         if let Some(publish) = self.publish_ui {
+            let _u = rustudio_core::bench::scope("pub_ui");
             publish();
         }
         let s = game.play.as_mut().expect("Play presentation retained");
@@ -871,6 +879,7 @@ impl Publication {
         s.cursor_image = frame.cursor_image;
         s.game.clickable = frame.clickable;
         s.game.kicked = frame.kicked;
+        s.close_done = frame.close_done;
         s.game.core_scripts_active = frame.core_scripts_active;
         s.game.flashes = frame.flashes;
         s.presentation = Some(frame.view);
@@ -879,6 +888,62 @@ impl Publication {
             host.document_changed(&game.doc);
         }
     }
+}
+
+/// The worker's memory, in the log while a Play runs on a phone (or with
+/// `RUSTUDIO_MEMORY_LOG=1` anywhere): every [`MEMORY_LOG_EVERY`] the two
+/// Lua heaps and the two DataModels' sizes, and every publication that
+/// replaces the viewport's whole document rather than sending a delta
+/// (the first ten, then every hundredth: one a frame would mean the
+/// viewport rebuilding its scene each frame — the lag and the memory
+/// growth a 2026-11-24 report showed after a switch to the client view,
+/// 7.2 GB resident before the GPU gave out). `adb logcat -s rustudio`
+/// then says where the memory went: a Lua heap, a DataModel, or the
+/// renderer (src/android/memory.rs has the renderer's share).
+const MEMORY_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn memory_log_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("RUSTUDIO_MEMORY_LOG").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => cfg!(target_os = "android"),
+    })
+}
+
+fn memory_log(game: &mut Game, replaces: bool, serial: u64) {
+    if !memory_log_on() {
+        return;
+    }
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static REPLACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if replaces {
+        let n = REPLACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 10 || n % 100 == 0 {
+            log::info!(
+                "memory: play publication {serial} replaces the viewport's document ({} instances; full snapshot #{n})",
+                game.doc.dom.descendants().count()
+            );
+        }
+    }
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| now.duration_since(t) < MEMORY_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    drop(last);
+    let showing = game.play.as_ref().map(|s| s.showing);
+    let shown = game.doc.dom.descendants().count();
+    let other = game.play.as_ref().and_then(|s| s.other_doc_instances());
+    let mut heap = |side: Side| game.with_play_side(side, |rt, _, _| rt.lua.used_memory() >> 20).unwrap_or(0);
+    let (server_mb, client_mb) = (heap(Side::Server), heap(Side::Client));
+    log::info!(
+        "memory: play worker: Lua server {server_mb} MB, client {client_mb} MB; {} DataModel {shown} instances{}; {} full snapshots",
+        showing.map_or("shown", |s| s.label()),
+        other.map_or(String::new(), |n| format!(", the other {n}")),
+        REPLACES.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 impl Game {
@@ -905,7 +970,15 @@ impl Game {
                 self.push_log(level, text);
             }
         }
-        let mut doc = Document::from_play_dom(self.doc.dom.clone(), self.doc.title.clone());
+        // The worker's document: Play's server copy, made here once (as
+        // `start_play` would: fresh refs, root "Game"). A teleport plays its
+        // own destination, and the worker copies that as before.
+        let teleporting = self.teleport_to.is_some();
+        let mut doc = if teleporting {
+            Document::from_play_dom(self.doc.dom.clone(), self.doc.title.clone())
+        } else {
+            self.doc.clone_for_play(self.doc.title.clone())
+        };
         doc.kind = self.doc.kind;
         doc.path.clone_from(&self.doc.path);
         doc.cloud.clone_from(&self.doc.cloud);
@@ -926,6 +999,7 @@ impl Game {
 
         let worker = match PlayWorker::spawn(host.play_worker_host(), move |game, worker_host| {
             game.doc = doc;
+            game.doc_is_play_copy = !teleporting;
             game.teleport_to = teleport;
             game.cam = cam;
             game.viewport_rect = viewport;
@@ -1004,7 +1078,9 @@ impl Game {
                 let _tick = rustudio_core::bench::scope("gameplay_step");
                 game.poll_assets();
                 let keyboard = input.apply(game);
-                game.step_play(dt, worker_host, &keyboard, true)
+                let updated = game.step_play(dt, worker_host, &keyboard, true);
+                game.update_close_state();
+                updated
             };
             let _capture = rustudio_core::bench::scope("gameplay_capture");
             let ui = updated.then(|| worker_host.hooks.capture_play_ui(game)).flatten();
@@ -1169,6 +1245,21 @@ impl Game {
 }
 
 impl Game {
+    /// Begins the close (Stop) on the gameplay worker, where the runtimes are.
+    pub(super) fn begin_close_worker(&mut self) {
+        let Some(t) = self.play_thread.as_mut() else { return };
+        if let Ok(Ok(logs)) = t
+            .worker
+            .submit(|game, worker_host| {
+                game.begin_close(worker_host);
+                std::mem::take(&mut game.log)
+            })
+            .map(|reply| reply.recv())
+        {
+            self.append_play_output(logs);
+        }
+    }
+
     pub(super) fn stop_play_worker(&mut self) {
         let Some(worker) = self.play_thread.take() else { return };
         if let Some(Ok((publication, _))) = worker.pending.map(|reply| reply.recv()) {
@@ -1177,7 +1268,7 @@ impl Game {
         let quiet = self.quiet_stop;
         if let Ok(Ok(logs)) = worker.worker.submit(move |game, worker_host| {
             game.quiet_stop = quiet;
-            game.stop_play(worker_host);
+            game.stop_play_now(worker_host);
             std::mem::take(&mut game.log)
         }).map(|reply| reply.recv()) {
             self.append_play_output(logs);

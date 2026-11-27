@@ -21,6 +21,8 @@ macro_rules! ukey {
 }
 #[doc(hidden)]
 pub use rbx_dom_weak as __rbx;
+/// The pinned Studio version (crates/rustudio-account/src/studio_target.rs).
+pub use rustudio_account::studio_target;
 
 pub mod grass_stream;
 pub mod sim_clock;
@@ -33,6 +35,7 @@ pub mod paths;
 pub mod android_dirs;
 pub mod platform;
 pub mod assets;
+pub mod asset_cache;
 pub mod bench;
 pub mod profiler;
 pub mod collision_groups;

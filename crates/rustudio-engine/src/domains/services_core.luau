@@ -147,8 +147,10 @@ end
 -- the CoreScript's context), whoever calls SetCore/GetCore. (A BindableEvent
 -- or BindableFunction handler's connection already runs as its connector.)
 local set_core_handlers = {}
+local set_core_identity = {}
+-- (captured at load: these internals leave the globals after start-up)
+local rs_identity, rs_spawn_with_identity = __rs_identity, __rs_spawn_with_identity
 local get_core_handlers = {}
-local set_core_ident = {}
 local get_core_ident = {}
 
 M["StarterGui.RegisterSetCore"] = function(self, name, fn)
@@ -157,7 +159,9 @@ M["StarterGui.RegisterSetCore"] = function(self, name, fn)
 		fail("RegisterSetCore: Argument 2 must be a function or BindableEvent")
 	end
 	set_core_handlers[k] = fn
-	set_core_ident[k] = rs.identity()
+	-- The handler runs at its registrant's identity (a CoreScript's), not
+	-- the identity of whoever calls SetCore.
+	set_core_identity[k] = rs_identity and rs_identity()
 end
 M["StarterGui.RegisterGetCore"] = function(self, name, fn)
 	local k = str_arg(name, 1)
@@ -168,11 +172,38 @@ M["StarterGui.RegisterGetCore"] = function(self, name, fn)
 	get_core_ident[k] = rs.identity()
 end
 
+-- SetCore values cross into CoreScript code the way Bindable arguments
+-- do: tables are copied without metatables and raw functions are dropped,
+-- so a game script can't hand a CoreScript a metatable or function that
+-- would run its code inside the CoreScript's frames or at its identity.
+local function bindable_copy(v, seen, depth)
+	local t = type(v)
+	if t == "function" or t == "thread" then
+		return nil
+	elseif t ~= "table" then
+		return v
+	end
+	if depth > 64 then return nil end
+	if seen[v] then return seen[v] end
+	local out = {}
+	seen[v] = out
+	for k, x in next, v do
+		local ck = bindable_copy(k, seen, depth + 1)
+		if ck ~= nil then
+			rawset(out, ck, bindable_copy(x, seen, depth + 1))
+		end
+	end
+	return out
+end
+
 function __rs_core_set_core(name, val)
 	local h = set_core_handlers[name]
 	if h == nil then return false end
+	val = bindable_copy(val, {}, 0)
 	if type(h) == "function" then
-		rs.call_as(set_core_ident[name] or rs.identity(), h, val)
+		-- Its own thread, at the registrant's identity: the handler's frames
+		-- are never on the calling game script's stack.
+		rs_spawn_with_identity("SetCore:" .. name, set_core_identity[name] or (rs_identity and rs_identity()), h, val)
 	elseif typeof(h) == "Instance" and h:IsA("BindableEvent") then
 		h:Fire(val)
 	end

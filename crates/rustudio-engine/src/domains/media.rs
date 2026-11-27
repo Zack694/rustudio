@@ -819,18 +819,14 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     lua.set_app_data(Media::default());
     // *Async members yield on the task scheduler as Studio's do: they run,
     // then the calling thread waits a frame before getting the result.
+    // A video load first waits (yielding) for the video to download.
     for name in ASYNC {
-        let n = name.to_string();
-        let raw = lua.create_function(move |lua, args: MultiValue| {
-            rustudio_core::bench::api_timed("call", &n, || checked(lua, call_method(lua, &n, args)))
-        })?;
-        let f = crate::cmeta::method(lua, name, Some(raw), None, None)?;
-        let maker: mlua::Function = lua
-            .load(
-                "local f = ... return function(...) local r = table.pack(f(...)) task.wait() return table.unpack(r, 1, r.n) end",
-            )
-            .into_function()?;
-        let y: mlua::Function = maker.call(f)?;
+        let f = crate::runtime::content_wait::raw_method(lua, name)?;
+        let y = match *name {
+            "LoadAsync" => crate::runtime::content_wait::yielding(lua, f, Some(true), true)?,
+            "CreateVideoSamplerAsync" => crate::runtime::content_wait::yielding(lua, f, Some(false), true)?,
+            _ => crate::runtime::content_wait::yielding(lua, f, None, true)?,
+        };
         if let Some(mut c) = lua.app_data_mut::<Cache>() {
             c.overrides.insert(name, y);
         }

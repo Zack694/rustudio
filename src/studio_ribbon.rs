@@ -132,7 +132,7 @@ impl Editor {
                 .on_hover_text("Stop (Shift+F5)");
             self.ui_rects.insert("test.stop", resp.rect);
             if mode.is_some() && resp.clicked() {
-                self.stop_play();
+                self.request_stop();
             }
             top_icon(ui, "device-mobile", theme::TEXT, false).on_hover_text("Device Simulator: not in rustudio yet");
 

@@ -128,6 +128,26 @@ struct HoverKey {
 }
 
 impl Editor {
+    /// The ScreenGui object drawn under `p` in the edit view, if the GUI is
+    /// shown. ScreenGuis draw over world GUIs, so the topmost hit is a
+    /// ScreenGui's whenever one is there.
+    fn screen_gui_at(&self, p: Pos2) -> Option<Ref> {
+        if !self.ui.show_gui {
+            return None;
+        }
+        let r = self.game.gui.object_at(p)?;
+        let doc = &self.game.doc;
+        let mut cur = doc.dom.get_by_ref(r).map(|i| i.parent());
+        while let Some(a) = cur.filter(|a| a.is_some()) {
+            let inst = doc.dom.get_by_ref(a)?;
+            if inst.class == "ScreenGui" {
+                return Some(r);
+            }
+            cur = Some(inst.parent());
+        }
+        None
+    }
+
     /// Fly speed multiplier over the base step, Studio's rule:
     /// the base step until 120 ticks held, then ticks / 240 studs, capped at 15
     /// (×30 base, reached after about 25 s).
@@ -761,7 +781,9 @@ impl Editor {
             && !self.clean_view
             && !roblox_dragger_idle
         {
-            pointer.and_then(|p| self.hover_pick(rect, p, alt))
+            pointer
+                .filter(|p| self.screen_gui_at(*p).is_none())
+                .and_then(|p| self.hover_pick(rect, p, alt))
         } else {
             None
         };
@@ -799,6 +821,7 @@ impl Editor {
 
         let playing = self.game.is_playing();
         let show_gui = self.ui.show_gui;
+        self.game.show_core_gui = self.ui.show_core_gui;
         // The game's fingers (touch identity, touch_input.rs): the GUI has
         // them first; what it leaves goes to the game's input (play_game.rs
         // `game_viewport`, play.rs).
@@ -909,6 +932,11 @@ impl Editor {
                 if let Some(h) = self.handle_at(&handles, p) {
                     self.start_drag(rect, h, p);
                 } else if alt {
+                } else if self.screen_gui_at(p).is_some() {
+                    // A ScreenGui object under the pointer blocks 3D part drag /
+                    // 3D marquee (UIEditor handles GUI dragging when active).
+                    // SurfaceGuis / BillboardGuis on parts don't: the part under
+                    // them still drags and hovers.
                 } else if matches!(self.tool, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate | Tool::Transform)
                     && self.start_part_drag(rect, p, ctrl || shift)
                 {
@@ -957,9 +985,11 @@ impl Editor {
         if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
-                let hit = self.game
-                    .gui
-                    .object_at(p)
+                let hit = self
+                    .ui
+                    .show_gui
+                    .then(|| self.game.gui.object_at(p))
+                    .flatten()
                     .or_else(|| self.pick(rect, p, ctx.input(|i| i.modifiers.alt)));
                 match (hit, ctrl || shift) {
                     (Some(r), true) => {

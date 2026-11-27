@@ -390,6 +390,112 @@ pub fn window_insets() -> Result<Insets> {
     })
 }
 
+// ---------------------------------------------------------------- cutout
+
+/// `WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES`
+/// (API 28): the window may extend into the display cutout on the short
+/// edges of the screen — a landscape phone's camera hole at the left or
+/// right — and is laid out away from it on the long edges.
+pub const LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES: i32 = 1;
+
+/// `window.getAttributes().layoutInDisplayCutoutMode = mode`, through
+/// `setAttributes` (API 28+; nothing before, where there is no cutout
+/// mode). The window's business: call on the Java main thread, as
+/// system_bars.rs does its calls (before the window is attached it is
+/// kept for the attach).
+pub fn set_layout_in_display_cutout_mode(mode: i32) -> Result<()> {
+    if sdk_int() < 28 {
+        return Ok(());
+    }
+    with_activity(|env, activity| {
+        let window = env.call_method(activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[])?.l()?;
+        if window.is_null() {
+            return Ok(());
+        }
+        let params = env
+            .call_method(&window, jni_str!("getAttributes"), jni_sig!("()Landroid/view/WindowManager$LayoutParams;"), &[])?
+            .l()?;
+        if params.is_null() {
+            return Ok(());
+        }
+        env.set_field(&params, jni_str!("layoutInDisplayCutoutMode"), jni_sig!("I"), JValue::Int(mode))?;
+        env.call_method(
+            &window,
+            jni_str!("setAttributes"),
+            jni_sig!("(Landroid/view/WindowManager$LayoutParams;)V"),
+            &[JValue::Object(&params)],
+        )?;
+        Ok(())
+    })
+}
+
+/// Where [`display_cutout_later`]'s answer arrives (`None` until it has):
+/// the cutout's safe insets, left / top / right / bottom, in window pixels.
+pub type CutoutAnswer = std::sync::Arc<std::sync::Mutex<Option<Result<[i32; 4]>>>>;
+
+/// The display cutout's safe insets in window pixels — what the camera
+/// hole or notch takes off each edge of the window; zeros without one,
+/// or while the window keeps out of it (`layoutInDisplayCutoutMode`
+/// default in landscape) — read on the Java main thread like
+/// [`keyboard_height_later`]: API 30+ `getInsets(Type.displayCutout())`,
+/// API 28–29 `getDisplayCutout()`'s safe insets, nothing before API 28.
+/// The answer is an error while the window has no insets yet (before its
+/// decor view is attached): ask again later.
+pub fn display_cutout_later() -> CutoutAnswer {
+    let slot: CutoutAnswer = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let answer = slot.clone();
+    match super::app() {
+        None => *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err("no AndroidApp yet".to_string())),
+        Some(app) => app.run_on_java_main_thread(Box::new(move || {
+            let insets = read_display_cutout();
+            *answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(insets);
+        })),
+    }
+    slot
+}
+
+fn read_display_cutout() -> Result<[i32; 4]> {
+    if sdk_int() < 28 {
+        return Ok([0; 4]);
+    }
+    with_activity(|env, activity| {
+        let window = env.call_method(activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[])?.l()?;
+        if window.is_null() {
+            return Ok(Err("no window yet".to_string()));
+        }
+        let decor = env.call_method(&window, jni_str!("getDecorView"), jni_sig!("()Landroid/view/View;"), &[])?.l()?;
+        if decor.is_null() {
+            return Ok(Err("no decor view yet".to_string()));
+        }
+        let insets = env
+            .call_method(&decor, jni_str!("getRootWindowInsets"), jni_sig!("()Landroid/view/WindowInsets;"), &[])?
+            .l()?;
+        if insets.is_null() {
+            return Ok(Err("no window insets yet".to_string()));
+        }
+        if sdk_int() >= 30 {
+            let cutout = env.call_static_method(jni_str!("android/view/WindowInsets$Type"), jni_str!("displayCutout"), jni_sig!("()I"), &[])?.i()?;
+            let (l, t, r, b) = read_insets(env, &insets, cutout)?;
+            return Ok(Ok([l, t, r, b]));
+        }
+        let cutout = env
+            .call_method(&insets, jni_str!("getDisplayCutout"), jni_sig!("()Landroid/view/DisplayCutout;"), &[])?
+            .l()?;
+        if cutout.is_null() {
+            return Ok(Ok([0; 4]));
+        }
+        let get = |env: &mut Env, name: &'static jni::strings::JNIStr| -> jni::errors::Result<i32> {
+            env.call_method(&cutout, name, jni_sig!("()I"), &[])?.i()
+        };
+        Ok(Ok([
+            get(env, jni_str!("getSafeInsetLeft"))?,
+            get(env, jni_str!("getSafeInsetTop"))?,
+            get(env, jni_str!("getSafeInsetRight"))?,
+            get(env, jni_str!("getSafeInsetBottom"))?,
+        ]))
+    })?
+}
+
 /// Where [`keyboard_height_later`]'s answer arrives (`None` until it has).
 pub type KeyboardAnswer = std::sync::Arc<std::sync::Mutex<Option<Result<i32>>>>;
 
@@ -925,4 +1031,56 @@ pub fn move_task_to_back() -> Result<()> {
         },
         std::time::Duration::from_millis(400),
     )?
+}
+
+/// Writes a file into the shared Download folder, `Download/rustudio/<name>`,
+/// where a Files app shows it — the app's own folders under `Android/data`
+/// are closed to them since Android 11, so a crash report there was out of
+/// a user's reach. API 29+: a `MediaStore.Downloads` row the app inserts
+/// (no permission is needed for files an app makes itself); below that,
+/// written straight into the public Download folder (which needs the
+/// storage permission). Returns the path as the Files app shows it.
+pub fn export_download(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
+    let rel = format!("Download/rustudio/{name}");
+    if sdk_int() < 29 {
+        let dir = std::path::Path::new("/storage/emulated/0/Download/rustudio");
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::write(dir.join(name), bytes).map_err(|e| format!("{rel}: {e}"))?;
+        return Ok(rel);
+    }
+    with_activity(|env, activity| {
+        let resolver = env
+            .call_method(activity, jni_str!("getContentResolver"), jni_sig!("()Landroid/content/ContentResolver;"), &[])?
+            .l()?;
+        let values = env.new_object(jni_str!("android/content/ContentValues"), jni_sig!("()V"), &[])?;
+        for (key, value) in [("_display_name", name), ("mime_type", mime), ("relative_path", "Download/rustudio")] {
+            let k = env.new_string(key)?;
+            let v = env.new_string(value)?;
+            env.call_method(&values, jni_str!("put"), jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"), &[JValue::Object(&k), JValue::Object(&v)])?;
+        }
+        let collection = env
+            .get_static_field(jni_str!("android/provider/MediaStore$Downloads"), jni_str!("EXTERNAL_CONTENT_URI"), jni_sig!("Landroid/net/Uri;"))?
+            .l()?;
+        let uri = env
+            .call_method(
+                &resolver,
+                jni_str!("insert"),
+                jni_sig!("(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;"),
+                &[JValue::Object(&collection), JValue::Object(&values)],
+            )?
+            .l()?;
+        if uri.is_null() {
+            return Err(jni::errors::Error::NullPtr("MediaStore insert"));
+        }
+        let stream = env
+            .call_method(&resolver, jni_str!("openOutputStream"), jni_sig!("(Landroid/net/Uri;)Ljava/io/OutputStream;"), &[JValue::Object(&uri)])?
+            .l()?;
+        if stream.is_null() {
+            return Err(jni::errors::Error::NullPtr("openOutputStream"));
+        }
+        let array = env.byte_array_from_slice(bytes)?;
+        env.call_method(&stream, jni_str!("write"), jni_sig!("([B)V"), &[JValue::Object(&array)])?;
+        env.call_method(&stream, jni_str!("close"), jni_sig!("()V"), &[])?;
+        Ok(rel.clone())
+    })
 }

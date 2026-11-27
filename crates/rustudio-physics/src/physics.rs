@@ -1273,6 +1273,21 @@ pub struct Physics {
     fresh: Option<Vec<Ref>>,
     /// Parts to re-check on the next sync (e.g. after `skip` changed).
     queued: HashSet<Ref>,
+    /// Journal marks a publish took out of the way of its own CFrame writes,
+    /// kept whole for the next `sync`. (They used to go into `queued` as
+    /// bare refs, which rebuilt and woke the part whatever the property
+    /// was: during a burst every Transparency tween and every CollisionGroup
+    /// write on a resting part was a rebuild, and a fresh debris batch
+    /// was built twice.)
+    held_marks: Vec<doc::Mark>,
+    /// `sync`'s rebuild: parts whose own structural property changed (or
+    /// that were queued), which wake when rebuilt. The rest of a rebuild —
+    /// a re-parented folder's descendants, assembly neighbours — keeps a
+    /// sleeping body asleep (`add_assembly`): a script re-parenting or
+    /// retagging the map used to wake every resting part in it at once.
+    rebuild_wakes: HashSet<Ref>,
+    /// Set while `sync`'s rebuild runs (the only one that may keep bodies asleep).
+    rebuild_keep_sleep: bool,
     /// Mesh parts colliding with a stand-in until their decomposition is ready.
     mesh_pending: HashMap<Ref, (std::sync::Arc<str>, u32)>,
     /// Off-centre unions' shape offsets (mesh_bvh::union_offset), kept for
@@ -1519,6 +1534,9 @@ impl Physics {
             follower_eps: (1e-5, 1e-9),
             fresh: None,
             queued: HashSet::default(),
+            held_marks: Vec::new(),
+            rebuild_wakes: HashSet::default(),
+            rebuild_keep_sleep: false,
             mesh_pending: HashMap::default(),
             union_offsets: HashMap::default(),
             mesh_checked: None,
@@ -1785,6 +1803,7 @@ impl Physics {
         let mut all: Vec<Ref> = all.into_iter().collect();
         all.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
         let mut prev_vel: HashMap<Ref, (Vec3, Vec3)> = HashMap::default();
+        let mut prev_asleep: HashSet<Ref> = HashSet::default();
         for r in &all {
             if let Some(b) = self.body_of(*r).and_then(|h| self.world.bodies.get(h)) {
                 if b.is_dynamic() {
@@ -1793,8 +1812,25 @@ impl Physics {
                     if v != Vec3::ZERO || w != Vec3::ZERO {
                         prev_vel.insert(*r, (v, w));
                     }
+                    if b.is_sleeping() {
+                        prev_asleep.insert(*r);
+                    }
                 }
             }
+        }
+        if all.len() > 300 && std::env::var_os("RUSTUDIO_SNAPSHOT_LOG").is_some() {
+            let mut classes: HashMap<String, usize> = HashMap::default();
+            for r in seeds.iter().take(20000) {
+                *classes.entry(doc.class_of(*r).map(|c| c.to_string()).unwrap_or_default()).or_default() += 1;
+            }
+            eprintln!(
+                "[physics] big rebuild: {} seeds ({} wake), {} parts in the closure, {} asleep before; seed classes {:?}",
+                seeds.len(),
+                self.rebuild_wakes.len(),
+                all.len(),
+                prev_asleep.len(),
+                classes
+            );
         }
         for r in &all {
             self.drop_part(*r);
@@ -1841,7 +1877,7 @@ impl Physics {
                 stack.extend(self.neighbours(r));
             }
             group.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
-            self.add_assembly(doc, &group, &info, &prev_vel);
+            self.add_assembly(doc, &group, &info, &prev_vel, &prev_asleep);
             self.rebuilt += 1;
         }
     }
@@ -1852,6 +1888,7 @@ impl Physics {
         group: &[Ref],
         info: &HashMap<Ref, (Xform, Sig)>,
         prev_vel: &HashMap<Ref, (Vec3, Vec3)>,
+        prev_asleep: &HashSet<Ref>,
     ) {
         let anchored = group.iter().any(|r| info[r].1.anchored);
         if anchored {
@@ -1951,11 +1988,25 @@ impl Physics {
             }
         }
         // Studio Settings > Physics > Allow Sleep.
+        let can_sleep = rustudio_core::rustudio_settings::studio_flag("PhysicsSettings", "AllowSleep", true);
+        // A resting assembly rebuilt for someone else's change (its folder
+        // re-parented, a neighbour's weld) goes back to sleep as it was;
+        // one whose own part changed, or that carries velocity, wakes.
+        // (rapier's solver only: the Studio solver keeps its own sleep state
+        // per body, which a new body starts awake in — a sleeping flag it
+        // doesn't know of would stop the body's poses being published.)
+        let stay_asleep = can_sleep
+            && self.studio.is_none()
+            && self.rebuild_keep_sleep
+            && init_lin == Vec3::ZERO
+            && init_ang == Vec3::ZERO
+            && group.iter().all(|r| prev_asleep.contains(r) && !self.rebuild_wakes.contains(r));
         let mut rb = rp::RigidBodyBuilder::dynamic()
             .pose(root_pose)
             .linvel(rv(init_lin))
             .angvel(rv(init_ang))
-            .can_sleep(rustudio_core::rustudio_settings::studio_flag("PhysicsSettings", "AllowSleep", true));
+            .can_sleep(can_sleep)
+            .sleeping(stay_asleep);
         if upright {
             rb = rb.lock_rotations();
         }
@@ -2236,10 +2287,16 @@ impl Physics {
             doc::Marks::All => {
                 let _p = rustudio_core::bench::scope("ps_reconcile");
                 self.queued.clear();
+                self.held_marks.clear();
                 self.reconcile(doc);
                 return;
             }
-            doc::Marks::Some(m) => m,
+            doc::Marks::Some(m) if self.held_marks.is_empty() => m,
+            doc::Marks::Some(m) => {
+                let mut held = std::mem::take(&mut self.held_marks);
+                held.extend(m);
+                held
+            }
         };
         // Decompositions that finished since: rebuild those parts with them.
         if !self.mesh_pending.is_empty()
@@ -2265,6 +2322,9 @@ impl Physics {
             }
         }
         let mut seeds: HashSet<Ref> = std::mem::take(&mut self.queued);
+        // Queued parts lost their property names: they wake when rebuilt.
+        self.rebuild_wakes.clear();
+        self.rebuild_wakes.extend(seeds.iter().copied());
         let mut moved: Vec<Ref> = Vec::new();
         let cframe = ustr("CFrame");
         let structural = |n: &str| {
@@ -2318,17 +2378,50 @@ impl Physics {
                     {
                         terrain = true;
                     }
+                    if matches!(name.as_str(), "CollisionGroup" | "CollisionGroupId")
+                        && self.parts.contains_key(&r)
+                    {
+                        // A part's new collision group goes onto its collider
+                        // in place (as `reapply_groups` does when the group table
+                        // changes): rebuilding it woke it, and a script that
+                        // regroups the whole map — LBG does, 6500 parts at a
+                        // time — rebuilt and woke every resting part at once.
+                        let g = self.part_groups(doc, r);
+                        let c = self.parts[&r].collider;
+                        if let Some(col) = self.world.colliders.get_mut(c) {
+                            if col.collision_groups() != g {
+                                col.set_collision_groups(g);
+                                if let Some(sv) = self.studio.as_mut() {
+                                    sv.support_changed(c);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if structural(name.as_str()) {
                         if self.joints.contains_key(&r)
                             || doc.class_of(r).is_some_and(|c| is_rigid_joint(&c))
                         {
-                            seeds.extend(self.read_joint(doc, ws, r));
+                            let ends = self.read_joint(doc, ws, r);
+                            self.rebuild_wakes.extend(ends.iter().copied());
+                            seeds.extend(ends);
                         } else {
+                            self.rebuild_wakes.insert(r);
                             seeds.insert(r);
                         }
                     }
                 }
                 doc::Mark::Tree(r) => {
+                    if std::env::var_os("RUSTUDIO_SNAPSHOT_LOG").is_some() {
+                        let n = doc.subtree(r).len();
+                        if n > 200 {
+                            eprintln!(
+                                "[physics] tree mark on {} {:?} ({n} descendants)",
+                                doc.class_of(r).map(|c| c.to_string()).unwrap_or_default(),
+                                doc.dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default()
+                            );
+                        }
+                    }
                     for d in doc.subtree(r) {
                         self.note_other(doc, d, &mut movers, &mut attachments, &mut terrain);
                         if self.joints.contains_key(&d)
@@ -2376,15 +2469,25 @@ impl Physics {
             let _p = rustudio_core::bench::scope("ps_terrain");
             self.build_terrain(doc);
         }
+        // A part this world leaves alone and has not built (the client's
+        // copy of the replicated map, until a client body comes near; the
+        // server's character parts) has nothing to rebuild: `wanted` would
+        // refuse it in `build` after the closure walk had been paid for —
+        // 6500 of them when LBG's server regroups its map, replicated to
+        // the client in one frame.
         seeds.retain(|r| {
             self.parts.contains_key(r)
-                || doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart"))
+                || (!self.skip.contains(r)
+                    && doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart")))
         });
         if !seeds.is_empty() {
             let _p = rustudio_core::bench::scope("ps_build");
             rustudio_core::bench::add("ps_seeds", 0.0, seeds.len() as u64);
+            self.rebuild_keep_sleep = true;
             self.build(doc, ws, seeds.clone());
+            self.rebuild_keep_sleep = false;
         }
+        self.rebuild_wakes.clear();
         for r in moved {
             self.server_moved.insert(r);
             if seeds.contains(&r) {
@@ -2814,18 +2917,27 @@ impl Physics {
                 (f, Vec3::ZERO)
             }
             Law::BodyPosition { pos, max, p, d } => {
-                // Studio's BodyPosition closes the gap at a first-order
-                // rate independent of mass, λ = 386·P / max(D, 196)²
-                // (fitted to Studio 0.744: P 1e4 D 1250 → 2.47/s, P 4e4 →
-                // 9.88, D 5000 → 0.154, P 1e3 D 100 → ≈10), holding the
-                // part's weight; the force is capped per world axis by
-                // MaxForce (a 4-stud cube at the default 4000 falls, as in
-                // Studio). ReachedTarget: within 0.1 stud (
-                // compares the squared gap with 0.01).
-                let dd = d.max(196.0);
-                let lambda = (386.0 * p.max(0.0) / (dd * dd)).min(0.9 / h);
+                // Roblox's BodyPosition is a PD controller on the
+                // assembly's acceleration, independent of mass: a = P·e −
+                // D·v re-evaluated every step (Roblox staff, devforum "Body
+                // Mover Mathematics for P and D"), holding the part's
+                // weight; the force is capped per world axis by MaxForce
+                // (a 4-stud cube at the default 4000 falls, as in Studio).
+                // Studio 0.744's large-D rates (P 1e4 D 1250 → 2.47/s, P
+                // 4e4 → 9.88, D 5000 → 0.154, P 1e3 D 100 → ≈10) are that
+                // controller's overdamped limit with D read as
+                // D·max(1, D/386); below 386 it is the plain PD — an
+                // underdamped P 160 D 22 lifts a character 33 studs in a
+                // third of a second (LBG's Savage Fangs), where the earlier
+                // first-order fit took seconds. Implicit in position and
+                // velocity, so any P and D are stable. ReachedTarget:
+                // within 0.1 stud (compares the squared gap with 0.01).
+                let p = p.max(0.0);
+                let d = d.max(0.0);
+                let d_eff = d * (d / 386.0).max(1.0);
                 let e = pos - part.pos;
-                (clamp_axes(force_for(e * lambda), max), Vec3::ZERO)
+                let v_new = (st.v + h * p * e) / (1.0 + h * d_eff + h * h * p);
+                (clamp_axes(force_for(v_new), max), Vec3::ZERO)
             }
             Law::AlignPosition {
                 goal,
@@ -3531,6 +3643,7 @@ impl Physics {
         }
         let (full_ms, hurried_ms) = (self.tick_full_ms, self.tick_hurried_ms);
         let (send, result) = std::sync::mpsc::sync_channel(1);
+        let _sp = rustudio_core::bench::scope("pf_spawn");
         pool.spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let sections = self.measure_batch(None, &frame);
@@ -3566,9 +3679,15 @@ impl Physics {
     }
 
     fn prepare_frame(&mut self, doc: &mut Document, dt: f32) -> PhysicsFrame {
-        self.apply_touch_quiet();
+        {
+            let _t = rustudio_core::bench::scope("pf_touch_quiet");
+            self.apply_touch_quiet();
+        }
+        let _g = rustudio_core::bench::scope("pf_gravity_impulses");
         self.sync_gravity(doc);
         self.take_script_impulses(doc.id);
+        drop(_g);
+        let _v = rustudio_core::bench::scope("pf_pending_vel");
         for (r, (v, left)) in std::mem::take(&mut self.pending_vel) {
             if self.parts.contains_key(&r) {
                 self.set_velocity(r, v);
@@ -3576,6 +3695,8 @@ impl Physics {
                 self.pending_vel.insert(r, (v, left - 1));
             }
         }
+        drop(_v);
+        let _m = rustudio_core::bench::scope("pf_mode");
         self.throttle.mode = doc
             .workspace()
             .and_then(|w| match doc.prop(w, "PhysicsEnvironmentalThrottle") {
@@ -3589,6 +3710,7 @@ impl Physics {
         if let Some(v) = *FORCE.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_ENV_THROTTLE").ok().and_then(|v| v.parse().ok())) {
             self.throttle.mode = crate::throttle::Mode::from_value(v);
         }
+        drop(_m);
         let h = 1.0 / step_rate().0;
         // Studio's cyclic executive caps this frame and remembers less
         // than four steps for the next. The worker and inline paths use
@@ -3752,14 +3874,8 @@ impl Physics {
                     .filter(|m| !matches!(m, doc::Mark::Prop(_, n) if *n == cframe))
                     .collect();
                 if !others.is_empty() {
-                    // Keep anything else for the next sync.
-                    for m in others {
-                        match m {
-                            doc::Mark::Prop(r, _) | doc::Mark::Tree(r) => {
-                                self.queued.insert(r);
-                            }
-                        }
-                    }
+                    // Keep anything else, as it is, for the next sync.
+                    self.held_marks.extend(others);
                 }
             }
         }
@@ -5957,6 +6073,44 @@ mod tests {
     fn floating(doc: &mut Document, at: Vec3) -> Ref {
         let ws = doc.workspace().unwrap();
         doc.dom.insert(ws, part("Box", at, false))
+    }
+
+    /// Savage Fangs (LBG) lifts the caster 33 studs with P 160, D 22,
+    /// MaxForce 1e5: Roblox's PD on acceleration gets there in about a
+    /// third of a second with a small overshoot, mass or not (a 3-stud
+    /// cube weighs about what an R6 character does; 1e5 is not the cap).
+    #[test]
+    fn body_position_small_d_lifts_quickly() {
+        for size in [2.0_f32, 3.0] {
+            let mut doc = Document::new_place();
+            let ws = doc.workspace().unwrap();
+            let a = doc.dom.insert(
+                ws,
+                InstanceBuilder::new("Part")
+                    .with_property("Size", Vector3::new(size, size, size))
+                    .with_property("CFrame", CFrame::new(Vector3::new(0.0, 20.0, 0.0), CFrame::identity().orientation))
+                    .with_property("Anchored", false),
+            );
+            let goal = Vec3::new(0.0, 53.0, 15.0);
+            doc.dom.insert(
+                a,
+                InstanceBuilder::new("BodyPosition")
+                    .with_property("Position", v3(goal))
+                    .with_property("P", 160.0_f32)
+                    .with_property("D", 22.0_f32)
+                    .with_property("MaxForce", Vector3::new(1e5, 1e5, 1e5)),
+            );
+            let mut p = Physics::new(&mut doc);
+            run(&mut p, &mut doc, 24);
+            let at = pos_of(&doc, a);
+            assert!(
+                (at - goal).length() < 4.0,
+                "size {size}: at {at:?} after 0.4 s, goal {goal:?}"
+            );
+            run(&mut p, &mut doc, 60);
+            let at = pos_of(&doc, a);
+            assert!((at - goal).length() < 0.5, "size {size}: settled at {at:?}, goal {goal:?}");
+        }
     }
 
     #[test]

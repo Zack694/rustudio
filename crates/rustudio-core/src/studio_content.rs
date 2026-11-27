@@ -15,6 +15,10 @@
 //! - `ReflectionMetadata.xml`, taken alone out of `RobloxStudio.zip` with
 //!   HTTP range requests (about 30 KB instead of the 120 MB package).
 //!
+//! The version is pinned (crate::studio_target): rustudio downloads exactly
+//! that deployment and checks every package's SHA-256, so the content always
+//! matches the bundled API dump. A download of another version is replaced.
+//!
 //! About 70 MB to download, a few packages at a time. `rustudio
 //! --install-studio-content` does it in the terminal; a normal launch does
 //! it in the background the first time (`RUSTUDIO_NO_STUDIO_FETCH=1` turns
@@ -46,7 +50,6 @@ const PACKAGES: &[(&str, &str)] = &[
 /// Single files pulled out of a big package by range requests.
 const SINGLE_FILES: &[(&str, &str)] = &[("RobloxStudio.zip", "ReflectionMetadata.xml")];
 
-const VERSION_URL: &str = "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64";
 const CDN: &str = "https://setup.rbxcdn.com";
 const MARKER: &str = ".rustudio-studio-version";
 // Bump when the installed content layout changes, even within one CDN version.
@@ -74,12 +77,13 @@ fn missing_packages(root: &Path) -> Vec<(&'static str, &'static str)> {
     PACKAGES.iter().copied().filter(|(_, sub)| !root.join(sub).is_dir()).collect()
 }
 
-/// Fetches `missing_packages` into an installed `root` of `version`.
-fn install_missing_packages(agent: &ureq::Agent, version: &str, root: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<(), String> {
+/// Fetches `missing_packages` into an installed `root` (of the pinned
+/// deployment).
+fn install_missing_packages(agent: &ureq::Agent, root: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<(), String> {
     for (pkg, sub) in missing_packages(root) {
         progress(&format!("downloading {pkg}"));
         let done = root.join(format!(".done-{pkg}"));
-        install_package(agent, version, pkg, &root.join(sub), &done)?;
+        install_package(agent, pkg, &root.join(sub), &done)?;
         let _ = std::fs::remove_file(done);
     }
     Ok(())
@@ -117,75 +121,105 @@ pub fn spawn_background_install_if_missing() {
         let need_vs = !has_view_selector(&root);
         let need_lp = !has_lua_package_assets(&root);
         let need_ui = !has_studio_ui_textures(&root);
-        if root == install_dir() && (need_vs || need_lp || need_ui || !packages.is_empty()) {
-            if let Some(marker) = std::fs::read_to_string(root.join(MARKER)).ok() {
-                if let Some(version) = marker.split_whitespace().next().and_then(studio_version) {
-                    let version = version.to_owned();
-                    let _ = std::thread::Builder::new().name("studio-content-upgrade".into()).spawn(move || {
-                        let a = agent();
-                        if !packages.is_empty() {
-                            let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
-                            post(false, format!("Studio content: downloading {} (new in this version of rustudio)…", names.join(", ")));
-                            match install_missing_packages(&a, &version, &root, &|_| {}) {
-                                Ok(()) => post(false, "Studio content: downloaded".into()),
-                                Err(e) => post(true, format!("Couldn't download Studio content: {e}")),
-                            }
-                        }
-                        if need_vs {
-                            if let Err(e) = install_view_selector(&a, &version, &root) {
-                                post(true, format!("Couldn't download Studio's View Selector: {e}"));
-                            }
-                        }
-                        if need_lp {
-                            if let Err(e) = install_lua_package_assets(&a, &version, &root) {
-                                post(true, format!("Couldn't download Studio's LuaPackages assets: {e}"));
-                            }
-                        }
-                        if need_ui {
-                            if let Err(e) = install_studio_ui_textures(&a, &version, &root) {
-                                post(true, format!("Couldn't download Studio's UI textures: {e}"));
-                            }
-                        }
-                    });
+        let pinned = crate::studio_target::DEPLOYMENT;
+        let found = content_deployment(&root);
+        if root == install_dir() && found.as_deref() != Some(pinned) {
+            // A download of another Studio version (or an older rustudio's
+            // "latest"): replace it with the pinned one.
+            let _ = std::thread::Builder::new().name("studio-content".into()).spawn(move || {
+                post(false, format!(
+                    "Studio content is {}, not the Studio {} rustudio targets: downloading {pinned} (about 60 MB)…",
+                    found.as_deref().unwrap_or("an unknown version"),
+                    crate::studio_target::VERSION,
+                ));
+                match install_retrying(&background_step) {
+                    Ok(v) => post(false, format!("Studio content {v} installed. Restart rustudio to use it everywhere.")),
+                    Err(e) => post(true, format!(
+                        "Couldn't download Studio content {pinned}: {e}. It continues where it stopped at the next start; `rustudio --install-studio-content` retries now."
+                    )),
                 }
-            }
+            });
+            return;
+        }
+        if root != install_dir() && found.as_deref() != Some(pinned) {
+            post(true, format!(
+                "Studio content at {} is {}, not the Studio {} ({pinned}) rustudio targets: scripts and metadata may not match its API. Unset RUSTUDIO_STUDIO_DIR to use rustudio's pinned download.",
+                root.display(),
+                found.as_deref().unwrap_or("an unknown version"),
+                crate::studio_target::VERSION,
+            ));
+        }
+        if root == install_dir() && (need_vs || need_lp || need_ui || !packages.is_empty()) {
+            let _ = std::thread::Builder::new().name("studio-content-upgrade".into()).spawn(move || {
+                let a = agent();
+                if !packages.is_empty() {
+                    let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
+                    post(false, format!("Studio content: downloading {} (new in this version of rustudio)…", names.join(", ")));
+                    match install_missing_packages(&a, &root, &|_| {}) {
+                        Ok(()) => post(false, "Studio content: downloaded".into()),
+                        Err(e) => post(true, format!("Couldn't download Studio content: {e}")),
+                    }
+                }
+                if need_vs {
+                    if let Err(e) = install_view_selector(&a, &root) {
+                        post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                    }
+                }
+                if need_lp {
+                    if let Err(e) = install_lua_package_assets(&a, &root) {
+                        post(true, format!("Couldn't download Studio's LuaPackages UI assets: {e}"));
+                    }
+                }
+                if need_ui {
+                    if let Err(e) = install_studio_ui_textures(&a, &root) {
+                        post(true, format!("Couldn't download Studio's UI textures: {e}"));
+                    }
+                }
+            });
         }
         return;
     }
     let _ = std::thread::Builder::new().name("studio-content".into()).spawn(|| {
         post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds, the CoreScripts' icon font; about 70 MB) from Roblox's CDN…".into());
-        // The packages as they come, so a slow connection is seen to get
-        // somewhere (the retired textures are a hundred small fetches: one
-        // line for all of them).
-        let step = |s: &str| {
-            if s.starts_with("downloading ") || (s.starts_with("fetching ") && !s.starts_with("fetching legacy ")) {
-                post(false, format!("Studio content: {s}…"));
-            } else if s.starts_with("ready") || s.starts_with("couldn't ") {
-                post(false, format!("Studio content: {s}"));
-            }
-        };
-        // A connection that drops gets a few more tries here (the download
-        // goes on where it stopped), and again at the next start.
-        const TRIES: u32 = 3;
-        for attempt in 1..=TRIES {
-            match install(&step) {
-                Ok(v) => {
-                    post(false, format!(
-                        "Studio content {v} installed in {}. Play now uses Roblox's default character and player scripts; restart rustudio to use Studio's fonts everywhere.",
-                        install_dir().display()
-                    ));
-                    break;
-                }
-                Err(e) if attempt < TRIES => {
-                    post(false, format!("Studio content: {e}; trying again in 20 s"));
-                    std::thread::sleep(std::time::Duration::from_secs(20));
-                }
-                Err(e) => post(true, format!(
-                    "Couldn't download Studio's built-in content: {e}. It continues where it stopped at the next start; `rustudio --install-studio-content` retries now, or point RUSTUDIO_STUDIO_DIR at a Studio install."
-                )),
-            }
+        match install_retrying(&background_step) {
+            Ok(v) => post(false, format!(
+                "Studio content {v} installed in {}. Play now uses Roblox's default character and player scripts; restart rustudio to use Studio's fonts everywhere.",
+                install_dir().display()
+            )),
+            Err(e) => post(true, format!(
+                "Couldn't download Studio's built-in content: {e}. It continues where it stopped at the next start; `rustudio --install-studio-content` retries now, or point RUSTUDIO_STUDIO_DIR at a Studio install."
+            )),
         }
     });
+}
+
+/// The background download's progress for Output: the packages as they
+/// come, so a slow connection is seen to get somewhere (the retired
+/// textures are a hundred small fetches: one line for all of them).
+fn background_step(s: &str) {
+    if s.starts_with("downloading ") || (s.starts_with("fetching ") && !s.starts_with("fetching legacy ")) {
+        post(false, format!("Studio content: {s}…"));
+    } else if s.starts_with("ready") || s.starts_with("couldn't ") {
+        post(false, format!("Studio content: {s}"));
+    }
+}
+
+/// `install`, and a few more tries when a connection drops (the download
+/// goes on where it stopped), as the background download does.
+fn install_retrying(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
+    const TRIES: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match install(progress) {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < TRIES => {
+                post(false, format!("Studio content: {e}; trying again in 20 s"));
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -197,7 +231,7 @@ fn agent() -> ureq::Agent {
     // long as the kernel retransmits.
     // One agent (connection pool) for the whole install.
     static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
-        let config = ureq::Agent::config_builder()
+        let config = rustudio_account::web::install(ureq::Agent::config_builder())
             .timeout_resolve(Some(Duration::from_secs(15)))
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
@@ -279,6 +313,23 @@ fn studio_version(version: &str) -> Option<&str> {
         .map(|_| version)
 }
 
+/// Which Studio deployment a content root is: rustudio's download marker,
+/// else a Studio / Vinegar version folder's own name (`version-…`).
+pub fn content_deployment(root: &Path) -> Option<String> {
+    if let Ok(marker) = std::fs::read_to_string(root.join(MARKER)) {
+        return marker.split_whitespace().next().and_then(studio_version).map(str::to_owned);
+    }
+    root.file_name()?.to_str().and_then(studio_version).map(str::to_owned)
+}
+
+/// One pinned deployment package, checked against its pinned SHA-256.
+fn package(agent: &ureq::Agent, pkg: &str) -> Result<Vec<u8>, String> {
+    let url = format!("{CDN}/{}-{pkg}", crate::studio_target::DEPLOYMENT);
+    let bytes = get(agent, &url, None)?;
+    crate::studio_target::verify(pkg, &bytes)?;
+    Ok(bytes)
+}
+
 fn has_view_selector(root: &Path) -> bool {
     root.join("StudioContent/models/ViewSelector/Basic.mesh").is_file()
         && ["back", "bottom", "front", "left", "right", "top"].iter().all(|face| {
@@ -288,11 +339,11 @@ fn has_view_selector(root: &Path) -> bool {
         })
 }
 
-fn install_view_selector(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
+fn install_view_selector(agent: &ureq::Agent, root: &Path) -> Result<(), String> {
     // Publish the body last so the renderer can pick up the complete cube.
     for kind in ["textures", "models"] {
-        let url = format!("{CDN}/{version}-studiocontent-{kind}.zip");
-        let bytes = get(agent, &url, None)?;
+        let url = format!("studiocontent-{kind}.zip");
+        let bytes = package(agent, &url)?;
         let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
         for entry in &zip.entries {
             let Some((dir, file)) = entry.name.split_once(['\\', '/']) else { continue };
@@ -329,9 +380,9 @@ fn has_lua_package_assets(root: &Path) -> bool {
         .all(|rel| root.join("ExtraContent/LuaPackages").join(rel).is_file())
 }
 
-fn install_lua_package_assets(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
-    let url = format!("{CDN}/{version}-extracontent-luapackages.zip");
-    let bytes = get(agent, &url, None)?;
+fn install_lua_package_assets(agent: &ureq::Agent, root: &Path) -> Result<(), String> {
+    let url = "extracontent-luapackages.zip";
+    let bytes = package(agent, url)?;
     let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
     let base = root.join("ExtraContent/LuaPackages");
     for e in &zip.entries {
@@ -351,13 +402,13 @@ fn has_studio_ui_textures(root: &Path) -> bool {
         && root.join("StudioContent/textures/StudioToolbox/RoundedBackground.png").is_file()
 }
 
-fn install_studio_ui_textures(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
+fn install_studio_ui_textures(agent: &ureq::Agent, root: &Path) -> Result<(), String> {
     for (pkg, sub) in [
         ("content-studio_svg_textures.zip", "content/studio_svg_textures"),
         ("studiocontent-textures.zip", "StudioContent/textures"),
     ] {
-        let url = format!("{CDN}/{version}-{pkg}");
-        let bytes = get(agent, &url, None)?;
+        let url = pkg;
+        let bytes = package(agent, pkg)?;
         let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
         let base = root.join(sub);
         for e in &zip.entries {
@@ -375,29 +426,23 @@ fn install_studio_ui_textures(agent: &ureq::Agent, version: &str, root: &Path) -
 
 pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
     let agent = agent();
-    let v: serde_json::Value = serde_json::from_slice(&get(&agent, VERSION_URL, None)?)
-        .map_err(|e| format!("version answer: {e}"))?;
-    let version = v["clientVersionUpload"]
-        .as_str()
-        .and_then(studio_version)
-        .ok_or("version answer has no clientVersionUpload")?
-        .to_string();
-    progress(&format!("Studio {} ({version})", v["version"].as_str().unwrap_or("?")));
+    let version = crate::studio_target::DEPLOYMENT.to_string();
+    progress(&format!("Studio {} ({version})", crate::studio_target::VERSION));
 
     let dest = install_dir();
     if std::fs::read_to_string(dest.join(MARKER)).is_ok_and(|s| s.trim() == format!("{version} {CONTENT_REVISION}")) {
-        install_missing_packages(&agent, &version, &dest, progress)?;
+        install_missing_packages(&agent, &dest, progress)?;
         if !has_view_selector(&dest) {
             progress("downloading Studio View Selector");
-            install_view_selector(&agent, &version, &dest)?;
+            install_view_selector(&agent, &dest)?;
         }
         if !has_lua_package_assets(&dest) {
             progress("downloading Studio LuaPackages UI assets");
-            install_lua_package_assets(&agent, &version, &dest)?;
+            install_lua_package_assets(&agent, &dest)?;
         }
         if !has_studio_ui_textures(&dest) {
             progress("downloading Studio UI textures");
-            install_studio_ui_textures(&agent, &version, &dest)?;
+            install_studio_ui_textures(&agent, &dest)?;
         }
         progress("already installed");
         return Ok(version);
@@ -436,7 +481,7 @@ pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
                         continue;
                     }
                     progress(&format!("downloading {pkg} ({}/{total})", n + 1));
-                    if let Err(e) = install_package(&agent, &version, pkg, &partial.join(sub), &done) {
+                    if let Err(e) = install_package(&agent, pkg, &partial.join(sub), &done) {
                         if let Ok(mut f) = failed.lock() {
                             f.get_or_insert(e);
                         }
@@ -452,11 +497,11 @@ pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
         // install: `install_extras`)
         if !has_lua_package_assets(&partial) {
             progress("downloading Studio LuaPackages UI assets");
-            install_lua_package_assets(&agent, &version, &partial)?;
+            install_lua_package_assets(&agent, &partial)?;
         }
         if !has_studio_ui_textures(&partial) {
             progress("downloading Studio UI textures");
-            install_studio_ui_textures(&agent, &version, &partial)?;
+            install_studio_ui_textures(&agent, &partial)?;
         }
         for (pkg, file) in SINGLE_FILES {
             if partial.join(file).is_file() {
@@ -465,6 +510,7 @@ pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
             progress(&format!("fetching {file} from {pkg}"));
             let url = format!("{CDN}/{version}-{pkg}");
             let data = fetch_one(&agent, &url, file)?;
+            crate::studio_target::verify(file, &data)?;
             write_file(&partial, file, &data)?;
         }
         std::fs::write(partial.join(MARKER), format!("{stamp}\n")).map_err(|e| e.to_string())
@@ -490,7 +536,7 @@ pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
     // retired texture is fetched by id when a place asks for it,
     // assets.rs `legacy_content`).
     progress("ready: Play now uses Roblox's default character and player scripts; the rest (retired textures, the View Selector) is fetched in the background");
-    install_extras(&agent, &version, &dest, progress);
+    install_extras(&agent, &dest, progress);
     Ok(version)
 }
 
@@ -499,10 +545,10 @@ const PARALLEL_PACKAGES: usize = 3;
 /// How many retired textures are fetched at once.
 const PARALLEL_LEGACY: usize = 2;
 
-/// One package: downloaded, unpacked under `into`, and `done` written.
-fn install_package(agent: &ureq::Agent, version: &str, pkg: &str, into: &Path, done: &Path) -> Result<(), String> {
-    let url = format!("{CDN}/{version}-{pkg}");
-    let bytes = get(agent, &url, None)?;
+/// One pinned package: downloaded and checked (`package`), unpacked under
+/// `into`, and `done` written.
+fn install_package(agent: &ureq::Agent, pkg: &str, into: &Path, done: &Path) -> Result<(), String> {
+    let bytes = package(agent, pkg)?;
     let zip = Zip::parse(&bytes).map_err(|e| format!("{pkg}: {e}"))?;
     for e in &zip.entries {
         if e.name.ends_with(['/', '\\']) {
@@ -518,7 +564,7 @@ fn install_package(agent: &ureq::Agent, version: &str, pkg: &str, into: &Path, d
 /// Studio resolves through LegacyContentTable (materialized so file-based
 /// consumers find them), and the View Selector cube. Best effort: what
 /// fails is said and left for the next start.
-fn install_extras(agent: &ureq::Agent, version: &str, root: &Path, progress: &(dyn Fn(&str) + Sync)) {
+fn install_extras(agent: &ureq::Agent, root: &Path, progress: &(dyn Fn(&str) + Sync)) {
     let legacy: Vec<(&str, &str)> = include_str!("../../../assets/legacy-content.tsv")
         .lines()
         .filter_map(|line| line.split_once('\t'))
@@ -553,7 +599,7 @@ fn install_extras(agent: &ureq::Agent, version: &str, root: &Path, progress: &(d
     }
     if !has_view_selector(root) {
         progress("downloading Studio View Selector");
-        if let Err(e) = install_view_selector(agent, version, root) {
+        if let Err(e) = install_view_selector(agent, root) {
             progress(&format!("couldn't download Studio's View Selector ({e}); the next start tries again"));
         }
     }

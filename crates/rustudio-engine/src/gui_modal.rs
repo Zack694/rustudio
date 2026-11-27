@@ -73,7 +73,122 @@ fn shown(d: &Document, layout: &HashMap<Ref, GuiBox>, lc: Ref, button: Ref) -> b
     rect(layout, lc).and_then(|r| clip(area, r)).is_some()
 }
 
-/// Whether the LocalPlayer's PlayerGui or CoreGui shows a Modal GuiButton now.
+/// The LocalPlayer's PlayerGui and CoreGui (the containers a Modal button counts in).
+fn containers(d: &Document) -> [Option<Ref>; 2] {
+    let root = d.dom.root_ref();
+    let pg = d.find_child(root, "Players").and_then(|p| match d.prop(p, "LocalPlayer") {
+        Some(Variant::Ref(lp)) if d.exists(lp) => d.find_child(lp, "PlayerGui"),
+        _ => None,
+    });
+    [pg, d.find_child(root, "CoreGui")]
+}
+
+fn is_modal_button(d: &Document, r: Ref) -> bool {
+    d.dom.get_by_ref(r).is_some_and(|i| {
+        doc::is_a(&i.class, "GuiButton")
+            && matches!(i.properties.get(&rbx_dom_weak::ustr("Modal")), Some(Variant::Bool(true)))
+    })
+}
+
+/// The Modal buttons of a document, kept current from its change journal
+/// (`Reader::Modal`): a frame asks `shown` while the game holds the mouse
+/// (every frame in first person / shift lock), and walking the whole
+/// PlayerGui each time cost 6.6 ms a frame on a desktop in a place with a
+/// large GUI (LBG, 2026-11-25: the biggest item on the main thread), more
+/// on a phone. Now the walk happens once per document (and whenever the
+/// journal answers `All`: the reader lagged, `mark_all`); afterwards only
+/// `Modal` changes and new subtrees are looked at.
+#[derive(Default)]
+pub struct ModalIndex {
+    doc: u64,
+    buttons: Vec<Ref>,
+}
+
+impl ModalIndex {
+    fn add_subtree(&mut self, d: &Document, r: Ref) {
+        if !d.exists(r) {
+            return;
+        }
+        if is_modal_button(d, r) && !self.buttons.contains(&r) {
+            self.buttons.push(r);
+        }
+        for x in d.dom.descendants_of(r) {
+            let b = x.referent();
+            if b != r && is_modal_button(d, b) && !self.buttons.contains(&b) {
+                self.buttons.push(b);
+            }
+        }
+    }
+
+    fn refresh(&mut self, d: &mut Document) {
+        let mut full = d.id != self.doc;
+        match d.marks_for(doc::Reader::Modal) {
+            doc::Marks::All => full = true,
+            doc::Marks::Some(marks) => {
+                if !full {
+                    for m in &marks {
+                        match m {
+                            doc::Mark::Prop(r, name) => {
+                                if name.as_str() == "Modal" {
+                                    let on = is_modal_button(d, *r);
+                                    match self.buttons.iter().position(|b| b == r) {
+                                        Some(i) if !on => {
+                                            self.buttons.swap_remove(i);
+                                        }
+                                        None if on => self.buttons.push(*r),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            // (a created, moved or removed subtree: a removed
+                            // button drops out at the next `shown`)
+                            doc::Mark::Tree(r) => self.add_subtree(d, *r),
+                        }
+                    }
+                }
+            }
+        }
+        if full {
+            self.doc = d.id;
+            self.buttons.clear();
+            for c in containers(d).into_iter().flatten() {
+                self.add_subtree(d, c);
+            }
+        }
+        self.buttons.retain(|&b| is_modal_button(d, b));
+    }
+
+    /// `modal_shown`, from the index.
+    pub fn shown(&mut self, d: &mut Document, layout: &HashMap<Ref, GuiBox>) -> bool {
+        self.refresh(d);
+        if self.buttons.is_empty() {
+            return false;
+        }
+        let containers = containers(d);
+        self.buttons.iter().any(|&button| {
+            // Its layer collector: the first one up the tree, directly
+            // under the PlayerGui or CoreGui, and Enabled.
+            let mut p = d.dom.get_by_ref(button).map(|i| i.parent()).unwrap_or_else(Ref::none);
+            let mut lc = None;
+            while let Some(inst) = d.dom.get_by_ref(p) {
+                if doc::is_a(&inst.class, "LayerCollector") {
+                    lc = Some((p, inst.parent()));
+                    break;
+                }
+                p = inst.parent();
+            }
+            match lc {
+                Some((lc, under)) => {
+                    containers.contains(&Some(under)) && flag(d, lc, "Enabled", true) && shown(d, layout, lc, button)
+                }
+                None => false,
+            }
+        })
+    }
+}
+
+/// Whether the LocalPlayer's PlayerGui or CoreGui shows a Modal GuiButton now
+/// (a full walk; frames use `ModalIndex`).
 pub fn modal_shown(d: &Document, layout: &HashMap<Ref, GuiBox>) -> bool {
     let root = d.dom.root_ref();
     let pg = d.find_child(root, "Players").and_then(|p| match d.prop(p, "LocalPlayer") {
@@ -164,5 +279,58 @@ mod tests {
         assert!(modal_shown(&d, &layout), "CoreGui Modal button");
         set(&mut d, cb, "Visible", Variant::Bool(false));
         assert!(!modal_shown(&d, &layout), "CoreGui Modal button hidden");
+    }
+
+    /// The index follows the journal: it agrees with the full walk after
+    /// inserts, Modal / Visible changes, a reparent out of the PlayerGui,
+    /// a removal, a clone brought in, and a new document.
+    #[test]
+    fn modal_index_follows_the_journal() {
+        let mut d = Document::new_place();
+        let root = d.dom.root_ref();
+        let players = d.find_child(root, "Players").unwrap_or_else(|| d.insert(root, InstanceBuilder::new("Players")));
+        let lp = d.insert(players, InstanceBuilder::new("Player").with_name("P"));
+        d.set_prop_live(players, rbx_dom_weak::ustr("LocalPlayer"), Variant::Ref(lp));
+        let pg = d.insert(lp, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+        let sg = d.insert(pg, InstanceBuilder::new("ScreenGui").with_name("G"));
+        let mut layout = HashMap::new();
+        layout.insert(sg, gb([0.0, 0.0], [800.0, 600.0]));
+        let mut ix = ModalIndex::default();
+        assert!(!ix.shown(&mut d, &layout), "no button yet");
+        // A button inserted later (a Tree mark).
+        let b = d.insert(sg, InstanceBuilder::new("TextButton").with_name("B").with_property("Modal", true));
+        layout.insert(b, gb([10.0, 10.0], [50.0, 20.0]));
+        assert!(ix.shown(&mut d, &layout), "inserted Modal button");
+        assert_eq!(ix.shown(&mut d, &layout), modal_shown(&d, &layout));
+        d.set_prop_live(b, rbx_dom_weak::ustr("Modal"), Variant::Bool(false));
+        assert!(!ix.shown(&mut d, &layout), "Modal off");
+        d.set_prop_live(b, rbx_dom_weak::ustr("Modal"), Variant::Bool(true));
+        assert!(ix.shown(&mut d, &layout), "Modal on again");
+        d.set_prop_live(b, rbx_dom_weak::ustr("Visible"), Variant::Bool(false));
+        assert!(!ix.shown(&mut d, &layout), "hidden");
+        d.set_prop_live(b, rbx_dom_weak::ustr("Visible"), Variant::Bool(true));
+        // Moved out of the PlayerGui (ReplicatedStorage): not shown; back: shown.
+        let rs = d.find_child(root, "ReplicatedStorage").unwrap_or_else(|| d.insert(root, InstanceBuilder::new("ReplicatedStorage")));
+        d.reparent(&[b], rs);
+        assert!(!ix.shown(&mut d, &layout), "outside the PlayerGui");
+        d.reparent(&[b], sg);
+        assert!(ix.shown(&mut d, &layout), "back in");
+        // A whole ScreenGui with a Modal button brought in, then removed.
+        let sg2 = d.insert(rs, InstanceBuilder::new("ScreenGui").with_name("Menu"));
+        let b2 = d.insert(sg2, InstanceBuilder::new("ImageButton").with_name("Shield").with_property("Modal", true));
+        d.remove(&[b]);
+        assert!(!ix.shown(&mut d, &layout), "removed");
+        d.reparent(&[sg2], pg);
+        layout.insert(sg2, gb([0.0, 0.0], [800.0, 600.0]));
+        layout.insert(b2, gb([0.0, 0.0], [800.0, 600.0]));
+        assert!(ix.shown(&mut d, &layout), "a ScreenGui moved in with its Modal button");
+        assert_eq!(ix.shown(&mut d, &layout), modal_shown(&d, &layout));
+        d.set_prop_live(sg2, rbx_dom_weak::ustr("Enabled"), Variant::Bool(false));
+        assert!(!ix.shown(&mut d, &layout), "its ScreenGui disabled");
+        // Another document: the index starts over.
+        let mut d2 = Document::new_place();
+        assert!(!ix.shown(&mut d2, &HashMap::new()), "a new document");
+        d.set_prop_live(sg2, rbx_dom_weak::ustr("Enabled"), Variant::Bool(true));
+        assert!(ix.shown(&mut d, &layout), "and back to the first");
     }
 }

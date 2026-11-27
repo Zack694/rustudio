@@ -535,7 +535,9 @@ impl Humanoid {
             dir.y = 0.0;
         }
         let dir = if dir != Vec3::ZERO { dir.normalize() } else { dir };
-        self.v_target = dir * inp.walk_speed * inp.move_mag;
+        // (a WalkSpeed below 0 — from a file, or set before the setter
+        // clamped it — walks nowhere, as Roblox's does, not backwards)
+        self.v_target = dir * inp.walk_speed.max(0.0) * inp.move_mag;
         self.w_target_y = 0.0;
         if inp.auto_rotate {
             let root_yaw = yaw_of_look(-inp.root_rot.z_axis);

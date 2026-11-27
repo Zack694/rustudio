@@ -98,9 +98,14 @@ impl CaptureState {
         (texture, padding, bind_group)
     }
 
-    /// Updates the [`CaptureState`] if the size of the surface texture has changed
+    /// Updates the [`CaptureState`] if the size or format of the surface texture has changed
     pub fn update(&mut self, device: &wgpu::Device, texture: &wgpu::Texture) {
-        if self.texture.size() != texture.size() {
+        if texture.width() == 0 || texture.height() == 0 {
+            return;
+        }
+        if self.texture.format() != texture.format() {
+            *self = Self::new(device, texture);
+        } else if self.texture.size() != texture.size() {
             let (new_texture, padding, bind_group) =
                 Self::create_texture(device, texture, &self.pipeline.get_bind_group_layout(0));
             self.texture = new_texture;
@@ -195,8 +200,8 @@ impl CaptureState {
         let tex_extent = self.texture.size();
         let padding = self.padding;
         let to_rgba = match format {
-            wgpu::TextureFormat::Rgba8Unorm => [0, 1, 2, 3],
-            wgpu::TextureFormat::Bgra8Unorm => [2, 1, 0, 3],
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => [0, 1, 2, 3],
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => [2, 1, 0, 3],
             _ => {
                 log::error!(
                     "Screen can't be captured unless the surface format is Rgba8Unorm or Bgra8Unorm. Current surface format is {format:?}"

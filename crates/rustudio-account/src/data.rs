@@ -48,6 +48,26 @@ impl StudioAccess {
                 .unwrap_or(false),
         })
     }
+    /// [`Self::fetch`], remembered per universe for a minute: a save loop
+    /// doesn't ask the game's configuration before every write.
+    pub fn cached(http: &impl AccessHttp, place_id: u64, universe_id: u64) -> Result<Self> {
+        use std::sync::{LazyLock, Mutex};
+        use std::time::{Duration, Instant};
+        static CACHE: LazyLock<Mutex<std::collections::HashMap<u64, (StudioAccess, Instant)>>> =
+            LazyLock::new(Default::default);
+        const TTL: Duration = Duration::from_secs(60);
+        if place_id != 0 {
+            if let Some((access, at)) = CACHE.lock().unwrap().get(&universe_id) {
+                if at.elapsed() < TTL {
+                    return Ok(*access);
+                }
+            }
+        }
+        let access = Self::fetch(http, place_id, universe_id)?;
+        CACHE.lock().unwrap().insert(universe_id, (access, Instant::now()));
+        Ok(access)
+    }
+
     pub fn require_write(self) -> Result<()> {
         if self.allowed {
             Ok(())
@@ -183,13 +203,12 @@ impl Request {
             return Err(Error::new("invalid engine data request method"));
         }
         if !memory && self.method != "GET" && !self.path.ends_with("/multi-get") {
-            StudioAccess::fetch(session, context.place, context.universe)?.require_write()?;
+            StudioAccess::cached(session, context.place, context.universe)?.require_write()?;
         }
         let mut headers = std::collections::BTreeMap::from([
             (
                 "User-Agent".into(),
-                "RobloxStudio/WinInet RobloxApp/0.744.0.7441077 (GlobalDist; RobloxDirectDownload)"
-                    .into(),
+                crate::studio_target::user_agent(),
             ),
             (
                 "Content-Type".into(),

@@ -183,6 +183,9 @@ impl Harness {
                 last_frame: None,
                 no_ui: false,
                 no_render: false,
+                // (the Core UI shows, as in a windowed desktop run)
+                show_core_gui: true,
+                show_core_gui_explicit: false,
                 end_after: None,
                 fail_on_error: false,
                 result: None,
@@ -405,6 +408,10 @@ pub struct RustudioApp {
     /// Room for the soft keyboard (src/android/keyboard.rs).
     #[cfg(target_os = "android")]
     keyboard: crate::android::keyboard::Keyboard,
+    /// The display cutout's insets, which the frame is laid out short of
+    /// (src/android/cutout.rs).
+    #[cfg(target_os = "android")]
+    cutout: crate::android::cutout::Cutout,
     /// The text fields' long-press menu (src/android/text_menu.rs).
     #[cfg(target_os = "android")]
     text_menu: crate::android::text_menu::TextMenu,
@@ -589,11 +596,36 @@ impl RustudioApp {
             env!("CARGO_PKG_VERSION"),
             doc::db().classes.len()
         ));
-        for line in rustudio_core::crash::unseen_reports() {
+        {
+            use rustudio_core::studio_target as target;
+            let content = rustudio_core::default_scripts::studio_dir()
+                .and_then(|root| rustudio_core::studio_content::content_deployment(&root));
+            ed.info(format!(
+                "Targets Studio {} ({}); Studio content: {}",
+                target::VERSION,
+                target::DEPLOYMENT,
+                match content.as_deref() {
+                    Some(d) if d == target::DEPLOYMENT => "matches".to_string(),
+                    Some(d) => format!("{d} (does not match)"),
+                    None => "not installed or unknown version".to_string(),
+                },
+            ));
+        }
+        let reports = rustudio_core::crash::unseen_reports();
+        for line in &reports {
             // (and in logcat, where a device run is read)
             #[cfg(target_os = "android")]
             log::error!("{line}");
-            ed.error(line);
+            ed.error(line.clone());
+        }
+        // On a phone the report's folder is closed to the Files apps
+        // (android/logs.rs): the report and the logs go to Download.
+        #[cfg(target_os = "android")]
+        if !reports.is_empty() && ed.harness.run.log_out.is_none() {
+            match crate::android::logs::export("after a crash") {
+                Ok(path) => ed.error(format!("The crash report and the logs were copied to {path} (a Files app: Download > rustudio); please send that file with a bug report")),
+                Err(e) => ed.error(format!("The logs couldn't be copied to Download: {e}")),
+            }
         }
         // A place the activity was started for but left alone (the last
         // start ended while opening it: android/storage.rs).
@@ -617,6 +649,13 @@ impl RustudioApp {
         // unless --overlays keeps the editor's overlays.
         if ed.harness.run.no_ui && !ed.harness.overlays {
             ed.clean_view = true;
+        }
+        ed.ui.show_core_gui = ed.harness.run.show_core_gui;
+        ed.game.show_core_gui = ed.harness.run.show_core_gui;
+        if ed.harness.run.show_core_gui_explicit {
+            // A flag for this run only: the layout keeps the default (or,
+            // below, what it had saved).
+            ed.ui.show_core_gui_saved = Some(true);
         }
         if ed.harness.selftest.is_some() {
             // Deterministic play-session timing for the scripted test.
@@ -684,6 +723,10 @@ impl RustudioApp {
             let saved = crate::layout_store::load();
             if let Some(l) = &saved {
                 l.apply(&mut ed);
+                if ed.harness.run.show_core_gui_explicit {
+                    ed.ui.show_core_gui_saved = Some(ed.ui.show_core_gui);
+                    ed.ui.show_core_gui = ed.harness.run.show_core_gui;
+                }
                 if let Some(d) = l.dock() {
                     dock = d;
                 }
@@ -693,6 +736,7 @@ impl RustudioApp {
             // (plugin widgets' restore state beside layout.json)
             crate::plugin_host::widgets_ui::set_persist_dir(Some(rustudio_core::paths::config().join("rustudio")));
         }
+        ed.game.show_core_gui = ed.ui.show_core_gui;
         strip_disabled_native_tabs(&mut dock, &mut panels, ed.builtin_tools);
         // (a GPU validation error is a logcat line, not the end of the
         // process: src/android/mod.rs install_gpu_error_handler. Set after
@@ -727,6 +771,8 @@ impl RustudioApp {
             panels,
             #[cfg(target_os = "android")]
             keyboard: Default::default(),
+            #[cfg(target_os = "android")]
+            cutout: Default::default(),
             #[cfg(target_os = "android")]
             text_menu: Default::default(),
             #[cfg(target_os = "android")]
@@ -893,6 +939,21 @@ impl Editor {
         self.ui.dock_moves.clear();
         self.ui.panel_requests.retain(|(tab, _)| !matches!(tab, Tab::Script(_)));
         self.game.doc = doc;
+        // The scripts compile for Play in the background from here
+        // (bytecode_cache::precompile): a first Play then starts as a second
+        // one does, finding its bytecode ready.
+        rustudio_engine::bytecode_cache::precompile(
+            self.game
+                .doc
+                .dom
+                .descendants()
+                .filter(|i| matches!(i.class.as_str(), "Script" | "LocalScript" | "ModuleScript"))
+                .filter_map(|i| match i.properties.get(&rbx_dom_weak::ustr("Source")) {
+                    Some(rbx_dom_weak::types::Variant::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
         self.game.edit_audio.reset();
         self.game.scene = Scene::default();
         self.drag = None;
@@ -1065,6 +1126,9 @@ impl Editor {
     /// the place file is written only when something outside the mapped
     /// paths changed (so an untouched project saves nothing).
     pub(crate) fn save_project(&mut self) {
+        if self.refuse_during_play("save") {
+            return;
+        }
         let Some(mut st) = self.project.take() else { return };
         if self.game.play.is_none() {
             st.write_back(&mut self.game.doc);
@@ -1131,18 +1195,40 @@ impl Editor {
     /// File > New / Ctrl+N: Studio's Baseplate template as Studio opens it
     /// (start_page/templates.rs), its editor camera at the template's saved
     /// Camera.
+    /// While Play or Run is going the shown document is the running game's
+    /// copy, not the place: saving would write the game's state (anything a
+    /// script made) over the place file, and New / Open would replace it.
+    /// Studio disables these during a playtest; refuse them here so every
+    /// route (menus, shortcuts, MCP, plugins) is covered.
+    fn refuse_during_play(&mut self, what: &str) -> bool {
+        if self.game.is_playing() {
+            self.warn(format!("Stop the playtest before you {what}."));
+            return true;
+        }
+        false
+    }
+
     pub fn new_place(&mut self) {
+        if self.refuse_during_play("create a new place") {
+            return;
+        }
         self.set_document(crate::start_page::templates::baseplate());
         self.info("New place created");
     }
 
     pub fn open_dialog(&mut self) {
+        if self.refuse_during_play("open a place") {
+            return;
+        }
         use crate::file_dialog::{Kind, Purpose};
         let d = crate::file_dialog::Request::new().add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"]);
         self.dialogs.start(Purpose::OpenPlace, d, Kind::PickFile);
     }
 
     pub fn save(&mut self) {
+        if self.refuse_during_play("save") {
+            return;
+        }
         if self.project.is_some() {
             return self.save_project();
         }
@@ -1164,6 +1250,9 @@ impl Editor {
     }
 
     pub fn save_as(&mut self) {
+        if self.refuse_during_play("save") {
+            return;
+        }
         let (name, exts): (&str, &[&str]) = match self.game.doc.kind {
             DocKind::Place => ("Roblox place", &["rbxl", "rbxlx"]),
             DocKind::Model => ("Roblox model", &["rbxm", "rbxmx"]),
@@ -1178,6 +1267,9 @@ impl Editor {
     }
 
     pub fn save_to(&mut self, p: PathBuf) {
+        if self.refuse_during_play("save") {
+            return;
+        }
         match self.game.doc.save_to(&p) {
             Ok(()) => self.info(format!("Saved {}", p.display())),
             Err(e) => self.error(format!("Save failed: {e}")),
@@ -1272,18 +1364,26 @@ impl Editor {
     }
 
     /// Paste goes next to the selection (or into it with `into`), else Workspace.
+    /// If the selected instance is a top-level Service (parent is DataModel root,
+    /// e.g. StarterGui), paste into that service rather than directly under DataModel.
     fn paste_target(&self, into: bool) -> Ref {
-        match self.game.doc.selection.first() {
-            Some(&r) if into => r,
-            Some(&r) => self.game
-                .doc
-                .dom
-                .get_by_ref(r)
-                .map(|i| i.parent())
-                .filter(|p| p.is_some())
-                .unwrap_or(self.game.doc.default_parent()),
-            None => self.game.doc.default_parent(),
-        }
+        paste_target_for(&self.game.doc, into)
+    }
+
+    /// Whether `StarterGui.ShowDevelopmentGui` is enabled (defaults to true in Studio).
+    /// Whether the edit view shows StarterGui. `StarterGui.ShowDevelopmentGui`
+    /// decides it, as in Studio (a property of the place: saved with it and
+    /// undoable); `ui.show_gui` is only an older editor-wide switch that the
+    /// toggles below turn back on, so the two can't disagree.
+    pub fn starter_gui_shown(&self) -> bool {
+        self.ui.show_gui && starter_gui_shown_in(&self.game.doc)
+    }
+
+    /// View > UI and the Explorer eye: sets `StarterGui.ShowDevelopmentGui`
+    /// (Studio's UI visibility toggle flips that property).
+    pub fn set_starter_gui_shown(&mut self, shown: bool) {
+        self.ui.show_gui = true;
+        set_starter_gui_shown_in(&mut self.game.doc, shown);
     }
 
     pub fn paste(&mut self, into: bool) {
@@ -1436,6 +1536,7 @@ impl Editor {
                     ),
                 );
         }
+        b = apply_insert_gui_defaults(class, b);
         if matches!(class, "Script" | "LocalScript" | "ModuleScript") {
             let src = if class == "ModuleScript" {
                 "local module = {}\n\nreturn module\n"
@@ -1606,7 +1707,7 @@ impl Editor {
             (stop, play, run)
         });
         if stop {
-            self.stop_play();
+            self.request_stop();
         } else if play {
             self.start_run(crate::studio_ui::RunType::Test);
         } else if run {
@@ -1795,6 +1896,9 @@ impl Editor {
     }
 
     fn perform(&mut self, action: PendingAction) {
+        if !matches!(action, PendingAction::Close) && self.refuse_during_play("open or create another place") {
+            return;
+        }
         match action {
             PendingAction::New => self.new_place(),
             PendingAction::Open(None) => self.open_dialog(),
@@ -1873,6 +1977,11 @@ impl Editor {
             } else {
                 "Snap off".into()
             });
+            if let Some((done, asked)) = self.game.assets.progress() {
+                ui.separator();
+                ui.label(RichText::new(format!("Loading assets {done}/{asked}")).color(theme::TEXT_DIM));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("{:.0} fps", self.fps)).color(theme::TEXT_DIM));
             });
@@ -2352,10 +2461,14 @@ impl eframe::App for RustudioApp {
             // pastes come with their text)
             crate::android::clipboard::before_frame(raw);
             self.text_menu.before_frame(raw);
-            self.text_bar.before_frame(raw);
+            self.text_bar.before_frame(ctx, raw);
+            // What the soft keyboard typed (src/android/ime.rs).
+            crate::android::ime::before_frame(ctx, raw);
             let textbox = self.ed.textbox_focused();
             let game_box = self.ed.game.play.is_some() && self.ed.game.gui.focus.is_some();
             self.keyboard.before_frame(ctx, raw, textbox, game_box);
+            // The display cutout's insets (with the keyboard's bottom).
+            self.cutout.before_frame(ctx, raw);
             let playing = self.ed.game.play_game_input();
             crate::android::lifecycle::back_pressed(ctx, raw, playing);
             // The window back in focus: the system bars hidden again.
@@ -2406,6 +2519,16 @@ impl eframe::App for RustudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // A lost GPU device: on the desktop the frame stops here with the
+        // reason in the crash report. On Android the device is lost when a
+        // phone runs out of memory (a 2026-11-24 report: a 250 s Play of a
+        // large place, 7.2 GB resident, "GPU device lost: Out of memory");
+        // that check ran before `gpu_watch` below and panicked before it
+        // could save the open place and relaunch — the user got a crash
+        // report where a saved copy was meant. The Android build leaves the
+        // loss to `gpu_watch` (a save to the recovery folder, a report, a
+        // relaunch) and never panics for it.
+        #[cfg(not(target_os = "android"))]
         rustudio_render::gpu_health::check();
         // The driver's pipeline cache goes to disk once a burst of pipeline
         // builds is over (pipeline_cache.rs): the next start skips them.
@@ -2413,9 +2536,6 @@ impl eframe::App for RustudioApp {
         if let Some(message) = rustudio_render::gpu_health::take_uncaptured() {
             self.ed.warn(message);
         }
-        // The driver's pipeline cache goes to disk once a burst of pipeline
-        // builds is over (pipeline_cache.rs): the next start skips them.
-        rustudio_render::pipeline_cache::save(false);
         // (a phone shows black until this frame is presented: logcat
         // `RustStdoutStderr` has the renderer's and the first frame's share
         // of its start, render.rs `ensure_pipelines` the viewport's)
@@ -2586,6 +2706,12 @@ impl RustudioApp {
             self.ed.keyboard_cover = self.keyboard.cover(&ctx);
             self.keyboard.shrink(ui);
         }
+        // And short of the display cutout (android/cutout.rs): the rest of
+        // the frame is laid out in a Ui that ends before the camera hole.
+        #[cfg(target_os = "android")]
+        let mut cutout_ui = self.cutout.child(ui);
+        #[cfg(target_os = "android")]
+        let ui = &mut cutout_ui;
         let ed = &mut self.ed;
         // Files opened from Finder (double-click, Open With, the Dock icon).
         #[cfg(target_os = "macos")]
@@ -2797,43 +2923,65 @@ impl RustudioApp {
 
         {
             let _p = rustudio_core::bench::scope("editor_chrome");
-            egui::Panel::top("menu")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::MENU_BAR)
-                        .inner_margin(egui::Margin::symmetric(6, 2)),
-                )
-                .show(ui, |ui| {
-                    let _p = rustudio_core::bench::scope("menu_bar");
-                    ed.studio_menu_bar(ui);
-                });
-            egui::Panel::top("testbar")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::PANEL)
-                        .inner_margin(egui::Margin::symmetric(8, 4)),
-                )
-                .show(ui, |ui| {
-                    let _p = rustudio_core::bench::scope("test_toolbar");
-                    ed.studio_top_row(ui);
-                });
-            egui::Panel::top("toolbar")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::PANEL)
-                        .inner_margin(egui::Margin::symmetric(6, 4)),
-                )
-                .show(ui, |ui| {
-                    let _p = rustudio_core::bench::scope("ribbon");
-                    ed.studio_ribbon(ui);
-                });
-            egui::Panel::bottom("status")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::PANEL_DARK)
-                        .inner_margin(egui::Margin::symmetric(8, 3)),
-                )
-                .show(ui, |ui| ed.status_bar(ui));
+            // Android, the typing layout (keyboard.rs `typing_layout`): the
+            // soft keyboard is up for an editor field, and the menu bar,
+            // the test bar and the ribbon leave their height to the dock
+            // — the script editor, the Properties cell — until it goes.
+            #[cfg(target_os = "android")]
+            let chrome = !self.keyboard.typing_layout(&ctx);
+            #[cfg(not(target_os = "android"))]
+            let chrome = true;
+            if chrome {
+                egui::Panel::top("menu")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::MENU_BAR)
+                            .inner_margin(egui::Margin::symmetric(6, 2)),
+                    )
+                    .show(ui, |ui| {
+                        let _p = rustudio_core::bench::scope("menu_bar");
+                        ed.studio_menu_bar(ui);
+                    });
+                egui::Panel::top("testbar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL)
+                            .inner_margin(egui::Margin::symmetric(8, 4)),
+                    )
+                    .show(ui, |ui| {
+                        let _p = rustudio_core::bench::scope("test_toolbar");
+                        ed.studio_top_row(ui);
+                    });
+                egui::Panel::top("toolbar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL)
+                            .inner_margin(egui::Margin::symmetric(6, 4)),
+                    )
+                    .show(ui, |ui| {
+                        let _p = rustudio_core::bench::scope("ribbon");
+                        ed.studio_ribbon(ui);
+                    });
+            }
+            // Android: no status bar while the soft keyboard is up. It
+            // carries nothing a typist needs, and it sat over the text
+            // being typed — a game TextBox the view had slid up to show
+            // (2026-11-25 report: the Team Create / camera strip over the
+            // box) — or took a line off the few a landscape phone has left
+            // above the keyboard for the panels.
+            #[cfg(target_os = "android")]
+            let status_bar = self.keyboard.room(&ctx) <= 0.0;
+            #[cfg(not(target_os = "android"))]
+            let status_bar = true;
+            if status_bar {
+                egui::Panel::bottom("status")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL_DARK)
+                            .inner_margin(egui::Margin::symmetric(8, 3)),
+                    )
+                    .show(ui, |ui| ed.status_bar(ui));
+            }
         }
 
         // Editor::start_run requests this when a playtest begins.
@@ -3027,6 +3175,7 @@ impl RustudioApp {
         {
             let textbox = self.ed.textbox_focused();
             let want = crate::android::keyboard::wanted(&ctx, textbox);
+            crate::android::ime::end_frame(&ctx, textbox);
             self.text_bar.end_frame(&ctx, &self.keyboard, want);
             self.keyboard.end_frame(&ctx, textbox);
         }
@@ -3041,7 +3190,20 @@ impl RustudioApp {
                 ),
                 (None, _) => String::new(),
             };
-            crate::android::memory::tick(&doing);
+            let game = &self.ed.game;
+            crate::android::memory::tick(&doing, || {
+                let mut parts = vec![format!("DataModel {} instances", game.doc.dom.descendants().count())];
+                if let Some(r) = game.renderer.as_ref() {
+                    parts.push(r.memory_summary());
+                }
+                if let Some(rs) = game.render_state.as_ref() {
+                    let gpu = crate::android::memory::gpu_line(&rs.device);
+                    if !gpu.is_empty() {
+                        parts.push(gpu);
+                    }
+                }
+                parts.join("; ")
+            });
         }
     }
 }
@@ -3165,13 +3327,33 @@ impl RustudioApp {
         {
             let textbox = self.ed.textbox_focused();
             let want = crate::android::keyboard::wanted(ctx, textbox);
+            crate::android::ime::end_frame(ctx, textbox);
             self.text_bar.end_frame(ctx, &self.keyboard, want);
             self.keyboard.end_frame(ctx, textbox);
             let doing = match &self.ed.game.doc.path {
                 Some(p) => format!("playing {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
                 None => String::new(),
             };
-            crate::android::memory::tick(&doing);
+            let game = &self.ed.game;
+            crate::android::memory::tick(&doing, || {
+                let mut parts = vec![format!("DataModel {} instances", game.doc.dom.descendants().count())];
+                if let Some(r) = game.renderer.as_ref() {
+                    parts.push(r.memory_summary());
+                }
+                if let Some(rs) = game.render_state.as_ref() {
+                    let gpu = crate::android::memory::gpu_line(&rs.device);
+                    if !gpu.is_empty() {
+                        parts.push(gpu);
+                    }
+                }
+                parts.join("; ")
+            });
+            // As in `frame`: a copy made while the game fills the screen
+            // (the bar's Copy of a TextBox, the game's own Ctrl+C) reaches
+            // the system clipboard too — it didn't, so a text copied in
+            // Play pasted nowhere outside the editor.
+            crate::android::clipboard::after_frame(ctx);
+            self.text_menu.end_frame(ctx);
         }
     }
 
@@ -3422,7 +3604,27 @@ impl Editor {
     pub fn harness_inject(&mut self, raw: &mut egui::RawInput) {
         let mut input = std::mem::take(&mut self.harness.run.input);
         input.inject(self.game.viewport_rect, self.game.lock_center_held(), self.harness.run.now(), raw, |name, raw| {
-            if self.plugin_widget_action(&name, raw) {
+            if let Some(f) = name.strip_prefix("finger:") {
+                // finger:ID:start|move|end:X,Y (view coordinates): a finger
+                // of the game's (--finger, --tap; touch_input::harness_finger).
+                let mut it = f.splitn(3, ':');
+                let (id, phase, xy) = (it.next(), it.next(), it.next());
+                let id = id.and_then(|s| s.parse::<u64>().ok());
+                let phase = match phase {
+                    Some("start") => Some(egui::TouchPhase::Start),
+                    Some("move") => Some(egui::TouchPhase::Move),
+                    Some("end") => Some(egui::TouchPhase::End),
+                    Some("cancel") => Some(egui::TouchPhase::Cancel),
+                    _ => None,
+                };
+                let xy = xy.and_then(|s| s.split_once(',')).and_then(|(x, y)| Some((x.parse::<f32>().ok()?, y.parse::<f32>().ok()?)));
+                if let (Some(id), Some(phase), Some((x, y))) = (id, phase, xy) {
+                    let pos = self.game.viewport_rect.min + egui::vec2(x, y);
+                    self.game.touch.harness_finger(id, phase, pos);
+                } else {
+                    eprintln!("harness: bad finger action {name:?}");
+                }
+            } else if self.plugin_widget_action(&name, raw) {
                 // plugin-widget:PLUGIN/WIDGET:CMD
             } else if self.harness_pointer(&name, raw) {
                 // ptr:VERB:TARGET
@@ -3473,4 +3675,247 @@ pub struct SelectionInfo {
     all_true: Vec<(&'static str, bool)>,
     /// Some(shared material, if any) once asked.
     material: Option<Option<u32>>,
+}
+
+/// Studio's Insert Object / UI-tab default properties for GUI classes and UI
+/// components, over the bare class-constructor / reflection defaults.
+///
+/// Studio's Insert Object defaults for GUI objects and UI components.
+///
+/// Called by `Editor::insert_class` so the Explorer `+` popup, Insert Object
+/// window, Explorer context menu, Home > GUI, and Ribbon UI tab all apply the
+/// exact same defaults. `Position` is intentionally untouched (`{0, 0}, {0, 0}`).
+pub(crate) fn apply_insert_gui_defaults(class: &str, mut b: InstanceBuilder) -> InstanceBuilder {
+    use rbx_dom_weak::types::{Color3, Content, Enum, Font, UDim, UDim2};
+    const WHITE: Color3 = Color3::new(1.0, 1.0, 1.0);
+    const BLACK: Color3 = Color3::new(0.0, 0.0, 0.0);
+    const PLACEHOLDER_IMAGE: &str = "rbxasset://textures/ui/GuiImagePlaceholder.png";
+    const SOURCE_SANS_FAMILY: &str = "rbxasset://fonts/families/SourceSansPro.json";
+
+    if doc::is_a(class, "GuiObject") {
+        // Every GuiObject (Frame, TextLabel/Button/Box, ImageLabel/Button,
+        // ScrollingFrame, ViewportFrame, CanvasGroup, VideoFrame, …).
+        b = b
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))
+            .with_property("BackgroundColor3", WHITE)
+            .with_property("BorderColor3", BLACK)
+            .with_property("BorderSizePixel", 0i32);
+
+        if doc::is_a(class, "TextLabel")
+            || doc::is_a(class, "TextButton")
+            || doc::is_a(class, "TextBox")
+        {
+            // Font = Enum.Font.SourceSans (3) → FontFace SourceSansPro Regular;
+            // FontSize = Enum.FontSize.Size14 (5) → TextSize 14.0;
+            // Size = {0, 200}, {0, 50}; TextColor3 = [0, 0, 0].
+            // Text stays at its class default ("Label" / "Button" / "TextBox").
+            b = b
+                .with_property("FontFace", Font::regular(SOURCE_SANS_FAMILY))
+                .with_property("TextSize", 14.0f32)
+                .with_property("Size", UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))
+                .with_property("TextColor3", BLACK);
+        } else if doc::is_a(class, "ImageLabel") || doc::is_a(class, "ImageButton") {
+            b = b.with_property("ImageContent", Content::from(PLACEHOLDER_IMAGE));
+        } else if doc::is_a(class, "ScrollingFrame") {
+            b = b
+                .with_property("Active", true)
+                .with_property("ScrollBarImageColor3", BLACK);
+        } else if doc::is_a(class, "TextChannelWindow") {
+            b = b.with_property("Size", UDim2::new(UDim::new(0.0, 250), UDim::new(0.0, 200)));
+        }
+        if doc::is_a(class, "InputActionLabel") {
+            b = b
+                .with_property("AutomaticSize", Enum::from_u32(1)) // Enum.AutomaticSize.X
+                .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 36)));
+        }
+    } else if doc::is_a(class, "BillboardGui") {
+        b = b
+            .with_property("Size", UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))
+            .with_property("LightInfluence", 1.0f32)
+            .with_property("ClipsDescendants", true)
+            .with_property("Active", true);
+    } else if doc::is_a(class, "SurfaceGui") {
+        b = b
+            .with_property("LightInfluence", 1.0f32)
+            .with_property("ClipsDescendants", true)
+            .with_property("SizingMode", Enum::from_u32(1)) // Enum.SurfaceGuiSizingMode.PixelsPerStud
+            .with_property("MaxDistance", 1000.0f32);
+    } else if doc::is_a(class, "UIGridStyleLayout") {
+        // UIListLayout, UIGridLayout, UIPageLayout, UITableLayout.
+        b = b.with_property("SortOrder", Enum::from_u32(2)); // Enum.SortOrder.LayoutOrder
+    } else if doc::is_a(class, "UIShadow") {
+        b = b
+            .with_property("BlurRadius", UDim::new(0.0, 20))
+            .with_property("Transparency", 0.5f32);
+    }
+
+    if doc::is_a(class, "LayerCollector") {
+        // ScreenGui, SurfaceGui, BillboardGui, AdGui, …
+        b = b.with_property("ZIndexBehavior", Enum::from_u32(1)); // Enum.ZIndexBehavior.Sibling
+    }
+
+    b
+}
+
+#[cfg(test)]
+mod insert_gui_tests {
+    use super::apply_insert_gui_defaults;
+    use rbx_dom_weak::types::{Color3, ContentId, Enum, Font, UDim, UDim2, Variant};
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_core::doc::{self, Document};
+
+    fn insert(doc: &mut Document, parent: rbx_dom_weak::types::Ref, class: &str) -> rbx_dom_weak::types::Ref {
+        let b = apply_insert_gui_defaults(
+            class,
+            InstanceBuilder::new(class).with_name(doc::default_instance_name(class)),
+        );
+        doc.insert(parent, b)
+    }
+
+    #[test]
+    fn gui_insert_defaults_match_studio() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let sg_svc = doc.find_child(root, "StarterGui").expect("StarterGui");
+
+        // ScreenGui: LayerCollector gets ZIndexBehavior = Sibling (1).
+        let sg = insert(&mut doc, sg_svc, "ScreenGui");
+        assert_eq!(doc.prop(sg, "ZIndexBehavior"), Some(Variant::Enum(Enum::from_u32(1))));
+
+        // Frame: 100x100 offset, white bg, black border, 0 border px, {0,0},{0,0} pos.
+        let frame = insert(&mut doc, sg, "Frame");
+        assert_eq!(doc.prop(frame, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))));
+        assert_eq!(doc.prop(frame, "Position"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0)))));
+        assert_eq!(doc.prop(frame, "BackgroundColor3"), Some(Variant::Color3(Color3::new(1.0, 1.0, 1.0))));
+        assert_eq!(doc.prop(frame, "BorderColor3"), Some(Variant::Color3(Color3::new(0.0, 0.0, 0.0))));
+        assert_eq!(doc.prop(frame, "BorderSizePixel"), Some(Variant::Int32(0)));
+        assert_eq!(doc.prop(frame, "BackgroundTransparency"), Some(Variant::Float32(0.0)));
+        assert_eq!(doc.prop(frame, "Active"), Some(Variant::Bool(false)));
+        assert_eq!(doc.prop(frame, "LayoutOrder"), Some(Variant::Int32(0)));
+
+        // ViewportFrame, CanvasGroup, VideoFrame inherit base GuiObject 100x100 defaults.
+        for cls in ["ViewportFrame", "CanvasGroup", "VideoFrame"] {
+            let r = insert(&mut doc, sg, cls);
+            assert_eq!(doc.prop(r, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))), "{cls}");
+            assert_eq!(doc.prop(r, "BackgroundColor3"), Some(Variant::Color3(Color3::new(1.0, 1.0, 1.0))), "{cls}");
+            assert_eq!(doc.prop(r, "BorderSizePixel"), Some(Variant::Int32(0)), "{cls}");
+        }
+
+        // TextLabel, TextButton, TextBox: 200x50, SourceSans 14, black text, class default Text.
+        for (cls, expected_text) in [("TextLabel", "Label"), ("TextButton", "Button"), ("TextBox", "TextBox")] {
+            let r = insert(&mut doc, sg, cls);
+            assert_eq!(doc.prop(r, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))), "{cls}");
+            assert_eq!(doc.prop(r, "FontFace"), Some(Variant::Font(Font::regular("rbxasset://fonts/families/SourceSansPro.json"))), "{cls}");
+            assert_eq!(doc.prop(r, "TextSize"), Some(Variant::Float32(14.0)), "{cls}");
+            assert_eq!(doc.prop(r, "TextColor3"), Some(Variant::Color3(Color3::new(0.0, 0.0, 0.0))), "{cls}");
+            assert_eq!(doc.prop(r, "BackgroundColor3"), Some(Variant::Color3(Color3::new(1.0, 1.0, 1.0))), "{cls}");
+            assert_eq!(doc.prop(r, "BorderSizePixel"), Some(Variant::Int32(0)), "{cls}");
+            assert_eq!(doc.prop(r, "Text"), Some(Variant::String(expected_text.into())), "{cls}");
+        }
+
+        // ImageLabel, ImageButton: 100x100 + GuiImagePlaceholder.png.
+        for cls in ["ImageLabel", "ImageButton"] {
+            let r = insert(&mut doc, sg, cls);
+            assert_eq!(doc.prop(r, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))), "{cls}");
+            assert_eq!(
+                doc.prop(r, "Image"),
+                Some(Variant::ContentId(ContentId::from("rbxasset://textures/ui/GuiImagePlaceholder.png"))),
+                "{cls}"
+            );
+        }
+
+        // ScrollingFrame: 100x100 + Active true + black ScrollBarImageColor3.
+        let sf = insert(&mut doc, sg, "ScrollingFrame");
+        assert_eq!(doc.prop(sf, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))));
+        assert_eq!(doc.prop(sf, "Active"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(sf, "ScrollBarImageColor3"), Some(Variant::Color3(Color3::new(0.0, 0.0, 0.0))));
+
+        // BillboardGui & SurfaceGui.
+        let ws = doc.workspace().expect("Workspace");
+        let bb = insert(&mut doc, ws, "BillboardGui");
+        assert_eq!(doc.prop(bb, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))));
+        assert_eq!(doc.prop(bb, "LightInfluence"), Some(Variant::Float32(1.0)));
+        assert_eq!(doc.prop(bb, "ClipsDescendants"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(bb, "Active"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(bb, "ZIndexBehavior"), Some(Variant::Enum(Enum::from_u32(1))));
+
+        let surf = insert(&mut doc, ws, "SurfaceGui");
+        assert_eq!(doc.prop(surf, "LightInfluence"), Some(Variant::Float32(1.0)));
+        assert_eq!(doc.prop(surf, "ClipsDescendants"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(surf, "SizingMode"), Some(Variant::Enum(Enum::from_u32(1))));
+        assert_eq!(doc.prop(surf, "MaxDistance"), Some(Variant::Float32(1000.0)));
+        assert_eq!(doc.prop(surf, "ZIndexBehavior"), Some(Variant::Enum(Enum::from_u32(1))));
+
+        // UIGridStyleLayout subclasses: SortOrder = LayoutOrder (2).
+        for cls in ["UIListLayout", "UIGridLayout", "UIPageLayout", "UITableLayout"] {
+            let r = insert(&mut doc, frame, cls);
+            assert_eq!(doc.prop(r, "SortOrder"), Some(Variant::Enum(Enum::from_u32(2))), "{cls}");
+        }
+
+        // UICorner keeps Studio's {0, 8} default.
+        let corner = insert(&mut doc, frame, "UICorner");
+        assert_eq!(doc.prop(corner, "CornerRadius"), Some(Variant::UDim(UDim::new(0.0, 8))));
+    }
+
+    #[test]
+    fn gui_paste_target_and_show_development_gui_toggle() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let sg_svc = doc.find_child(root, "StarterGui").expect("StarterGui");
+        let sg = doc.insert(sg_svc, InstanceBuilder::new("ScreenGui").with_name("ScreenGui"));
+        let frame = doc.insert(sg, InstanceBuilder::new("Frame").with_name("Frame"));
+
+        // ShowDevelopmentGui defaults to true and toggles cleanly with undo.
+        assert!(super::starter_gui_shown_in(&doc));
+        super::set_starter_gui_shown_in(&mut doc, false);
+        assert!(!super::starter_gui_shown_in(&doc));
+        assert_eq!(doc.prop(sg_svc, "ShowDevelopmentGui"), Some(Variant::Bool(false)));
+        assert!(doc.undo().is_some());
+        assert!(super::starter_gui_shown_in(&doc));
+
+        // Pasting with a top-level Service (StarterGui) selected pastes INTO StarterGui,
+        // never directly under DataModel root.
+        doc.selection = vec![sg_svc];
+        assert_eq!(super::paste_target_for(&doc, false), sg_svc);
+        assert_eq!(super::paste_target_for(&doc, true), sg_svc);
+
+        // Pasting with a Frame selected pastes next to it (ScreenGui); Paste Into pastes into Frame.
+        doc.selection = vec![frame];
+        assert_eq!(super::paste_target_for(&doc, false), sg);
+        assert_eq!(super::paste_target_for(&doc, true), frame);
+    }
+}
+
+fn paste_target_for(doc: &Document, into: bool) -> Ref {
+    let root = doc.dom.root_ref();
+    match doc.selection.first() {
+        Some(&r) if into => r,
+        Some(&r) => match doc.dom.get_by_ref(r).map(|i| i.parent()) {
+            Some(p) if p == root => r,
+            Some(p) if p.is_some() => p,
+            _ => doc.default_parent(),
+        },
+        None => doc.default_parent(),
+    }
+}
+
+fn starter_gui_shown_in(doc: &Document) -> bool {
+    let root = doc.dom.root_ref();
+    doc.find_child(root, "StarterGui")
+        .and_then(|sg| match doc.prop(sg, "ShowDevelopmentGui") {
+            Some(rbx_dom_weak::types::Variant::Bool(b)) => Some(b),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+fn set_starter_gui_shown_in(doc: &mut Document, shown: bool) {
+    let root = doc.dom.root_ref();
+    if let Some(sg) = doc.find_child(root, "StarterGui").filter(|_| starter_gui_shown_in(doc) != shown) {
+        doc.set_props(
+            "Toggle ShowDevelopmentGui",
+            vec![(sg, rbx_dom_weak::ustr("ShowDevelopmentGui"), rbx_dom_weak::types::Variant::Bool(shown))],
+            None,
+        );
+    }
 }

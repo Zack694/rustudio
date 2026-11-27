@@ -295,12 +295,12 @@ pub const OPTS: &[Opt] = &[
         kind: OptKind::Path,
     },
     Opt {
-        key: "live_data",
+        key: "data_mode",
         cat: "Data",
-        label: "Use live DataStores",
-        desc: "Off: in a published place, saves made while playing stay in memory and are thrown away when Play stops. On: Play reads and writes the place's real DataStores, MemoryStores and Messaging, like Studio with API access enabled. Next Play.",
-        env: "RUSTUDIO_LIVE_DATA",
-        kind: OptKind::Bool,
+        label: "Data in Play",
+        desc: "Like Studio: a published place's Play uses its real DataStores, MemoryStores and Messaging; writes need the game's \"Enable Studio Access to API Services\" (otherwise they fail with Studio's 403, reads still work). In memory only: saves made while playing are kept in memory and thrown away when Play stops. Next Play.",
+        env: "RUSTUDIO_DATA_MODE",
+        kind: OptKind::Choice(&[("studio", "Like Studio"), ("memory", "In memory only")]),
     },
     Opt {
         key: "core_scripts",
@@ -544,13 +544,18 @@ pub fn spin_guard_now() -> bool {
     resolve_spin_guard(env("RUSTUDIO_SOLVER_GYRO_GUARD").as_deref(), saved("spin_guard").as_ref())
 }
 
-/// Live cloud data in a published place: `RUSTUDIO_LIVE_DATA` when set (only
-/// "1" means live, as before), then saved, then off.
-pub fn resolve_live_data(env: Option<&str>, saved: Option<&Value>) -> bool {
-    match env {
-        Some(v) => v == "1",
-        None => saved.and_then(Value::as_bool).unwrap_or(false),
+/// Live cloud data in a published place, as Studio has it (the game's API
+/// access setting then decides whether writes are allowed): unless
+/// `RUSTUDIO_DATA_MODE=memory` (or the older `RUSTUDIO_LIVE_DATA` set to
+/// anything but "1") or the saved "In memory only".
+pub fn resolve_live_data(mode_env: Option<&str>, legacy_env: Option<&str>, saved: Option<&Value>) -> bool {
+    if let Some(v) = mode_env {
+        return v.trim() != "memory";
     }
+    if let Some(v) = legacy_env {
+        return v == "1";
+    }
+    saved.and_then(Value::as_str) != Some("memory")
 }
 
 /// Project paths outside the project's repository: `RUSTUDIO_PROJECT_ANY_PATH=1`
@@ -563,7 +568,7 @@ pub fn project_any_path() -> bool {
 }
 
 pub fn live_data_now() -> bool {
-    resolve_live_data(env("RUSTUDIO_LIVE_DATA").as_deref(), saved("live_data").as_ref())
+    resolve_live_data(env("RUSTUDIO_DATA_MODE").as_deref(), env("RUSTUDIO_LIVE_DATA").as_deref(), saved("data_mode").as_ref())
 }
 
 pub fn client_link_now() -> bool {
@@ -880,7 +885,7 @@ pub fn shown(o: &Opt) -> Shown {
         "solver" => Shown::Choice(if solver_now() == SolverKind::Rapier { 1 } else { 0 }),
         "spin_guard" => Shown::Bool(spin_guard_now()),
         "client_link" => Shown::Bool(client_link_now()),
-        "live_data" => Shown::Bool(live_data_now()),
+        "data_mode" => Shown::Choice(if live_data_now() { 0 } else { 1 }),
         "core_scripts" => Shown::Bool(core_scripts()),
         "builtin_plugins" => Shown::Bool(builtin_plugins()),
         "builtin_toolbox" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::Toolbox) == ToolImpl::Roblox)),
@@ -913,7 +918,7 @@ pub fn inactive(o: &Opt) -> Option<&'static str> {
 /// outside the repository and built-in plugins start off; Roblox's CoreScripts
 /// start on).
 pub fn bool_default(key: &str) -> bool {
-    !matches!(key, "live_data" | "project_any_path" | "builtin_plugins")
+    !matches!(key, "project_any_path" | "builtin_plugins")
 }
 
 /// The dialog writes a value: defaults are removed from the file.
@@ -1029,12 +1034,15 @@ mod tests {
         assert!(!resolve_off_switch(false, Some(&json!(false)), true));
         assert!(!resolve_off_switch(true, Some(&json!(true)), true));
         assert!(resolve_off_switch(false, Some(&json!("junk")), true));
-        // Live data: only "1" is live; any other env value is off.
-        assert!(!resolve_live_data(None, None));
-        assert!(resolve_live_data(None, Some(&json!(true))));
-        assert!(!resolve_live_data(Some("0"), Some(&json!(true))));
-        assert!(!resolve_live_data(Some(""), Some(&json!(true))));
-        assert!(resolve_live_data(Some("1"), Some(&json!(false))));
+        // Data in Play: like Studio (live) unless "memory" is chosen; the
+        // older RUSTUDIO_LIVE_DATA still means live only for "1".
+        assert!(resolve_live_data(None, None, None));
+        assert!(!resolve_live_data(None, None, Some(&json!("memory"))));
+        assert!(resolve_live_data(None, None, Some(&json!("studio"))));
+        assert!(!resolve_live_data(Some("memory"), None, Some(&json!("studio"))));
+        assert!(resolve_live_data(Some("studio"), Some("0"), Some(&json!("memory"))));
+        assert!(!resolve_live_data(None, Some("0"), None));
+        assert!(resolve_live_data(None, Some("1"), Some(&json!("memory"))));
         // CoreScripts: on by default, off with "0" / "false" / "off" or saved false.
         assert!(resolve_core_scripts(None, None));
         assert!(!resolve_core_scripts(None, Some(&json!(false))));
@@ -1139,10 +1147,10 @@ mod tests {
 
     #[test]
     fn set_bool_saves_non_defaults() {
-        set_bool("live_data", true);
-        assert_eq!(saved("live_data"), Some(json!(true)));
-        set_bool("live_data", false);
-        assert_eq!(saved("live_data"), None);
+        set_bool("project_any_path", true);
+        assert_eq!(saved("project_any_path"), Some(json!(true)));
+        set_bool("project_any_path", false);
+        assert_eq!(saved("project_any_path"), None);
         set_bool("update_check", false);
         assert_eq!(saved("update_check"), Some(json!(false)));
         set_bool("update_check", true);

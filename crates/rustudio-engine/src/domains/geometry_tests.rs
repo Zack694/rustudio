@@ -101,6 +101,49 @@ print("adj",#em:GetAdjacentFaces(t1))
     assert!(out.contains("merge2 4"), "{out}");
 }
 
+/// The grid-based MergeVertices gives what the pairwise greedy walk did:
+/// a later vertex within the tolerance of a surviving earlier one goes
+/// into it, in id order — checked against that walk, done in Luau, on a
+/// cloud of vertices with many near-coincident ones, across cell edges.
+#[test]
+fn editable_mesh_merge_vertices_matches_the_pairwise_walk() {
+    let out = run(r#"
+local em=game:GetService("AssetService"):CreateEditableMesh()
+local rng=Random.new(7)
+local ids,pos={},{}
+for i=1,400 do
+    local p
+    if i>1 and rng:NextNumber()<0.6 then
+        local j=rng:NextInteger(1,#pos)
+        p=pos[j]+Vector3.new(rng:NextNumber(-0.012,0.012),rng:NextNumber(-0.012,0.012),rng:NextNumber(-0.012,0.012))
+    else
+        p=Vector3.new(rng:NextNumber(-2,2),rng:NextNumber(-2,2),rng:NextNumber(-2,2))
+    end
+    ids[i]=em:AddVertex(p) pos[i]=p
+end
+local tol=0.01
+local gone,want={}, {}
+for i=1,#ids do
+    if not gone[i] then
+        for j=i+1,#ids do
+            if not gone[j] and (pos[i]-pos[j]).Magnitude<=tol then gone[j]=true want[ids[j]]=ids[i] end
+        end
+    end
+end
+local got=em:MergeVertices(tol)
+local nw,ng,same=0,0,true
+for k,v in want do nw+=1 if got[k]~=v then same=false end end
+for k,v in got do ng+=1 if want[k]~=v then same=false end end
+print("merge3",nw,ng,same,nw>50)
+"#);
+    let line = out.lines().find(|l| l.starts_with("merge3")).unwrap_or_default().to_string();
+    let parts: Vec<&str> = line.split_whitespace().take(5).collect();
+    assert_eq!(parts.len(), 5, "{out}");
+    assert_eq!(parts[1], parts[2], "{out}");
+    assert_eq!(parts[3], "true", "{out}");
+    assert_eq!(parts[4], "true", "{out}");
+}
+
 const PATH_SETUP: &str = r#"
 local function part(sz,pos,mat) local b=Instance.new("Part") b.Anchored=true b.Size=sz b.Position=pos if mat then b.Material=mat end b.Parent=workspace return b end
 local PS=game:GetService("PathfindingService")

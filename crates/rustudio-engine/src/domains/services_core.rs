@@ -442,9 +442,27 @@ pub(super) fn call(lua: &Lua, owner: &str, name: &str, args: &MultiValue) -> mlu
         "GetPlaySessionId" => Ok(MultiValue::from_iter([Value::String(lua.create_string("")?)])),
         // Studio's client answers the platform Studio runs on; rustudio
         // answers Windows off macOS, the platform whose Studio it follows
-        // elsewhere (estimate).
+        // elsewhere (estimate). A phone answers Android, as Roblox's app
+        // does: the CoreScripts pick their touch form (the developer
+        // console fills the screen, DevConsoleMaster's `platformConversion`,
+        // instead of a window whose title bar only a mouse button drags)
+        // and games their mobile UI.
+        // RUSTUDIO_PLATFORM=Android (a Platform name or value) answers that
+        // instead, to try a game's or the CoreScripts' touch form elsewhere.
         "GetPlatform" => {
-            let platform = if cfg!(target_os = "macos") { 1 } else { 0 };
+            let platform = std::env::var("RUSTUDIO_PLATFORM")
+                .ok()
+                .and_then(|v| {
+                    let v = v.trim();
+                    v.parse::<u32>().ok().or_else(|| rustudio_core::doc::enum_item_by_name("Platform", v).map(|(_, n)| n))
+                })
+                .unwrap_or(if cfg!(target_os = "android") {
+                    3
+                } else if cfg!(target_os = "macos") {
+                    1
+                } else {
+                    0
+                });
             Ok(MultiValue::from_iter([super::enum_val(lua, "Platform", platform)?]))
         }
         // The app's notification types by name. Only the two Roblox's own

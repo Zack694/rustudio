@@ -220,8 +220,8 @@ function M.GetStyledPropertyChangedSignal(self, prop)
 end
 
 -- QueryDescendants: Studio's style selector language over descendants.
--- Compound selectors ("Part.Tag#Name[attr]"), descendant (" ") and child
--- (">") combinators, and "," lists.
+-- Compound selectors ("Part.Tag#Name[attr]"), descendant (" " or ">>") and
+-- child (">") combinators, and "," lists.
 local function parse_compound(s, i)
 	local c = { tags = {}, attrs = {}, props = {} }
 	local n = #s
@@ -266,7 +266,11 @@ local function parse_selector(sel)
 		while true do
 			local ws = string.match(s, "^%s*()", i); i = ws
 			if i > n then break end
-			if string.sub(s, i, i) == ">" then
+			if string.sub(s, i, i + 1) == ">>" then
+				-- ">>": explicit descendant combinator (as " ").
+				comb = " "; i += 2
+				i = string.match(s, "^%s*()", i)
+			elseif string.sub(s, i, i) == ">" then
 				comb = ">"; i += 1
 				i = string.match(s, "^%s*()", i)
 			end

@@ -1297,14 +1297,16 @@ local function drag_step(kind, x, y)
 end
 local function step_drags()
     for _, e in G.drags() do
-        if e.kind == 0 then drag = { obj = e.obj } end
+        if e.kind == 0 then drag = { obj = e.obj, finger = e.finger } end
         if drag and drag.obj == e.obj then
             local ok, err = pcall(drag_step, e.kind, e.x, e.y)
             if not ok then log("error", tostring(err)) end
             if e.kind == 2 then drag = nil end
         end
     end
-    if drag and not G.buttons() then
+    -- A mouse drag ends when the button is no longer held (a release
+    -- the view never saw); a finger's drag ends with its lift (above).
+    if drag and not drag.finger and not G.buttons() then
         local _, _, mx, my = G.view()
         pcall(drag_step, 2, mx, my - 58)
         drag = nil
@@ -3133,6 +3135,26 @@ local function start_dialog_ui()
     end
 end
 
+-- ContextActionService's touch buttons without Roblox's CoreScripts
+-- (domains/context_action_touch.luau; with them on, their
+-- ContextActionTouch draws the buttons): started once, in Play on a touch
+-- screen, when the LocalPlayer's PlayerGui is there. G.touch_buttons_ui
+-- is nil when there is nothing to draw.
+local touch_buttons_started = false
+local function start_touch_buttons()
+    if touch_buttons_started then return end
+    local p = local_player()
+    local pg = p and p:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+    touch_buttons_started = true
+    local ok, f = pcall(G.touch_buttons_ui)
+    if ok and f then
+        task.spawn(f, pg)
+    elseif not ok then
+        log("warn", "touch buttons: " .. tostring(f))
+    end
+end
+
 local prompt_ui_started = false
 local function preferred_prompt(candidate, current)
     return not current or candidate.alignment > current.alignment
@@ -3301,7 +3323,10 @@ local function step_all(dt)
     step_drags()
     step_adorns()
     step_mouse()
-    if not edit then step_prompts() end
+    if not edit then
+        step_prompts()
+        start_touch_buttons()
+    end
     G.profile_step(2, step_styles, style_rev, vw, vh, hover_sig)
     return styles_dirty
         or next(playing_fx) ~= nil

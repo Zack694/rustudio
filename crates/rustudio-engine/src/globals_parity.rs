@@ -22,7 +22,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 
 /// The compatibility version Studio reports.
-pub const VERSION: &str = "0.744.0.7441077";
+pub const VERSION: &str = rustudio_core::studio_target::VERSION;
 pub const LOCKED: &str = "The metatable is locked";
 
 unsafe extern "C-unwind" {
@@ -433,6 +433,28 @@ pub fn sync(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// The standard libraries every script reads (and every identity shares:
+/// game scripts, CoreScripts, plugins) are read-only, as in Roblox
+/// ("attempt to modify a readonly table"). Writable, a game script could
+/// replace `string.sub` and have a CoreScript or plugin call its function
+/// at that thread's higher identity.
+pub const FROZEN_LIBRARIES: &[&str] =
+    &["string", "table", "math", "task", "coroutine", "os", "debug", "utf8", "buffer", "bit32", "vector"];
+
+/// Called once every global is installed (the end of bind_globals).
+pub fn freeze_libraries(lua: &Lua) -> mlua::Result<()> {
+    let public: Table = reg(lua, "rustudio_shared")?;
+    let g = lua.globals();
+    for lib in FROZEN_LIBRARIES {
+        for t in [public.raw_get::<Value>(*lib)?, g.raw_get::<Value>(*lib)?] {
+            if let Value::Table(t) = t {
+                t.set_readonly(true);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A script environment: `_G`, `shared`, `script` and nothing else, locked,
 /// reading through to the public globals. Flagged safe for Luau's fast
 /// paths (Luau clears it if the script calls getfenv/setfenv).
@@ -448,6 +470,33 @@ pub fn new_env(lua: &Lua, script: Option<Value>) -> mlua::Result<Table> {
     Ok(env)
 }
 
+/// Gives a privileged environment (a CoreScript's, a plugin's) its own `_G`
+/// and `shared`, apart from the game scripts' ones, so a game script can't
+/// leave a value there for privileged code to call at its identity.
+pub fn use_privileged_globals(lua: &Lua, env: &Table) -> mlua::Result<()> {
+    let table = |key: &str| -> mlua::Result<Table> {
+        match lua.named_registry_value::<Option<Table>>(key)? {
+            Some(t) => Ok(t),
+            None => {
+                let t = lua.create_table()?;
+                lua.set_named_registry_value(key, t.clone())?;
+                Ok(t)
+            }
+        }
+    };
+    env.raw_set("_G", table("rs_privileged_G")?)?;
+    env.raw_set("shared", table("rs_privileged_shared")?)?;
+    Ok(())
+}
+
+/// A privileged environment (CoreScripts, plugins): as `new_env`, with its
+/// own `_G` and `shared`.
+pub fn new_privileged_env(lua: &Lua, script: Option<Value>) -> mlua::Result<Table> {
+    let env = new_env(lua, script)?;
+    use_privileged_globals(lua, &env)?;
+    Ok(env)
+}
+
 /// The test harness's environment: scripts' `_G` and `shared`, and every
 /// host global (internals included). Flagged safe like a script's, so a
 /// harness chunk gets the same import and builtin fast paths (per-call
@@ -458,6 +507,7 @@ pub fn harness_env(lua: &Lua) -> mlua::Result<Table> {
     env.raw_set("shared", lua.globals().raw_get::<Value>("shared")?)?;
     let mt = lua.create_table()?;
     mt.raw_set("__index", lua.globals())?;
+    mt.raw_set("__metatable", LOCKED)?;
     env.set_metatable(Some(mt))?;
     env.set_safeenv(true);
     Ok(env)
@@ -513,6 +563,52 @@ mod tests {
         for want in wants {
             assert!(out.iter().any(|t| t == want), "missing {want:?} in {out:#?}");
         }
+    }
+
+    /// Game scripts and privileged code (CoreScripts, plugins) don't share
+    /// _G or shared: a game script can't leave something there for them.
+    #[test]
+    fn privileged_globals_are_separate() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Run));
+        rt.bind_globals().unwrap();
+        let lua = &rt.lua;
+        let game = super::new_env(lua, None).unwrap();
+        lua.load("_G.planted = print; shared.planted = print").set_environment(game.clone()).exec().unwrap();
+        let core = super::new_privileged_env(lua, None).unwrap();
+        let seen: (bool, bool) = lua
+            .load("return _G.planted == nil, shared.planted == nil")
+            .set_environment(core)
+            .eval()
+            .unwrap();
+        assert_eq!(seen, (true, true));
+        let other_game = super::new_env(lua, None).unwrap();
+        let same: bool = lua.load("return _G.planted == print").set_environment(other_game).eval().unwrap();
+        assert!(same, "game scripts still share _G with each other");
+    }
+
+    /// The libraries are read-only to scripts, as in Roblox: a game script
+    /// can't swap `string.sub` (which CoreScripts and plugins also call) for
+    /// its own function.
+    #[test]
+    fn libraries_are_read_only() {
+        let a = r#"
+            local orig = string.sub
+            for _, lib in {"string", "table", "math", "task", "coroutine", "os", "debug", "utf8", "buffer", "bit32"} do
+                local t = getfenv()[lib]
+                local ok, e = pcall(function() t.sub = print end)
+                print(lib, ok, e, table.isfrozen(t))
+            end
+            print("same", rawequal(string.sub, orig), ("abc"):sub(2) == "bc")
+        "#;
+        let out = run(Side::Server, &[("A", a)], &[]);
+        for lib in ["string", "table", "math", "task", "coroutine", "os", "debug", "utf8", "buffer", "bit32"] {
+            let ok = out.iter().any(|l| {
+                l.starts_with(&format!("{lib} false ")) && l.ends_with("attempt to modify a readonly table true")
+            });
+            assert!(ok, "{lib}: {out:?}");
+        }
+        assert!(out.iter().any(|l| l == "same true true"), "{out:?}");
     }
 
     #[test]

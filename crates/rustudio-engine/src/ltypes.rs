@@ -1050,7 +1050,17 @@ impl LEnumItem {
     /// All items of an enum, sorted by value.
     pub fn items(enum_type: &str) -> Option<Vec<(String, u32)>> {
         let mut v: Vec<(String, u32)> = match doc::db().enums.get(enum_type) {
-            Some(e) => e.items.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            Some(e) => {
+                let mut v: Vec<(String, u32)> = e.items.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+                // Items only Studio's API dump has (the reflection database
+                // can be an older version): Enum.X.Y finds them, so list them.
+                for (k, n) in Self::dump_items(enum_type).into_iter().flatten() {
+                    if !e.items.contains_key(k.as_str()) && !v.iter().any(|(_, x)| x == n) {
+                        v.push((k.clone(), *n));
+                    }
+                }
+                v
+            }
             None => Self::dump_items(enum_type)?.clone(),
         };
         v.sort_by_key(|(_, v)| *v);

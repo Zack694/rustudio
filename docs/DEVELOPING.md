@@ -1,5 +1,13 @@
 # Developing rustudio
 
+rustudio builds for Linux, Windows, macOS and Android from one workspace.
+Everything below is about the desktop binary unless it says otherwise; the
+Android app (the same `rustudio` library inside a `NativeActivity`, built
+into an APK with xbuild, driven by touch, tested on a device over `adb`)
+has its own guide: [ANDROID.md](ANDROID.md) — building, what differs on a
+phone (`src/android/`, `crates/rustudio-android/`), the touch layer, the
+soft keyboard, graphics on a phone's GPU, and the device-run notes.
+
 ## Command-line options
 
 Mostly for automated testing and benchmarking.
@@ -27,6 +35,12 @@ rustudio place.rbxl --play --from-play --shots 5 --screenshot t.png \
 rustudio --write-corpus tools/fidelity/corpus   # regenerate the demo / control places
 cargo test --workspace           # unit tests (undo/redo, files, Luau runtime, physics, meshes, FBX, GUI, PKCE)
 ```
+A `--luau` chunk runs at the command bar's identity, so (as in Studio) its
+`require` gets separate copies of the place's ModuleScripts: a probe that reads
+a game module's state (a target cache, a stats table) has to create a `Script`
+or `LocalScript` with that code as `Source` and parent it (instance signals and
+remotes are shared either way).
+
 `RUSTUDIO_GUI_DEBUG=1` logs GUI clicks and remote calls to Output;
 `RUSTUDIO_NO_GUI=1` hides every GUI (to tell GUI from 3D in a picture).
 
@@ -39,7 +53,10 @@ thread ("(resume) Chunk:line" where it waits) and by script start, and
 FindPartOnRayWithIgnoreList", "index Position") with their call counts.
 `RUSTUDIO_HITCH=1` prints every Lua resume over 10 ms (with the engine
 calls inside one over 300 ms) and every engine call over 5 ms, to find
-hitches.
+hitches. `RUSTUDIO_MEMORY_LOG=1` has the Play worker log, every 15 s, its
+two Lua heaps, the two DataModels' sizes and how many of its publications
+replaced the viewport's whole document rather than sending a delta (on by
+default on Android: `docs/ANDROID.md`), to place a memory growth.
 
 On macOS there is no gamescope: `--screenshot`, `--self-test` and `--bench`
 open a normal window (keep it in front; macOS slows down hidden windows).

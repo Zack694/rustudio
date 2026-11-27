@@ -21,16 +21,36 @@
 //! band is outside egui's safe area, so the bar's `Area` is left
 //! unconstrained. A tap on it is egui's, not the game's (the touch layer
 //! leaves fingers on a foreground layer to egui), and the field it is for
-//! keeps the focus: egui's rule gives the focus up at a click elsewhere,
-//! so it is asked back for the frame the event is handled in (as the
-//! long-press menu does).
+//! keeps the focus: egui's rule gives the focus up at a click outside the
+//! focused widget — judged as the field draws, before the bar does, so
+//! the bar (drawn for a focused field) would be gone in the very frame
+//! the tap completes in, its button never clicked — hence, from a press
+//! that begins on the bar to its release, egui is told to surrender the
+//! focus never ([`TextBar::before_frame`]); and should the field lack the
+//! focus all the same, it is asked back for the frame the event is handled
+//! in (as the long-press menu does).
+//!
+//! With the input-connection bridge (ime.rs) there is no bar: the
+//! keyboard's own paste, clipboard panel and Select all reach the field
+//! through its `InputConnection` (`commitText`, `performContextMenuAction`),
+//! so the bar only took a band of the screen — a dark strip labelled
+//! "Text" / "TextBox" over a game in Play, where the keyboard lies over
+//! the view — and its band stood unpainted (black) over panel text while
+//! the keyboard was up for nothing. The bar is the fallback for a phone
+//! whose bridge failed to load ([`in_use`]).
 
-use egui::{Align, Event, Id, Key, Layout, Modifiers, Order, Pos2, Rect};
+use egui::{Align, Event, Id, Key, Layout, Modifiers, Order, Pos2, Rect, SurrenderFocusOn};
 
 use super::keyboard::{Keyboard, Want};
 
 /// The bar's band, in points.
 pub const HEIGHT: f32 = 34.0;
+
+/// Whether the bar (and its band in `Keyboard::room`) is in use: only
+/// without the input-connection bridge (the module comment).
+pub fn in_use() -> bool {
+    !super::ime::available()
+}
 
 const ID: &str = "rustudio text bar";
 
@@ -40,20 +60,63 @@ pub struct TextBar {
     queued: Vec<Event>,
     /// The bar showed last frame.
     shown: bool,
+    /// Where it stood last frame.
+    rect: Option<Rect>,
+    /// A press began on the bar and hasn't been released.
+    pressed: bool,
+    /// egui's focus rule from before the press, put back after it.
+    surrender: Option<SurrenderFocusOn>,
 }
 
 impl TextBar {
-    /// In `App::raw_input_hook`: the entry chosen last frame.
-    pub fn before_frame(&mut self, raw: &mut egui::RawInput) {
+    /// In `App::raw_input_hook`: the entry chosen last frame; and the
+    /// focus held for the field through a press on the bar (the module
+    /// comment).
+    pub fn before_frame(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         raw.events.append(&mut self.queued);
+        let mut released = false;
+        for e in &raw.events {
+            if let Event::PointerButton { pos, pressed, .. } = e {
+                if *pressed {
+                    self.pressed = self.shown && self.rect.is_some_and(|r| r.contains(*pos));
+                } else {
+                    released = true;
+                }
+            }
+        }
+        // (the release's frame is the click's: the rule holds through it)
+        let hold = self.pressed;
+        if released {
+            self.pressed = false;
+        }
+        if hold {
+            ctx.options_mut(|o| {
+                let was = std::mem::replace(&mut o.input_options.surrender_focus_on, SurrenderFocusOn::Never);
+                if self.surrender.is_none() && was != SurrenderFocusOn::Never {
+                    self.surrender = Some(was);
+                }
+            });
+        } else if let Some(rule) = self.surrender.take() {
+            ctx.options_mut(|o| {
+                if o.input_options.surrender_focus_on == SurrenderFocusOn::Never {
+                    o.input_options.surrender_focus_on = rule;
+                }
+            });
+        }
     }
 
     /// At the end of `App::ui`, after every panel: the bar while the
     /// keyboard is up (`keyboard`) for `want`.
     pub fn end_frame(&mut self, ctx: &egui::Context, keyboard: &Keyboard, want: Option<Want>) {
         let keyboard_h = keyboard.height(ctx);
+        if !in_use() {
+            self.shown = false;
+            self.rect = None;
+            return;
+        }
         let Some(want) = want.filter(|_| keyboard_h > 0.0) else {
             self.shown = false;
+            self.rect = None;
             return;
         };
         if !self.shown {
@@ -74,6 +137,7 @@ impl TextBar {
             Pos2::new(screen.min.x, screen.max.y - keyboard_h - HEIGHT),
             Pos2::new(screen.max.x, screen.max.y - keyboard_h),
         );
+        self.rect = Some(rect);
         let clipboard = super::clipboard::text();
         let (field, selection) = match want {
             Want::Field(id) => (

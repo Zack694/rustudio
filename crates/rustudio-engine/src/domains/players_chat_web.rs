@@ -230,44 +230,6 @@ pub fn friends(uid: i64) -> Job {
     })
 }
 
-/// A user's id from their name (POST users.roblox.com/v1/usernames/users).
-pub fn user_id_from_name(name: String) -> Job {
-    Box::new(move |c| {
-        let v = post_json(
-            c,
-            "https://users.roblox.com/v1/usernames/users",
-            &serde_json::json!({ "usernames": [name], "excludeBannedUsers": false }),
-        )?;
-        v["data"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|r| r["id"].as_i64())
-            .map(J::from)
-            .ok_or_else(|| "Unknown user".to_string())
-    })
-}
-
-/// A user's name from their id (users.roblox.com/v1/users/{id}).
-pub fn name_from_user_id(id: i64) -> Job {
-    Box::new(move |c| {
-        let (status, body) = c
-            .session
-            .get(&format!("https://users.roblox.com/v1/users/{id}"))
-            .map_err(|e| e.to_string())?;
-        if status == 404 || status == 400 {
-            return Err("Unknown user".into());
-        }
-        if status != 200 {
-            return Err(status_text(status));
-        }
-        let v: J = serde_json::from_str(&body).map_err(|_| "Invalid response received".to_string())?;
-        v["name"]
-            .as_str()
-            .map(|s| J::String(s.to_string()))
-            .ok_or_else(|| "Unknown user".to_string())
-    })
-}
-
 /// Days since 1970-01-01 for an ISO-8601 date ("2015-03-19T01:02:03.4Z").
 fn days_of(iso: &str) -> Option<i64> {
     let d = iso.get(..10)?;

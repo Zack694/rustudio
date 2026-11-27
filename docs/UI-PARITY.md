@@ -25,7 +25,7 @@ Status: **done** = matches Studio; **partial** = as noted; **open** = not yet.
 | Document tab | the place's file name over the 3D view | the place's name (was "Viewport") | done |
 | Panel headers | full-width bar, name centred, float / close at the right | full-width centred title with close; no float button | partial |
 | Command bar | Script > Command Bar at the bottom (on by default) | not built: Window > Script > Command Bar disabled | open |
-| Status bar | none in this Studio | rustudio keeps its status bar (selection, parts, camera, snap, fps; rebuild_check reads it) | different on purpose |
+| Status bar | none in this Studio | rustudio keeps its status bar (selection, parts, camera, snap, fps; rebuild_check reads it); on Android it is not drawn while the soft keyboard is up, and the menu bar, test bar and ribbon go too while an editor field has the keyboard (`Keyboard::typing_layout`, docs/ANDROID.md "Text: the soft keyboard") | different on purpose |
 | Fonts | Builder Sans (ribbon, panels) | Builder Sans read from Studio's content folder at run time, else egui's | done |
 | Animations | menus open at once | egui fades turned off | done |
 
@@ -148,6 +148,7 @@ pairs in `checks/ui/side-brickcolor-popup.png`, `side-color-dialog.png`,
 | Slider rows | a property gets a slider when ReflectionMetadata gives UIMinimum and UIMaximum (303 members: Transparency, Reflectance, Lighting Brightness / ClockTime / ShadowSoftness / ExposureCompensation, Sound Volume / PlaybackSpeed, ParticleEmitter Rate / Speed / Drag…); step = range / UINumTicks, 20 steps without it (measured: Transparency 0.05, ParticleEmitter.Drag 0–5 in 0.25, ShadowSoftness 100 ticks in 0.01); SliderScaling "Square" | the same rules, read from Studio's ReflectionMetadata.xml (`src/prop_slider.rs`); Square spaces values quadratically | done |
 | Slider look | on the picked row: a 65-px spin box (value, up / down arrows) then the slider (9 × 14 handle (53, 55, 65), 2-px groove), on (40, 41, 49); the name cell in the selection blue (19, 35, 93) | the same; shown on hover too (the person's request; Studio shows it once the row is clicked) | done |
 | Slider editing | dragging sets the value live; arrows step by one tick; typing in the spin box | the same; a drag is one undo step | done |
+| Ref rows (Part0 / Part1, Attachment0 / Attachment1, PrimaryPart, CameraSubject…) | the instance's name; clicking the value starts a pick: the cell says "Select an instance", the next instance clicked in the Explorer or the 3D view becomes the value, and the selection returns to the owner; a × at the cell's right clears it | the same (`properties.rs` `RefPick` / `ref_cell`): a click starts the pick (a second click, Escape or deselecting ends it), the next selection is the value and the owners are selected again, × clears. Before this the cells were read-only by name — a 2026-11-25 device report: a WeldConstraint's parts "cannot be modified". Parent stays a Explorer move | done |
 
 ## Output (round 17)
 

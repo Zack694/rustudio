@@ -37,6 +37,8 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                             | ("globals_parity.rs", '\u{200d}')
                         // The Studio font fixtures exercise runtime-provided fonts.
                             | ("gui.rs", 'ו' | 'ל' | 'ם' | 'ע' | 'ש' | '\u{200d}' | '\u{fe0f}' | '🛒')
+                            | ("gui_color_glyphs.rs", '\u{e000}')
+                            | ("gui_ligatures.rs", '\u{e000}' | '\u{f174}' | '\u{f175}')
                         // The Output stack marker is stripped before display.
                             | ("runtime.rs" | "ui_shots.rs", '\u{2063}')
                         // The Android clipboard's seed text is never shown.

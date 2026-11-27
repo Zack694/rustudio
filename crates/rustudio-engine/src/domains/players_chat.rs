@@ -263,11 +263,13 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("UserMessageIntentSent", "TextChatService"),
 ];
 
-/// Player:Kick requests (message), for play_game.rs to disconnect the player.
-static KICKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-pub fn take_kick() -> Option<String> {
-    KICKS.lock().ok()?.drain(..).next()
+/// This VM's first pending Player:Kick message, for play_game.rs to
+/// disconnect the player (later ones in the same frame change nothing).
+pub fn take_kick(lua: &Lua) -> Option<String> {
+    let mut world = lua.app_data_mut::<crate::runtime::World>()?;
+    let first = (!world.kicks.is_empty()).then(|| world.kicks.remove(0));
+    world.kicks.clear();
+    first
 }
 
 fn one(v: Value) -> mlua::Result<MultiValue> {
@@ -1204,9 +1206,15 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     r.set(
         "kick",
         lua.create_function(|lua, (p, msg): (Value, String)| {
-            if let Ok(mut k) = KICKS.lock() {
-                k.push(msg.clone());
+            // A player who already left (not in Players) can't be kicked:
+            // nothing happens, as in Roblox.
+            if let Some(r) = opt_inst(&p) {
+                let gone = world(lua)?.d().dom.get_by_ref(r).is_none_or(|i| i.parent().is_none());
+                if gone {
+                    return Ok(());
+                }
             }
+            world(lua)?.kicks.push(msg.clone());
             world(lua)?.output.push((
                 rustudio_core::log::Level::Info,
                 if msg.is_empty() {
@@ -1248,13 +1256,40 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 Value::String(s) => s.to_string_lossy().to_string(),
                 _ => String::new(),
             };
+            // Names and ids: batched with every other lookup meanwhile
+            // (rustudio_account::users), kept in memory.
+            let batched = |r: Option<Result<Value, String>>| -> mlua::Result<(i32, Value)> {
+                Ok(match r {
+                    Some(Ok(v)) => (0, v),
+                    Some(Err(e)) => (1, Value::String(lua.create_string(e)?)),
+                    None => (2, Value::Nil),
+                })
+            };
+            match kind.as_str() {
+                "id_by_name" => {
+                    let r = rustudio_account::users::poll_id(&text(&a));
+                    return batched(r.map(|r| r.map(|id| Value::Number(id as f64))));
+                }
+                "name_by_id" => {
+                    let uid = int(&a);
+                    let r = if uid <= 0 {
+                        Some(Err(rustudio_account::users::UNKNOWN.to_string()))
+                    } else {
+                        rustudio_account::users::poll_user(uid as u64)
+                    };
+                    return batched(match r {
+                        Some(Ok(u)) => Some(Ok(Value::String(lua.create_string(&u.name)?))),
+                        Some(Err(e)) => Some(Err(e)),
+                        None => None,
+                    });
+                }
+                _ => {}
+            }
             let (key, job) = match kind.as_str() {
                 "groups" => (format!("groups:{}", int(&a)), web::groups(int(&a))),
                 "friend" => (format!("friend:{}:{}", int(&a), int(&b)), web::friend_status(int(&a), int(&b))),
                 "friends_online" => (format!("online:{}", int(&a)), web::friends_online(int(&a))),
                 "friends" => (format!("friends:{}", int(&a)), web::friends(int(&a))),
-                "id_by_name" => (format!("id:{}", text(&a).to_lowercase()), web::user_id_from_name(text(&a))),
-                "name_by_id" => (format!("name:{}", int(&a)), web::name_from_user_id(int(&a))),
                 _ => return Err(rt_err(format!("unknown lookup {kind}"))),
             };
             Ok(match web::poll(&key, job) {
@@ -1527,6 +1562,32 @@ pub fn chat_input(lua: &Lua, text: &str) -> bool {
 mod tests {
     use super::*;
     use rustudio_core::doc::Document;
+
+    /// A kick belongs to the VM that made it: a stopping Play's kick (its
+    /// PlayerRemoving → session end → Kick) must not reach the next Play.
+    #[test]
+    fn kicks_stay_in_their_own_session() {
+        let session = || {
+            let mut doc = Document::new_place();
+            doc.ensure_services();
+            let rt = Runtime::new().expect("runtime");
+            rt.enter(World::new(doc, RunMode::Play));
+            rt.bind_globals().expect("globals");
+            rt
+        };
+        let old = session();
+        // (command-bar identity: a game script can't create a Player)
+        crate::runtime::security::with_main_identity(&old.lua, crate::runtime::security::COMMAND, || {
+            old.lua
+                .load(r#"local p = Instance.new("Player") p.Parent = game:GetService("Players") p:Kick("from the old session")"#)
+                .exec()
+        })
+        .expect("kick");
+        let new = session();
+        assert_eq!(take_kick(&new.lua), None, "a new session starts with no kick");
+        assert_eq!(take_kick(&old.lua).as_deref(), Some("from the old session"));
+        assert_eq!(take_kick(&old.lua), None, "taken once");
+    }
 
     #[test]
     fn text_chat_defaults_and_callbacks_match_studio() {

@@ -705,6 +705,30 @@ impl Touch {
         std::mem::take(&mut self.game_events)
     }
 
+    /// A finger of the game's made up by the harness (`--finger`, `--tap`:
+    /// run_harness.rs), as `filter` would hand one over on a touch screen:
+    /// `pos` in window points. Runs anywhere (a test on a desktop), with
+    /// touch identity on (`RUSTUDIO_TOUCH=1`) so the game expects fingers.
+    pub fn harness_finger(&mut self, id: u64, phase: TouchPhase, pos: Pos2) {
+        let id = TouchId(id);
+        match phase {
+            TouchPhase::Start => {
+                self.game_fingers.insert(id);
+            }
+            TouchPhase::Move => {
+                if !self.game_fingers.contains(&id) {
+                    return;
+                }
+            }
+            TouchPhase::End | TouchPhase::Cancel => {
+                if !self.game_fingers.remove(&id) {
+                    return;
+                }
+            }
+        }
+        self.push_game(GameTouch { id, phase, pos });
+    }
+
     /// Whether `id` is a finger the game has now.
     pub fn is_game_finger(&self, id: TouchId) -> bool {
         self.game_fingers.contains(&id)

@@ -18,7 +18,9 @@ rbx_binary = "3"
 zstd = "0.13"
 lz4_flex = "0.13"
 rbx_xml = "3"
-rbx_reflection_database = "3"
+# Only the bundled database: never a machine-wide .rbxreflection file another
+# tool left (it also feeds rbx_binary / rbx_xml), so the version is the one we ship.
+rbx_reflection_database = { version = "3", features = ["debug_always_use_bundled"] }
 rbx_reflection = "7"
 rbx_types = "3"
 glam = { version = "0.30", features = ["bytemuck"] }

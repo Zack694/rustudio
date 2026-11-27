@@ -27,6 +27,7 @@ rapier3d = { version = "0.36", features = ["parallel", "profiler"] }
 rustc-hash = "2"
 chrono = { version = "0.4.35", default-features = false, features = ["clock"] }
 libc = "0.2"
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }

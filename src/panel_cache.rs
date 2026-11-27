@@ -51,6 +51,7 @@ enum State {
         lines: usize,
         generation: u64,
         row_height: f32,
+        wrap_text: bool,
     },
 }
 
@@ -68,20 +69,31 @@ struct Fonts {
     scale: f32,
     size: [usize; 2],
     fill: f32,
+    /// The atlas the snapshot's glyph UVs point into. A rebuilt atlas (a
+    /// game's font added during Play, or the atlas filling up) can reach the
+    /// same size and fill with every glyph somewhere else: replaying across
+    /// it painted the panels as garbage.
+    generation: u64,
 }
 
 impl Fonts {
     fn current(ctx: &Context) -> Self {
-        let (size, fill) = ctx.fonts(|f| (f.font_image_size(), f.font_atlas_fill_ratio()));
+        let (size, fill, generation) = ctx.fonts(|f| {
+            (f.font_image_size(), f.font_atlas_fill_ratio(), f.atlas_generation())
+        });
         Self {
             scale: ctx.pixels_per_point(),
             size,
             fill,
+            generation,
         }
     }
 
     fn reusable(&self, now: &Self) -> bool {
-        self.scale == now.scale && self.size == now.size && self.fill <= now.fill
+        self.scale == now.scale
+            && self.size == now.size
+            && self.fill <= now.fill
+            && self.generation == now.generation
     }
 }
 
@@ -210,6 +222,13 @@ impl Editor {
                 {
                     return false;
                 }
+                // A GUI object shows values the GUI layout computes
+                // (AbsolutePosition, AbsoluteSize, TextBounds…) from its
+                // ancestors and the view, which no journal mark on the
+                // selection covers: draw it fresh.
+                if doc.class_of(first).is_some_and(|class| rustudio_core::doc::is_a(&class, "GuiBase2d")) {
+                    return false;
+                }
                 let now = doc.journal_end();
                 if *journal == now {
                     return true;
@@ -234,10 +253,12 @@ impl Editor {
                 lines,
                 generation,
                 row_height,
+                wrap_text,
             } => {
                 *lines == self.game.log.len()
                     && *generation == self.output_view.log_generation
                     && *row_height == crate::output_panel::line_h()
+                    && *wrap_text == self.output_view.wrap_text
             }
         }
     }
@@ -266,6 +287,7 @@ impl Editor {
                 lines: self.game.log.len(),
                 generation: self.output_view.log_generation,
                 row_height: crate::output_panel::line_h(),
+                wrap_text: self.output_view.wrap_text,
             },
             _ => unreachable!("only Explorer, Properties and Output are retained"),
         }
@@ -300,6 +322,39 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A font added mid-session (a game's font during Play) rebuilds the
+    /// atlas; a snapshot taken before must not be replayed after, even when
+    /// the new atlas has the same size and has filled as far.
+    #[test]
+    fn rebuilt_font_atlas_invalidates_snapshots() {
+        let ctx = Context::default();
+        let frame = |ctx: &Context| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.label("Output line with several glyphs 0123456789");
+            })
+            .textures_delta
+            .clear();
+        };
+        frame(&ctx);
+        let before = Fonts::current(&ctx);
+        assert!(before.reusable(&Fonts::current(&ctx)));
+
+        let (name, data) = egui::FontDefinitions::default().font_data.into_iter().next().unwrap();
+        ctx.add_font(egui::epaint::text::FontInsert::new(
+            &format!("{name}-game"),
+            (*data).clone(),
+            vec![egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Name("game".into()),
+                priority: egui::epaint::text::FontPriority::Highest,
+            }],
+        ));
+        frame(&ctx);
+        frame(&ctx);
+        let after = Fonts::current(&ctx);
+        assert_ne!(before.generation, after.generation);
+        assert!(!before.reusable(&after));
+    }
 
     #[test]
     fn idle_snapshot_preserves_hit_targets_until_the_first_click() {

@@ -26,7 +26,7 @@ fn req<'a>(a: &'a J, k: &str) -> R<&'a str> {
 }
 
 fn num(a: &J, k: &str) -> Option<f64> {
-    a.get(k).and_then(|v| v.as_f64())
+    a.get(k).and_then(|v| v.as_f64()).filter(|n| n.is_finite())
 }
 
 fn flag(a: &J, k: &str, d: bool) -> bool {
@@ -68,6 +68,21 @@ impl Editor {
             "get_source" => self.mcp_get_source(a).map(Into::into),
             "grep_scripts" => self.mcp_grep(a).map(Into::into),
             "read_output" => Ok(self.mcp_read_output(a).into()),
+            "web_stats" => {
+                let stats = rustudio_account::web::stats();
+                if a.get("reset").and_then(|v| v.as_bool()) == Some(true) {
+                    rustudio_account::web::reset_stats();
+                }
+                let (batches, resolved, cache_hits) = rustudio_account::asset_batch::counters();
+                Ok(ToolResult::json(&serde_json::json!({
+                    "hosts": stats,
+                    "asset_batch": { "batches": batches, "resolved": resolved, "cache_hits": cache_hits },
+                    "thumbs": rustudio_account::thumbs::counters(),
+                    "users": rustudio_account::users::counters().0,
+                    "usernames": rustudio_account::users::counters().1,
+                }))
+                .into())
+            }
             "screenshot" => {
                 let mode = match s(a, "mode").unwrap_or("viewport").to_ascii_lowercase().as_str() {
                     "window" | "full" => ShotMode::Window,
@@ -313,10 +328,7 @@ impl Editor {
                     total += 1;
                     if hits.len() < limit {
                         let mut t = l.trim().to_string();
-                        if t.len() > 200 {
-                            t.truncate(200);
-                            t.push('…');
-                        }
+                        super::truncate_utf8(&mut t, 200);
                         hits.push(format!("{p}:{}: {t}", n + 1));
                     }
                 }
@@ -705,8 +717,10 @@ impl Editor {
         if self.game.play.is_none() {
             return Ok(Step::Done(ToolResult::text("Not playing")));
         }
-        self.stop_play();
-        Ok(Step::Wait(Op::Play { want: false }, Duration::from_secs(60)))
+        // As the Stop button: BindToClose callbacks get up to the shutdown
+        // deadline (30 s) before the session ends.
+        self.request_stop();
+        Ok(Step::Wait(Op::Play { want: false }, Duration::from_secs(90)))
     }
 
     fn mcp_play_state(&self) -> J {
@@ -724,11 +738,11 @@ impl Editor {
         let mut out = Vec::new();
         let mut until = now;
         for (i, st) in steps.iter().enumerate() {
-            let at = now + num(st, "at").unwrap_or(0.0).max(0.0) as f32;
+            let at = now + num(st, "at").unwrap_or(0.0).clamp(0.0, 3600.0) as f32;
             let bad = |what: &str| format!("Nothing was sent. step {}: {what}", i + 1);
             if let Some(k) = s(st, "key") {
                 let (key, mods) = rustudio_player::run_harness::parse_harness_key(k).ok_or_else(|| bad(&format!("{k:?} isn't a key name (egui names: A, Space, Enter, ArrowUp, F1, ctrl+a…)")))?;
-                match num(st, "hold") {
+                match num(st, "hold").map(|h| h.clamp(0.0, 3600.0)) {
                     Some(h) if h > 0.0 => {
                         out.push((at, H::KeyState(key, mods, true)));
                         out.push((at + h as f32, H::KeyState(key, mods, false)));
@@ -737,7 +751,7 @@ impl Editor {
                     _ => out.push((at, H::Key(key, mods))),
                 }
             } else if let Some(xy) = st.get("click").and_then(|c| c.as_array()) {
-                let v: Vec<f32> = xy.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect();
+                let v: Vec<f32> = xy.iter().filter_map(|x| x.as_f64().filter(|f| f.is_finite()).map(|f| f as f32)).collect();
                 let [x, y] = v[..] else { return Err(bad("click: [x, y]")) };
                 out.push((at, H::Click(x, y)));
             } else if let Some(t) = s(st, "type") {
@@ -745,7 +759,7 @@ impl Editor {
             } else if let Some(n) = num(st, "wheel") {
                 out.push((at, H::Wheel(n as f32, None)));
             } else if let Some(m) = st.get("move").and_then(|c| c.as_array()) {
-                let v: Vec<f32> = m.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect();
+                let v: Vec<f32> = m.iter().filter_map(|x| x.as_f64().filter(|f| f.is_finite()).map(|f| f as f32)).collect();
                 let [dx, dy] = v[..] else { return Err(bad("move: [dx, dy]")) };
                 out.push((at, H::MouseMotion(dx, dy)));
             } else {
@@ -754,11 +768,12 @@ impl Editor {
             until = until.max(at);
         }
         self.harness.run.input.actions.extend(out);
-        Ok(Step::Wait(Op::Input { until: until + 0.1 }, Duration::from_secs_f32(until - now + 30.0)))
+        let wait_secs = (until - now).clamp(0.0, 3600.0) + 30.0;
+        Ok(Step::Wait(Op::Input { until: until + 0.1 }, Duration::from_secs_f32(wait_secs)))
     }
 
     fn mcp_set_camera(&mut self, a: &J) -> R<ToolResult> {
-        let p: Vec<f32> = a.get("position").and_then(|p| p.as_array()).map(|v| v.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()).unwrap_or_default();
+        let p: Vec<f32> = a.get("position").and_then(|p| p.as_array()).map(|v| v.iter().filter_map(|x| x.as_f64().filter(|f| f.is_finite()).map(|f| f as f32)).collect()).unwrap_or_default();
         let [x, y, z] = p[..] else { return Err("position: [x, y, z]".into()) };
         let cam = &mut self.game.cam;
         cam.pos = glam::Vec3::new(x, y, z);
@@ -1043,14 +1058,14 @@ impl Editor {
     }
 
     fn mcp_poll_shot(&mut self, ctx: &egui::Context, save: Option<PathBuf>, mode: ShotMode, requested: &mut bool, settled: &mut bool, asked: Instant) -> Option<ToolResult> {
-        // Default save path inside `/storage/emulated/0/rustudio/screenshots/` on Android
-        // (or `<Pictures>/rustudio/` on desktop) when no explicit path is provided.
-        let resolved_save = save.unwrap_or_else(|| {
-            let dir = rustudio_core::paths::screenshots();
-            let _ = std::fs::create_dir_all(&dir);
-            let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
-            dir.join(format!("rustudio_{stamp}.png"))
-        });
+        let resolve_save = |explicit: Option<PathBuf>| -> PathBuf {
+            explicit.unwrap_or_else(|| {
+                let dir = rustudio_core::paths::screenshots();
+                let _ = std::fs::create_dir_all(&dir);
+                let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
+                dir.join(format!("rustudio_{stamp}.png"))
+            })
+        };
 
         if !*requested {
             let ready = self.game.viewport_rect.is_positive()
@@ -1071,7 +1086,8 @@ impl Editor {
             if mode == ShotMode::Scene3d {
                 let direct = self.game.renderer.as_ref().zip(self.game.render_state.as_ref()).and_then(|(r, rs)| r.read_frame(rs));
                 if let Some((w, h, rgba)) = direct {
-                    return Some(shot_result(w, h, rgba, Some(resolved_save.as_path()), *settled));
+                    let path = resolve_save(save);
+                    return Some(shot_result(w, h, rgba, Some(path.as_path()), *settled));
                 }
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -1090,30 +1106,47 @@ impl Editor {
             if asked.elapsed() > Duration::from_secs(24) {
                 let direct = self.game.renderer.as_ref().zip(self.game.render_state.as_ref()).and_then(|(r, rs)| r.read_frame(rs));
                 if let Some((w, h, rgba)) = direct {
-                    return Some(shot_result(w, h, rgba, Some(resolved_save.as_path()), *settled));
+                    let path = resolve_save(save);
+                    return Some(shot_result(w, h, rgba, Some(path.as_path()), *settled));
                 }
             }
             return None;
         };
-        let (x0, y0, w, h) = if mode == ShotMode::Window {
-            (0usize, 0usize, image.size[0], image.size[1])
+        let img_w = image.size[0];
+        let img_h = image.size[1];
+        if img_w == 0 || img_h == 0 || image.pixels.len() < img_w.saturating_mul(img_h) {
+            return Some(ToolResult::error("The captured screenshot had empty dimensions"));
+        }
+        let (mut x0, mut y0, mut w, mut h) = if mode == ShotMode::Window {
+            (0usize, 0usize, img_w, img_h)
         } else {
             let ppp = ctx.pixels_per_point();
             crate::app::view_pixels(self.game.viewport_rect, ppp, image.size)
         };
-        let mut rgba = Vec::with_capacity(w * h * 4);
+        if w == 0 || h == 0 || x0 >= img_w || y0 >= img_h {
+            (x0, y0, w, h) = (0, 0, img_w, img_h);
+        } else {
+            w = w.min(img_w - x0);
+            h = h.min(img_h - y0);
+        }
+        let mut rgba = Vec::with_capacity(w.saturating_mul(h).saturating_mul(4));
         for y in 0..h {
+            let row = (y0 + y) * img_w;
             for x in 0..w {
-                let p = image.pixels[(y0 + y) * image.size[0] + x0 + x];
+                let p = image.pixels.get(row + x0 + x).copied().unwrap_or(egui::Color32::BLACK);
                 rgba.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
             }
         }
-        Some(shot_result(w as u32, h as u32, rgba, Some(resolved_save.as_path()), *settled))
+        let path = resolve_save(save);
+        Some(shot_result(w as u32, h as u32, rgba, Some(path.as_path()), *settled))
     }
 }
 
 /// The view as an MCP image (scaled to at most 1600 wide), saved too when asked.
 fn shot_result(w: u32, h: u32, mut rgba: Vec<u8>, save: Option<&Path>, settled: bool) -> ToolResult {
+    if w == 0 || h == 0 {
+        return ToolResult::error("The view had zero width or height");
+    }
     for px in rgba.chunks_exact_mut(4) {
         px[3] = 255;
     }
@@ -1130,7 +1163,12 @@ fn shot_result(w: u32, h: u32, mut rgba: Vec<u8>, save: Option<&Path>, settled: 
             Err(e) => note += &format!(" (save warning {}: {e})", p.display()),
         }
     }
-    let img = if w > 1600 { image::imageops::resize(&img, 1600, (h as f32 * 1600.0 / w as f32) as u32, image::imageops::FilterType::Triangle) } else { img };
+    let img = if w > 1600 {
+        let new_h = ((h as f32 * 1600.0 / w as f32).round().max(1.0)) as u32;
+        image::imageops::resize(&img, 1600, new_h, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
     let mut png = std::io::Cursor::new(Vec::new());
     if let Err(e) = img.write_to(&mut png, image::ImageFormat::Png) {
         return ToolResult::error(format!("PNG: {e}"));
@@ -1150,5 +1188,13 @@ mod tests {
         assert_eq!(super::base64(b"fo"), "Zm8=");
         assert_eq!(super::base64(b"foo"), "Zm9v");
         assert_eq!(super::base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn shot_result_rejects_empty_and_resizes_thin_image() {
+        let empty = super::shot_result(0, 0, Vec::new(), None, true);
+        assert!(empty.is_error);
+        let thin = super::shot_result(2000, 1, vec![255u8; 2000 * 4], None, true);
+        assert!(!thin.is_error);
     }
 }

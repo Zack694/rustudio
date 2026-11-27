@@ -1336,8 +1336,9 @@ impl Walk<'_, '_> {
         k
     }
 
-    /// The size of a text object's text, wrapped at `wrap` (AutomaticSize).
-    fn measure_text(&mut self, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
+    /// The size of a text object's text, wrapped at `wrap` (AutomaticSize);
+    /// `fit_height` as `AutoText::measure_text`.
+    fn measure_text(&mut self, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2 {
         let d = self.input.doc;
         let mut text = text_prop(d, r, "Text");
         if text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox") {
@@ -1346,7 +1347,10 @@ impl Walk<'_, '_> {
         let rich = boolp(d, r, "RichText", false);
         let font = font_of(d, r);
         let legacy_scale = legacy_text_scale(&font);
-        let mut size = num(d, r, "TextSize", 14.0) * scale * legacy_scale;
+        let mut size = match fit_height {
+            Some(h) => scaled_text_size(h, scale),
+            None => num(d, r, "TextSize", 14.0) * scale * legacy_scale,
+        };
         if let Some(c) = child_of_class(d, r, "UITextSizeConstraint") {
             size = constrain_font_size(
                 size,
@@ -1463,12 +1467,36 @@ impl Walk<'_, '_> {
 /// Measures a text object's text for AutomaticSize (`Walk::measure_text`
 /// in the GUI walk, `FaceText` for a script's read between walks).
 pub(super) trait AutoText {
-    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2;
+    /// `fit_height`: TextScaled growing on X alone sizes its text by the
+    /// box's height (`scaled_text_size`) instead of TextSize.
+    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2;
 }
 
 impl AutoText for &mut Walk<'_, '_> {
-    fn measure_text(&mut self, _: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
-        Walk::measure_text(self, r, wrap, scale)
+    fn measure_text(&mut self, _: &Document, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2 {
+        Walk::measure_text(self, r, wrap, scale, fit_height)
+    }
+}
+
+/// The text size of a TextScaled object that grows on X alone: the largest
+/// whole size whose single line fits the box's height (at most 100, like
+/// TextScaled's search; the painted fit then finds the same size in the
+/// grown box). Roblox scales such a label's text to its height and widens
+/// it to the line — the {0, 0}, {1, 0} TextScaled AutomaticSize X name
+/// tags of a horizontal list (LBG's "Accessory" pill, 8 px wide and 2 px
+/// of text when measured at TextSize wrapped in no width).
+pub(super) fn scaled_text_size(height: f32, scale: f32) -> f32 {
+    (height + 0.5).floor().clamp(1.0, 100.0 * scale.max(1.0))
+}
+
+/// Which parent axis (bit 1 = X, bit 2 = Y) each of a GuiObject's Size
+/// scales reads: X and Y, or both the width under SizeConstraint RelativeXX
+/// (1), both the height under RelativeYY (2).
+pub(super) fn scale_axes(d: &Document, r: Ref) -> (u32, u32) {
+    match enum_u32(d.prop(r, "SizeConstraint")) {
+        Some(1) => (1, 1),
+        Some(2) => (2, 2),
+        _ => (1, 2),
     }
 }
 
@@ -1531,7 +1559,11 @@ impl<M: AutoText> Sizer<'_, M> {
             // three lines in its 302 px window,
             // checks/plugins/ref/corpus/screens/argon-load-popup.jpg).
             let sz = udim2(d, r, "Size");
-            let wrap = if !boolp(d, r, "TextWrapped", false) {
+            // TextScaled growing on X alone: text as tall as the box, the
+            // box as wide as that one line (nothing to wrap at).
+            let fit_height = (boolp(d, r, "TextScaled", false) && auto & 1 != 0 && auto & 2 == 0)
+                .then_some(inner.height());
+            let wrap = if fit_height.is_some() || !boolp(d, r, "TextWrapped", false) {
                 f32::INFINITY
             } else if auto & 1 != 0 {
                 if sz[0] > 0.0 && inner.width() > 0.0 {
@@ -1543,21 +1575,24 @@ impl<M: AutoText> Sizer<'_, M> {
             } else {
                 inner.width()
             };
-            ext = self.m.measure_text(d, r, wrap, scale);
+            ext = self.m.measure_text(d, r, wrap, scale, fit_height);
         }
         // Measure direct children and any nested Folder-held layout groups
         // (matching `Walk::children` — closes ENGINE-GAPS AutomaticSize Folder gap).
-        fn collect_folders(d: &Document, parent: Ref, out: &mut Vec<Ref>) {
+        fn collect_folders(d: &Document, parent: Ref, out: &mut Vec<Ref>, nested: usize) {
+            if nested >= 64 {
+                return;
+            }
             for c in children(d, parent) {
                 if d.class_of(c).as_deref() == Some("Folder") {
                     out.push(c);
-                    collect_folders(d, c, out);
+                    collect_folders(d, c, out, nested + 1);
                 }
             }
         }
         ext = ext.max(self.measure_group(r, inner, scale, auto, depth));
         let mut folders = Vec::new();
-        collect_folders(d, r, &mut folders);
+        collect_folders(d, r, &mut folders, 0);
         for folder in folders {
             ext = ext.max(self.measure_group(folder, inner, scale, auto, depth));
         }
@@ -1743,8 +1778,16 @@ impl<M: AutoText> Sizer<'_, M> {
             return s;
         }
         let sz = udim2(self.d, k, "Size");
+        // A Scale counts as growing only when it reads a growing axis: under
+        // SizeConstraint RelativeXX a child's height follows the parent's
+        // width, which an AutomaticSize Y list has (LBG's limited emotes: a
+        // column of {1, 0}, {0.932, 0} RelativeXX cards, each with a 0.48
+        // UIAspectRatioConstraint frame inside — measured as "sized by the
+        // growing axis" the frame derived 500 px of height from its width
+        // and the 300 px list grew to 900).
+        let (rx, ry) = scale_axes(self.d, k);
         let grows = |axis: u32, sc: f32| auto & axis != 0 && sc != 0.0;
-        let (gx, gy) = (grows(1, sz[0]), grows(2, sz[2]));
+        let (gx, gy) = (grows(rx, sz[0]), grows(ry, sz[2]));
         if gx || gy {
             let axes = (gx as u32) | ((gy as u32) << 1);
             let c = self.content_size_in(k, s, scale, axes, depth, inner.width());
@@ -1802,8 +1845,9 @@ impl<M: AutoText> Sizer<'_, M> {
             // auto-growing axis isn't constrained yet (e.g. a 1:1 square thumbnail
             // with Size {1,0},{1,0} in an AutomaticSize.Y card), so derive that axis
             // from the known fixed axis instead of collapsing to 0.
-            let auto_gx = parent_auto & 1 != 0 && s[0] != 0.0;
-            let auto_gy = parent_auto & 2 != 0 && s[2] != 0.0;
+            let (rx, ry) = scale_axes(d, r);
+            let auto_gx = parent_auto & rx != 0 && s[0] != 0.0;
+            let auto_gy = parent_auto & ry != 0 && s[2] != 0.0;
             if enum_u32(d.prop(c, "AspectType")) == Some(1) {
                 if enum_u32(d.prop(c, "DominantAxis")) == Some(1) {
                     size.x = size.y * ratio;
@@ -2284,7 +2328,7 @@ impl Walk<'_, '_> {
         if chat_style {
             content = content.shrink(17.0 * me.scale);
         }
-        if (boolp(d, r, "ClipsDescendants", false) || scrolling) && me.aff.is_id() {
+        if (boolp(d, r, "ClipsDescendants", false) || scrolling || class == "CanvasGroup") && me.aff.is_id() {
             me.clip = me.clip.intersect(rect);
         }
         if scrolling {
@@ -2369,7 +2413,23 @@ impl Walk<'_, '_> {
             );
             let canvas_rect = Rect::from_min_size(origin, canvas);
             // UIPadding pads inside the canvas (not added on top of CanvasSize).
-            let mut inner_canvas = padded(d, r, canvas_rect, me.scale);
+            // On an AutomaticCanvasSize axis the children's Scale follows the
+            // ScrollingFrame itself, not the canvas it grew — Roblox lays an
+            // automatic canvas' children out against the frame, so a
+            // UIGridLayout of (0.2, 0.35) cells in an automatic-Y canvas
+            // keeps 0.35 of the window instead of 0.35 of a canvas that then
+            // holds more again (a shop's cards 2.4x too tall after one
+            // frame, taller after each). The canvas is still the scroll
+            // range; `content_size_in` above measured the children the same
+            // way, and `runtime_ext::scroll_geometry` reads them so.
+            let basis = Rect::from_min_size(
+                canvas_rect.min,
+                egui::vec2(
+                    if acs & 1 != 0 { rect.width().min(canvas.x - inset_v).max(0.0) } else { canvas.x },
+                    if acs & 2 != 0 { rect.height().min(canvas.y - inset_h).max(0.0) } else { canvas.y },
+                ),
+            );
+            let mut inner_canvas = padded(d, r, basis, me.scale);
             if chat_style {
                 inner_canvas = inner_canvas.shrink(17.0 * me.scale);
             }
@@ -2415,28 +2475,29 @@ impl Walk<'_, '_> {
             let has = d.dom.get_by_ref(r).is_some_and(|i| i.properties.contains_key(&rbx_dom_weak::ustr(prop)));
             if has { text_prop(d, r, prop) } else { dflt.to_string() }
         };
+        let cap = th.min(len * 0.5);
         let parts = if vertical {
             [
-                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
+                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, cap))),
                 (
                     image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
-                    Rect::from_min_max(Pos2::new(bar.left(), bar.top() + th), Pos2::new(bar.right(), bar.bottom() - th)),
+                    Rect::from_min_max(Pos2::new(bar.left(), bar.top() + cap), Pos2::new(bar.right(), bar.bottom() - cap)),
                 ),
                 (
                     image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
-                    Rect::from_min_max(Pos2::new(bar.left(), bar.bottom() - th), bar.max),
+                    Rect::from_min_max(Pos2::new(bar.left(), bar.bottom() - cap), bar.max),
                 ),
             ]
         } else {
             [
-                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
+                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(cap, th))),
                 (
                     image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
-                    Rect::from_min_max(Pos2::new(bar.left() + th, bar.top()), Pos2::new(bar.right() - th, bar.bottom())),
+                    Rect::from_min_max(Pos2::new(bar.left() + cap, bar.top()), Pos2::new(bar.right() - cap, bar.bottom())),
                 ),
                 (
                     image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
-                    Rect::from_min_max(Pos2::new(bar.right() - th, bar.top()), bar.max),
+                    Rect::from_min_max(Pos2::new(bar.right() - cap, bar.top()), bar.max),
                 ),
             ]
         };
@@ -2452,8 +2513,24 @@ impl Walk<'_, '_> {
                 continue;
             };
             drew = true;
-            let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-            self.push(Shape::Mesh(quad_mesh(dst, full, tex, &|_| c, 1).into()), me);
+            // Studio's scroll-top/bottom.png are vertical half-capsules; horizontal
+            // scrollbars rotate them 90 deg CCW so texture top (v=0) is left and
+            // texture bottom (v=1) is right.
+            let mesh = if vertical {
+                let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                quad_mesh(dst, full, tex, &|_| c, 1)
+            } else {
+                let mut m = Mesh::with_texture(tex);
+                m.vertices.extend_from_slice(&[
+                    Vertex { pos: dst.left_top(), uv: Pos2::new(1.0, 0.0), color: c },
+                    Vertex { pos: dst.right_top(), uv: Pos2::new(1.0, 1.0), color: c },
+                    Vertex { pos: dst.right_bottom(), uv: Pos2::new(0.0, 1.0), color: c },
+                    Vertex { pos: dst.left_bottom(), uv: Pos2::new(0.0, 0.0), color: c },
+                ]);
+                m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                m
+            };
+            self.push(Shape::Mesh(mesh.into()), me);
         }
         if !drew {
             // No content folder: a plain bar.
@@ -3796,6 +3873,100 @@ mod layout_tests {
         out.textures_delta.clear();
     }
 
+    /// An AutomaticSize Y list of RelativeXX cards ({1, 0}, {0.5, 0}: as
+    /// tall as half the list's width) is as tall as the cards: a card's
+    /// height follows the list's width, not the height being worked out, so
+    /// the card counts with its Size — not with what it holds, where a
+    /// {1, 0}, {1, 0} frame under a 0.25 UIAspectRatioConstraint would derive
+    /// 400 px of height from its width (LBG's limited emotes column, 3x too
+    /// tall, its header and footer centred off the screen).
+    #[test]
+    fn auto_size_counts_relative_xx_children_by_size() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let page = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let list = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 0)))
+            .with_property("AutomaticSize", Enum::from_u32(2)));
+        doc.dom.insert(list, InstanceBuilder::new("UIListLayout"));
+        let mut cards = Vec::new();
+        for n in 0..3 {
+            let card = doc.dom.insert(list, InstanceBuilder::new("Frame")
+                .with_property("LayoutOrder", n)
+                .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.5, 0)))
+                .with_property("SizeConstraint", Enum::from_u32(1)));
+            let tall = doc.dom.insert(card, InstanceBuilder::new("Frame")
+                .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0))));
+            doc.dom.insert(tall, InstanceBuilder::new("UIAspectRatioConstraint")
+                .with_property("AspectRatio", 0.25f32));
+            cards.push((card, tall));
+        }
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b_ = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
+            let l = b_(list);
+            assert!((l.size[0] - 100.0).abs() < 0.01 && (l.size[1] - 150.0).abs() < 0.01, "three 50 px cards: {:?}", l.size);
+            for (n, (card, tall)) in cards.iter().enumerate() {
+                let c = b_(*card);
+                assert!((c.size[1] - 50.0).abs() < 0.01 && (c.pos[1] - 50.0 * n as f32).abs() < 0.01, "card {n}: {:?} at {:?}", c.size, c.pos);
+                // The aspect frame fits within its 100 x 50 card: 12.5 x 50.
+                let t = b_(*tall);
+                assert!((t.size[0] - 12.5).abs() < 0.01 && (t.size[1] - 50.0).abs() < 0.01, "aspect frame {n}: {:?}", t.size);
+            }
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A TextScaled label growing on X alone ({0, 0}, {0, 20}) has its text
+    /// as tall as its box and is as wide as that line: as wide as the same
+    /// text at TextSize 20 growing on X (LBG's "Accessory" tag).
+    #[test]
+    fn text_scaled_auto_x_sizes_text_by_height() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let page = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        // (SourceSans: Font.Legacy draws at 1.5 x TextSize, a fitted size as is)
+        let scaled = doc.dom.insert(page, InstanceBuilder::new("TextLabel")
+            .with_property("Text", "Accessory")
+            .with_property("Font", Enum::from_u32(3))
+            .with_property("TextScaled", true)
+            .with_property("TextWrapped", true)
+            .with_property("TextSize", 14.0f32)
+            .with_property("AutomaticSize", Enum::from_u32(1))
+            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 20))));
+        let plain = doc.dom.insert(page, InstanceBuilder::new("TextLabel")
+            .with_property("Text", "Accessory")
+            .with_property("Font", Enum::from_u32(3))
+            .with_property("TextSize", 20.0f32)
+            .with_property("AutomaticSize", Enum::from_u32(1))
+            .with_property("Position", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 40)))
+            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 20))));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let size = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.size;
+            let (s, p) = (size(scaled), size(plain));
+            assert!((s[1] - 20.0).abs() < 0.01, "keeps its height: {s:?}");
+            assert!(s[0] > 40.0 && (s[0] - p[0]).abs() < 0.01, "as wide as the 20 px line: {s:?} vs {p:?}");
+        });
+        out.textures_delta.clear();
+    }
+
     /// SizeConstraint RelativeYY / RelativeXX: both scales take the parent's
     /// height / width (DataStore Editor's check box: a 0.6-of-the-row square).
     #[test]
@@ -4052,6 +4223,62 @@ mod layout_tests {
         out.textures_delta.clear();
     }
 
+    /// AutomaticCanvasSize: on the automatic axis the children's Scale
+    /// follows the frame, not the canvas it grows (three (1, 0.5) children
+    /// of a 100 px automatic-Y frame are 50 px each, the canvas 150 — not
+    /// 75 px in a canvas that then holds 225, and so on); an explicit
+    /// CanvasSize beyond the content is the scroll range but not the
+    /// children's basis either. Without AutomaticCanvasSize the canvas
+    /// stays the basis (`scrolling_frame_insets_gutter_and_direction`).
+    #[test]
+    fn automatic_canvas_children_scale_with_the_frame() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let mut frames = Vec::new();
+        for (canvas, auto) in [(0.0f32, 2u32), (400.0, 2), (400.0, 0)] {
+            let sf = doc.dom.insert(parent, InstanceBuilder::new("ScrollingFrame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))
+                .with_property("CanvasSize", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, canvas as i32)))
+                .with_property("ScrollBarThickness", 0i32)
+                .with_property("AutomaticCanvasSize", Enum::from_u32(auto)));
+            doc.dom.insert(sf, InstanceBuilder::new("UIListLayout"));
+            let kids: Vec<Ref> = (0..3)
+                .map(|_| doc.dom.insert(sf, InstanceBuilder::new("Frame")
+                    .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.5, 0)))))
+                .collect();
+            frames.push((sf, kids));
+        }
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            let (auto_sf, auto_kids) = &frames[0];
+            assert_eq!(b(*auto_sf).canvas, Some([100.0, 150.0]), "automatic Y holds three 50 px children");
+            for k in auto_kids {
+                assert_eq!(b(*k).size, [100.0, 50.0], "half the frame, not half the canvas");
+            }
+            let (big_sf, big_kids) = &frames[1];
+            assert_eq!(b(*big_sf).canvas, Some([100.0, 400.0]), "an explicit CanvasSize beyond the content");
+            for k in big_kids {
+                assert_eq!(b(*k).size, [100.0, 50.0], "still the frame's half");
+            }
+            let (plain_sf, plain_kids) = &frames[2];
+            assert_eq!(b(*plain_sf).canvas, Some([100.0, 400.0]));
+            for k in plain_kids {
+                assert_eq!(b(*k).size, [100.0, 200.0], "no AutomaticCanvasSize: half the canvas");
+            }
+        });
+        out.textures_delta.clear();
+    }
+
     #[test]
     fn page_layout_slots_and_circular_wrap() {
         let mut doc = Document::new_place();
@@ -4163,6 +4390,139 @@ mod layout_tests {
             assert!((h.size[0] - 130.0).abs() < 0.01 && (h.size[1] - 24.0).abs() < 0.01, "expected 130x24, got {:?}", h.size);
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn hide_core_gui_hides_core_ui_while_keeping_player_gui() {
+        use rbx_dom_weak::InstanceBuilder;
+        use rbx_dom_weak::types::{UDim, UDim2};
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let players = doc.find_child(root, "Players").unwrap_or_else(|| doc.dom.insert(root, InstanceBuilder::new("Players")));
+        let lp = doc.dom.insert(players, InstanceBuilder::new("Player").with_name("Local"));
+        doc.dom.get_by_ref_mut(players).unwrap().properties.insert("LocalPlayer".into(), Variant::Ref(lp));
+        let pg = doc.dom.insert(lp, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+        let game_sg = doc.dom.insert(pg, InstanceBuilder::new("ScreenGui").with_name("GameHud"));
+        let game_frame = doc.dom.insert(
+            game_sg,
+            InstanceBuilder::new("Frame")
+                .with_name("HudFrame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 120), UDim::new(0.0, 40))),
+        );
+        let core = doc.find_child(root, "CoreGui").unwrap_or_else(|| doc.dom.insert(root, InstanceBuilder::new("CoreGui")));
+        let topbar_sg = doc.dom.insert(core, InstanceBuilder::new("ScreenGui").with_name("TopBarApp"));
+        let topbar_frame = doc.dom.insert(
+            topbar_sg,
+            InstanceBuilder::new("Frame")
+                .with_name("TopBarFrame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 96), UDim::new(0.0, 44))),
+        );
+
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // Default: both PlayerGui and CoreGui are drawn.
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter_at(rect);
+            gui.draw(ui.ctx(), &painter, DrawIn {
+                render_state: None,
+                doc: &doc,
+                cam: &cam,
+                rect,
+                store: &mut store,
+                doc_dir: None,
+                playing: true,
+                fixed_step: true,
+                roots: Roots::View,
+            });
+        });
+        out.textures_delta.clear();
+        assert!(gui.layout.contains_key(&game_frame), "PlayerGui frame should be laid out");
+        assert!(gui.layout.contains_key(&topbar_frame), "CoreGui frame should be laid out when shown");
+
+        // Hidden: CoreGui is omitted and pruned from layout while PlayerGui remains.
+        gui.hide_core_gui = true;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter_at(rect);
+            gui.draw(ui.ctx(), &painter, DrawIn {
+                render_state: None,
+                doc: &doc,
+                cam: &cam,
+                rect,
+                store: &mut store,
+                doc_dir: None,
+                playing: true,
+                fixed_step: true,
+                roots: Roots::View,
+            });
+        });
+        out.textures_delta.clear();
+        assert!(gui.layout.contains_key(&game_frame), "PlayerGui frame should remain visible");
+        assert!(!gui.layout.contains_key(&topbar_frame), "CoreGui frame should be hidden");
+
+        // Toggled back on: CoreGui returns immediately.
+        gui.hide_core_gui = false;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter_at(rect);
+            gui.draw(ui.ctx(), &painter, DrawIn {
+                render_state: None,
+                doc: &doc,
+                cam: &cam,
+                rect,
+                store: &mut store,
+                doc_dir: None,
+                playing: true,
+                fixed_step: true,
+                roots: Roots::View,
+            });
+        });
+        out.textures_delta.clear();
+        assert!(gui.layout.contains_key(&game_frame));
+        assert!(gui.layout.contains_key(&topbar_frame), "CoreGui frame should return when re-enabled");
+    }
+
+    #[test]
+    fn canvas_group_clips_descendants_even_when_clips_descendants_is_false() {
+        use rbx_dom_weak::InstanceBuilder;
+        use rbx_dom_weak::types::{UDim, UDim2};
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let sg_parent = doc.find_child(root, "StarterGui").unwrap();
+        let screen = doc.dom.insert(sg_parent, InstanceBuilder::new("ScreenGui"));
+        let cg = doc.dom.insert(
+            screen,
+            InstanceBuilder::new("CanvasGroup")
+                .with_property("Position", UDim2::new(UDim::new(0.0, 20), UDim::new(0.0, 30)))
+                .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 80)))
+                .with_property("ClipsDescendants", false),
+        );
+        let overflow = doc.dom.insert(
+            cg,
+            InstanceBuilder::new("Frame")
+                .with_property("Position", UDim2::new(UDim::new(0.0, 80), UDim::new(0.0, 50)))
+                .with_property("Size", UDim2::new(UDim::new(0.0, 90), UDim::new(0.0, 70))),
+        );
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut child_clip = None;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(screen, rect, Down { clip: rect, aff: Aff::ID, scale: 1.0, z: 0, alpha: 1.0, tint: [1.0; 3], turn: 0.0 });
+            child_clip = walk.hits.iter().find(|h| h.r == overflow).and_then(|h| h.clip);
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            child_clip,
+            Some(Rect::from_min_size(Pos2::new(20.0, 30.0), egui::vec2(100.0, 80.0))),
+            "CanvasGroup must clip descendants to its bounds even with ClipsDescendants=false",
+        );
     }
 
 }

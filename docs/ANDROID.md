@@ -117,7 +117,8 @@ xbuild quirks worth knowing (commit e67b501):
 | Input | mouse + keyboard | fingers through `crates/rustudio-engine/src/touch_input.rs` (below); hardware mice / keyboards work as on a desktop |
 | Clipboard | egui-winit (arboard) | egui's copies mirrored to `ClipboardManager` after each frame, pastes read from it (`src/android/clipboard.rs`) |
 | Browser links (`platform::open_url`) | `ctx.open_url` (webbrowser) | `ACTION_VIEW` Intent from the activity (`jni::open_url`); eframe's `links` feature isn't built for Android |
-| System bars | — | hidden (immersive mode): the navigation bar — Back / Home / Recents or the gesture pill, the right edge in landscape — and the status bar; a swipe from the edge shows them for a moment, translucent over the editor, and they go again by themselves (`src/android/system_bars.rs`: API 30+ `WindowInsetsController.hide(systemBars)` with transient-by-swipe, before that the sticky immersive view flags; asked at start and again on focus regained / keyboard down, on the Java main thread). `RUSTUDIO_SYSTEM_BARS=1` keeps them. The camera hole's side stays letterboxed in landscape (the cutout mode isn't changed: the chrome doesn't pad by the cutout inset yet) |
+| System bars | — | hidden (immersive mode): the navigation bar — Back / Home / Recents or the gesture pill, the right edge in landscape — and the status bar; a swipe from the edge shows them for a moment, translucent over the editor, and they go again by themselves (`src/android/system_bars.rs`: API 30+ `WindowInsetsController.hide(systemBars)` with transient-by-swipe, before that the sticky immersive view flags; asked at start and again on focus regained / keyboard down, on the Java main thread). `RUSTUDIO_SYSTEM_BARS=1` keeps them |
+| Display cutout (the camera hole / notch) | — | the window goes under it on the screen's short edges (`layoutInDisplayCutoutMode` shortEdges, API 28+, set on the window's attributes from the Java main thread at start: `src/android/cutout.rs`, `jni::set_layout_in_display_cutout_mode`) where Android had letterboxed the hole's whole side in landscape, black, like the navigation bar's strip before; the editor pads itself by the hole's safe insets instead — `App::ui` lays the frame out in a child `Ui` that ends short of the hole (`Cutout::child`, as keyboard.rs's `shrink` takes the keyboard's room), the strip painted the window's colour, and the insets are egui's safe-area insets too (`Cutout::before_frame`, with the keyboard's bottom), so windows, menus and popups keep off it. The insets come from `jni::display_cutout_later` on the Java main thread, never waited for: at start (again every ½ s until the window has insets), on focus regained and after a resize (a rotation moves the hole: three readings over the second after). A played game lies inside the padded area — its view and GUIs never reach the hole, so the engine's `DeviceSafeInsets` stay zero; drawing the 3D view under the hole with only the GUIs inset would need those first. `RUSTUDIO_CUTOUT=0` leaves the window out of the cutout, as before |
 | Back button | — | closes what is open on top (Escape); in Play opens / closes the Roblox menu (Escape's job, as Back does in Roblox's app; its Leave ends the session, as the Stop button at the game's top right does); otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Roblox menu and chat in Play | Esc and `/` | the top bar over the game view is upstream's Luau one (`players_chat_ui.luau`: `CoreGui.TopBarApp`, the Roblox button and the unibar pill with the menu and chat buttons, drawn as GUI and so hit by fingers like any button; the chat button opens the chat window with its box, the keyboard comes up for the box) when the CoreScripts are off, and Roblox's own TopBarApp / Chrome unibar when they run (Settings > rustudio > Play > CoreScripts). `SetCore("TopbarEnabled", false)` hides it; `GuiService.TopbarInset` is the bar's free area either way (`World::topbar_inset`, upstream's) |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
@@ -127,8 +128,8 @@ xbuild quirks worth knowing (commit e67b501):
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below) — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
 | Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
-| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
-| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`) |
+| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root — and since Android 11 the Files apps can't open `Android/data` either, so the start after a crash copies the report, the session logs (`src/android/logcat.rs`: this run's and the crashed run's) and the app's own `logcat -d` into **`Download/rustudio/rustudio-logs-<stamp>.txt`**, a file any Files app shows and a user can send; Help > Copy Logs to Download does the same at any time: `src/android/logs.rs`, a `MediaStore.Downloads` row the app inserts, no permission needed). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
+| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`). The desktop's own check (`gpu_health::check` in `App::ui`, which panics on a lost device so a desktop run ends with a report) is not run on Android: it ran before `gpu_watch` got its turn, and a 2026-11-24 device — 7.2 GB resident after four minutes of a 288,000-instance place, the driver out of memory — crashed in it (`gpu_health.rs:88`) instead of saving the place and relaunching |
 | Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output (and logcat) at every start says how Roblox's servers are reached, phase by phase — DNS, a TCP connect to the first IPv4 and the first IPv6 address, an HTTPS GET — with the time each took; `rustudio --network-check` prints the same on a desktop. Every agent resolves a host IPv4 first (`rustudio_account::http`): a network that advertises an IPv6 that doesn't route — some phones' Wi-Fi and mobile networks — otherwise cost every new connection a connect timeout, and the app "worked, but very slowly". Connects time out after 10 s; one agent (connection pool) per purpose for the process, so an asset doesn't pay DNS, TCP and TLS twice over |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
@@ -189,8 +190,8 @@ provides or still has to.
 | `OnScreenKeyboardVisible / OnScreenKeyboardSize / OnScreenKeyboardPosition`, `TextBoxFocused / TextBoxFocusReleased`, `TextBox.ReturnPressedFromOnScreenKeyboard` | focus events fire (`play_game.rs` 247); keyboard size zero | the soft keyboard comes up for a focused TextBox and goes with its focus (`keyboard.rs` `end_frame`, `gui::share().focus`); the user hiding it releases the focus (FocusLost). While it is up for a game's TextBox it lies over the view, which slides up to show the box (`Editor::keyboard_pan`, src/viewport.rs), and `OnScreenKeyboardVisible / Position / Size` report it in the game's coordinates (`touch_input::soft_keyboard`, `runtime_ext.rs` `device_prop`); Enter on a touch screen fires `ReturnPressedFromOnScreenKeyboard` before `FocusLost` (gui_input.luau `lose`) |
 | `HapticService.IsVibrationSupported / IsMotorSupported / SetMotor / GetMotor` | gamepad-only flags, in-memory motor table (`gui_input.luau` 1796-1845) | `jni::vibrator_info()` (hasVibrator, hasAmplitudeControl) and `jni::vibrate(ms, strength)` — **wiring to do**: `UserInputType.Touch` supported, `VibrationMotor.Large` (and `Small` when amplitude control exists) |
 | `HapticEffect:Play / Stop`, `HapticEffect.Type` presets | simulated durations (UIHover .035 s, UIClick .055, UINotification .4, GameplayCollision .3, GameplayExplosion .8) | `jni::vibrate_pattern` (VibrationEffect.createWaveform) — **mapping of each preset to do** |
-| `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` ContextActionService section); with the CoreScripts on, Roblox's own ContextActionTouch draws the buttons (PlayerGui `ContextActionGui`) from `BoundActionAdded / Removed / Changed` and answers `GetButton` through `GetActionButtonEvent` / `FireActionButtonFoundSignal`, as StarterScript starts it on a touch screen (`UserInputService.TouchScreenEnabled`, RobloxScriptSecurity, is `TouchEnabled`); without them no buttons | **to do**: this build's own buttons when the CoreScripts are off (70×70 ImageButton right of the thumbstick) |
-| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`); `TopbarInset` in Play is the top bar's free area — from the end of the menu and chat buttons (128 px with the chat button, 72 without: `gui::fallback_topbar_inset`; the CoreScripts' own `GuiService:SetTopbarInset` when they run) to the viewport's right edge, 58 high — and `GetPropertyChangedSignal("TopbarInset")` fires when the viewport or the chat button changes (`gui_input.luau step_topbar`, upstream's; LBG's ClientRenderer and TopbarPlus wait on it); an empty Rect in the edit DataModel; a `TopbarSafeInsets` ScreenGui is that rect (TopbarPlus's icons: starts after the buttons, 58 high; `gui_input.rs` roots, `runtime_ext.rs gui_rect`) | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only |
+| `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` ContextActionService section); with the CoreScripts on, Roblox's own ContextActionTouch draws the buttons (PlayerGui `ContextActionGui`) from `BoundActionAdded / Removed / Changed` and answers `GetButton` through `GetActionButtonEvent` / `FireActionButtonFoundSignal`, as StarterScript starts it on a touch screen (`UserInputService.TouchScreenEnabled`, RobloxScriptSecurity, is `TouchEnabled`); without them no buttons | without them, this build's own (`crates/rustudio-engine/src/domains/context_action_touch.luau`, started by `gui_input.luau start_touch_buttons` in Play on a touch screen once the LocalPlayer's PlayerGui is there): Roblox's ContextActionTouch rebuilt the way it builds — `PlayerGui.ContextActionGui.ContextButtonFrame` (30 % × 50 % of the screen from (70 %, 50 %)), a 45 × 45 `ContextActionButton` ImageButton per action (35 × 35 on a screen 320 tall or less) at one of its seven places, its `ActionIcon` / `ActionTitle` from `SetImage` / `SetTitle`, `SetPosition` moving it, the frame visible while `PreferredInput == Touch` and `GuiService.TouchControlsEnabled` — so a game that finds the button with `GetButton` and restyles it finds what it finds in Roblox. A finger on a button runs the handler with `Begin`, its moves `Change`, its lift `End` (a lift after it dragged off the button: `Cancel`) through `ContextActionService:CallFunction` (RobloxScriptSecurity, new in `library.luau`: Roblox's own ContextActionTouch presses its buttons with it too, so with the CoreScripts on the buttons now work as well as show). Test: `touch_buttons_without_the_core_scripts` |
+| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`); `TopbarInset` in Play is the top bar's free area — from the end of the menu and chat buttons (128 px with the chat button, 72 without: `gui::fallback_topbar_inset`; the CoreScripts' own `GuiService:SetTopbarInset` when they run) to the viewport's right edge, 58 high — and `GetPropertyChangedSignal("TopbarInset")` fires when the viewport or the chat button changes (`gui_input.luau step_topbar`, upstream's; LBG's ClientRenderer and TopbarPlus wait on it); an empty Rect in the edit DataModel; a `TopbarSafeInsets` ScreenGui is that rect (TopbarPlus's icons: starts after the buttons, 58 high; `gui_input.rs` roots, `runtime_ext.rs gui_rect`) | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only. With the system bars hidden and the editor laying the game out short of the display cutout (`src/android/cutout.rs`) all four are zero today, so the constant answer is the right one on a device |
 | `StarterGui.ScreenOrientation`, `PlayerGui.ScreenOrientation / CurrentScreenOrientation` | stored (`start_page/builtin.rs` 144); `CurrentScreenOrientation = LandscapeLeft` | `jni::set_requested_orientation` + `jni::current_orientation()` — **wiring to do**: apply at Play start, restore `sensorLandscape` at stop |
 | `Player:GetMouse()`, `Mouse` while playing | desktop pointer | **to do**: the first touch stands in (as Roblox does) |
 | `VRService`, gamepads | stubs | unchanged |
@@ -336,6 +337,40 @@ Block buttons only with the next spawn's re-send). `RUSTUDIO_TOUCH=0` (the
 (the keyboard-and-mouse reading of fingers) on a device; `=1` turns the
 game's touch on on a desktop with a touch screen.
 
+**ContextActionService's touch buttons** (`BindAction(name, fn, true,
+...)`): Roblox's ContextActionTouch CoreScript draws one per action with
+`createTouchButton` in `PlayerGui.ContextActionGui` and presses it with
+`ContextActionService:CallFunction(name, state, inputObject)`
+(RobloxScriptSecurity). With the CoreScripts on (Settings > rustudio >
+Play > CoreScripts) that script runs here; without them
+`crates/rustudio-engine/src/domains/context_action_touch.luau` does its
+job, built from its source (Roblox-Client-Tracker
+`scripts/CoreScripts/CoreScripts/ContextActionTouch.lua`): the same
+`ContextButtonFrame` (the screen's lower-right 30 % × 50 %), the same
+45 × 45 `ContextActionButton` ImageButtons (35 × 35 on a screen 320 tall
+or less) at its seven places — the first free one, `SetPosition` moving
+a button —, `ActionIcon` and `ActionTitle` children from `SetImage` /
+`SetTitle` (SourceSansBold 18, white, stroked), its up / down images
+(assets 97166444 / 97166756), `Maximum of 7 allowed touch buttons` as
+its warning, the frame shown while `PreferredInput == Touch` and
+`GuiService.TouchControlsEnabled`; `GetButton` gets the button through
+`GetActionButtonEvent` / `FireActionButtonFoundSignal`. A finger
+landing on a button runs the handler with `UserInputState.Begin` and
+the finger's InputObject, its moves with `Change`, its lift on the
+button with `End`, and a lift anywhere else after it dragged off with
+`Cancel` (Roblox's AWAY state; heard from `UserInputService.InputEnded`,
+since the button no longer has the finger) — `CallFunction` is new in
+`library.luau` for both scripts (the CoreScript's buttons showed but did
+nothing before, the method missing), runs the handler at the binder's
+identity and reports its error as the script's. `gui_input.luau
+start_touch_buttons` starts the drawer once in Play on a touch screen
+(`touch_input::game_touch`) when the LocalPlayer's PlayerGui exists and
+the CoreScripts aren't running (`core_scripts.scripts` empty); the
+PlayerModule's own thumbstick and jump button are theirs as before. Test:
+`runtime.rs touch_buttons_without_the_core_scripts` (the button, its
+children, `GetButton`, a game script refused `CallFunction`, Begin / End
+and Begin / Cancel from two fingers, `UnbindAction` taking it away).
+
 **The game's canvas: View > Play Fills the Screen** (on by default on
 Android; `RUSTUDIO_PLAY_FULL=1` / `0` sets it, saved with the layout).
 While a game is played it alone covers the window, at the display's own
@@ -412,7 +447,21 @@ text bar on it, below) — as Android pans a window to its focused field:
 never past the box's own top edge leaving the view, never further than
 the keyboard covers the view — and back when the keyboard goes. What
 slides above the view's panel is clipped; the fingers that land there are
-the toolbar's (`Zones::viewport` is the visible part). The game's scripts see the
+the toolbar's (`Zones::viewport` is the visible part). **The status bar
+is not drawn while the keyboard is up**, in either mode (`RustudioApp::ui`,
+`Keyboard::room` > 0): it carries nothing a typist needs, a 2026-11-25
+report had its Team Create / camera strip over the text being typed, and
+in the panel mode it took a line off the few a landscape phone has left
+above the keyboard. **Neither are the menu bar, the test bar and the
+ribbon while an editor field has the keyboard** (`Keyboard::typing_layout`:
+a field of the editor's own focused and room made for the keyboard — not
+a game's TextBox, which moves nothing): a landscape phone is about 410 pt
+tall, the keyboard and the text bar take about 200 of them and the three
+top panels about 140, which left the script editor two or three lines
+("still can't see what I'm typing", 2026-11-25); without them the dock
+gets the whole strip above the keyboard, eight to ten lines. They come
+back with the keyboard going down (the focus released, Back, Done). The
+game's scripts see the
 keyboard where Roblox's client reports it: `UserInputService.
 OnScreenKeyboardVisible / OnScreenKeyboardPosition / OnScreenKeyboardSize`
 in the game's coordinates (`touch_input::set_soft_keyboard`, read by
@@ -420,6 +469,98 @@ in the game's coordinates (`touch_input::set_soft_keyboard`, read by
 `TextBox.ReturnPressedFromOnScreenKeyboard` before `FocusLost` (a
 runtime test drives both through the Lua side on the host:
 `runtime.rs soft_keyboard_reaches_the_scripts`).
+
+**What the keyboard types goes through an `InputConnection` of the
+app's own** (`src/android/ime.rs`, `tools/android/java/dev/rustudio/studio/ImeBridge.java`).
+A NativeActivity has no view that offers the keyboard one, so the
+keyboard ran in the framework's fallback mode: single characters came as
+key events (winit's `Event::Text`), and everything else a keyboard does —
+a word composed with suggestions and committed, an auto-correction, a
+swiped word, its own paste key, deleting a word — came as a
+`KeyEvent.ACTION_MULTIPLE` whose characters only the Java object carries,
+which native code never sees. Text went missing, keyboards that both
+compose and send keys (Samsung's) delivered some of it twice or garbled,
+and in the script editor, where a keyboard composes every word, nothing
+much arrived at all. The fix is a Java class: `ImeBridge` is a 1 × 1
+`View` added to the activity's content (`addContentView`), focusable only
+while the editor wants the keyboard, whose `onCreateInputConnection` hands
+the keyboard a `BaseInputConnection` over a `SpannableStringBuilder` that
+mirrors the focused field — text, selection, the keyboard's composing
+span — so the keyboard works as it does in an `EditText`. Every change
+the keyboard makes to the mirror (one call, or the batch it bracketed with
+`beginBatchEdit` / `endBatchEdit`) is found by comparing the mirror before
+and after and reported to the editor as one replacement, code points
+`[a, b)` becoming a string with the selection at `[selStart, selEnd)`,
+through a native method (`nativeOp`, on the Java main thread, queued for
+the editor's thread). The editor applies one replacement a frame from
+`App::raw_input_hook`: an egui `TextEdit` gets its cursor range set to
+`[a, b)` (`TextEditState`) and the text as `Event::Text` (Backspace for a
+deletion, Enter for the action key), which it handles as typing over the
+selection; a Roblox TextBox gets the same as a selection and an insertion
+in `Gui::keyboard` (`gui::share().tb_ime`). At the end of the frame the
+field's text (egui's `OutputEvent::FocusGained / ValueChanged /
+TextSelectionChanged / Clicked` carry it; a TextBox's state is
+`share().tb_live`) is hashed (FNV-1a over code points, the same on both
+sides) and checked against what the Java side computed of its mirror; a
+difference — the editor auto-indented an Enter, closed a bracket, the
+user tapped the caret elsewhere, pasted, undid, a hardware key — sends the
+Java side the editor's state (`setState`, with the number of the last
+operation it includes, so a state behind an operation in flight is left
+for the next one; the keyboard is restarted when its composition would be
+stale). The editor's text is the truth throughout, so a disagreement
+costs at most a dropped suggestion. The script editor's field is
+`KIND_CODE`: no suggestions, auto-correction or capitals
+(`TYPE_TEXT_FLAG_NO_SUGGESTIONS` plus the visible-password variation,
+which is what Samsung's keyboard honours); a multi-line TextBox is
+`KIND_MULTILINE` (Enter is a line); everything else `KIND_TEXT` (Enter is
+the action key: the field commits, as Enter from a hardware keyboard
+does). Key events the keyboard still sends — Enter, Delete, a character —
+are applied to the mirror and swallowed there, so they aren't typed a
+second time through the window; arrows and the rest pass through to
+native code as before. The keyboard's own Select all / Cut / Copy / Paste
+(`performContextMenuAction`) work on the mirror and the system clipboard.
+A character that nonetheless arrives through the window as a key event
+while the keyboard is up through the bridge would be the same character
+again: key-event text (winit's `Event::Text`; never `Event::Key`) is held
+back one frame and dropped if an operation of the keyboard's arrives
+meanwhile — the key event can reach the window a frame before the
+operation — else typed (`ime.rs key_text`): a hardware keyboard, whose
+keys reach the window before any input method and so never come through
+the bridge, types as before, a frame later. Logcat says which way a
+doubled character came: `ime: op …` for the bridge's, `ime: N key-event
+character(s) dropped / typed` for the window's.
+
+The doubling a 2026-11 device had ("s" typed as "ss", a paste pasted
+twice) was the bridge's own: every operation a keyboard makes outside a
+`beginBatchEdit` / `endBatchEdit` pair of its own was reported twice —
+`BaseInputConnection`'s `commitText`, `setComposingText`,
+`finishComposingText` and `deleteSurroundingText` bracket their work with
+those two calls, and the bridge's overrides of them counted the inner
+pair as a batch of the keyboard's and reported it as it ended, then
+reported the operation again on its own account (`ImeBridge.java
+mutate`; keyboards that batch every call, as Gboard does, were reported
+once, which is why the bridge looked right with one keyboard and typed
+"ss" and pasted twice with another). The batch count is now held up
+through the operation's run, so the inner pair reports nothing. The
+editor also drops an operation that merely repeats the one before it —
+the next number, the same replacement, the mirror's hash the same after
+it, which a replacement made anew cannot leave (`ime.rs repeats`) — and
+logs `ime: op N reports op M again … dropped`.
+
+The class is compiled by `tools/android/build-dex.sh` (javac → d8, with
+an SDK's `android.jar` and `d8`; run it when the Java changes) into
+`assets/android/ImeBridge.dex`, which is committed, built into the native
+library with `include_bytes!`, and loaded at start by `ime::install`
+with an `InMemoryDexClassLoader` whose parent is the activity's class
+loader; `nativeOp` is bound with `RegisterNatives` — the APK build needs
+no Java toolchain, Gradle or SDK, and the manifest's `NativeActivity`
+stays. logcat says `ime: bridge loaded (N byte dex)` and `ime: input
+connection view attached`, then `ime: show for Code, N chars, selection
+a..b`, `ime: op 12 replace 3..3 with 5 chars, selection 8..8`, and `ime:
+op 12 left the field another text than the keyboard's mirror: the mirror
+takes the editor's` when a resync happened. Should the dex fail to load
+(`ime: the bridge's class couldn't be loaded (…)`), the keyboard is asked
+up through the activity as before, in the fallback mode.
 
 The keyboard is shown and hidden by `keyboard.rs` itself
 (`Keyboard::end_frame`), not by egui-winit. egui-winit shows it while
@@ -433,10 +574,13 @@ that moves its caret included (`egui-winit` 0.36 `handle_platform_output`,
 again on each tap into a field, whatever the editor's own fields did
 (they had already stopped asking for the focus every frame). So at the
 end of each frame the IME output is taken out of egui's platform output
-(egui-winit never asks winit for the keyboard) and the activity is asked
-directly, as winit would, when what wants the keyboard changes: a focused
-egui text field, or a Roblox TextBox with the focus — the game's in Play,
-a plugin widget's — which egui-winit never showed it for. Up at once
+(egui-winit never asks winit for the keyboard) and the bridge's view is
+asked (`ime::show` / `hide`: `InputMethodManager.showSoftInput` for the
+view, with the field's kind, text and selection — or the activity
+directly, as winit would, without the bridge) when what wants the
+keyboard changes: a focused egui text field, or a Roblox TextBox with the
+focus — the game's in Play, a plugin widget's — which egui-winit never
+showed it for. Up at once
 (`soft keyboard asked up for a text field` / `a TextBox` in logcat), down
 once nothing has wanted it for 250 ms (`asked down`), so a field losing
 the focus for a frame or the focus moving between fields keeps it up, as
@@ -453,16 +597,25 @@ and a tap on the field starts it again. A zero with nothing focused takes
 the room away at once.
 
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
-own, egui-winit has no clipboard on Android, and the keyboard's own paste
-key never reaches a NativeActivity (its text arrives as key events, which
-winit drops — the clipboard isn't involved). So while the keyboard is up
-for anything, a **text bar** stands in a band right above it
-(`src/android/text_bar.rs`, `HEIGHT` points; part of the room keyboard.rs
-makes, or of what the view slides up for a game's TextBox): Cut, Copy,
-Paste and Select all for an egui field, Paste and Copy for a Roblox
-TextBox (a game's in Play, a plugin widget's), fed to egui as the events
-the shortcuts would be (`Event::Cut` / `Copy` / `Paste(text)` / Ctrl+A)
-through `raw_input_hook` on the next frame. egui's `TextEdit` answers
+own, and egui-winit has no clipboard on Android. So while the keyboard is
+up for anything **without the input-connection bridge** (its dex failed
+to load: `ime: bridge …` in logcat says), a **text bar** stands in a band
+right above it (`src/android/text_bar.rs`, `HEIGHT` points; part of the
+room keyboard.rs makes, or of what the view slides up for a game's
+TextBox — `text_bar::in_use`): Cut, Copy, Paste and Select all for an
+egui field, Paste and Copy for a Roblox TextBox (a game's in Play, a
+plugin widget's), fed to egui as the events the shortcuts would be
+(`Event::Cut` / `Copy` / `Paste(text)` / Ctrl+A) through `raw_input_hook`
+on the next frame. With the bridge there is no bar: the keyboard's own
+paste, clipboard panel and Select all reach the field through the input
+connection (`commitText`, `performContextMenuAction`), and the bar only
+took a band of the screen — a dark strip labelled "Text" / "TextBox" over
+a game in Play, where the keyboard lies over the view, which a 2026-11
+report called a black bar covering the text. Whatever room the keyboard
+takes is painted the window's colour (`Keyboard::shrink`): the band
+between the panels' end and the keyboard's top was left unpainted, black,
+the moment the keyboard went before the next height reading, and while
+the bar's band was reserved with the bar not up. egui's `TextEdit` answers
 them; a TextBox gets them in `Gui::keyboard` (crates/rustudio-engine/src/gui_input.rs): Paste
 types the clipboard's text in (a single-line box gets line breaks as
 spaces), Copy copies the box's text. The `Editor::shortcuts` Copy / Cut /
@@ -471,8 +624,18 @@ the focus, as they do for an egui field. A long press on an egui text
 field still opens the same entries as a menu (`src/android/text_menu.rs`,
 which keeps the field's focus for its tap — egui's rule is a click
 outside takes it — and puts back the selection egui's right click
-collapsed), and the bar keeps the focus the same way. Objects are cut,
-copied and pasted from the Explorer's long-press menu as before.
+collapsed). The bar keeps the focus too, and had to be more careful
+about it: egui judges the click outside as the *field* draws, before the
+bar does, so the field had lost the focus by the time the bar's turn
+came, the bar (drawn for a focused field) wasn't drawn in the very frame
+the tap completed in, and its button never saw the click — the bar did
+nothing on a device. From a press that begins on the bar to its release,
+egui's rule is set to `SurrenderFocusOn::Never` (`TextBar::before_frame`,
+from the raw input), and put back after. Objects are cut, copied and
+pasted from the Explorer's long-press menu as before. The keyboard's own
+clipboard key pastes through the input connection as well (above), which
+needs no clipboard access of the app's: the keyboard reads it as the
+default IME.
 
 The clipboard itself is `src/android/clipboard.rs` over
 `ClipboardManager`, asked on the editor's thread (since API 24 the
@@ -503,6 +666,98 @@ that are taps, long presses for its menus — and has none of the editor's
 reasons to tell a scroll from a drag. Switching off lets go of anything
 held; a finger down at a switch stays egui's until it lifts, so no press
 is left half delivered. Once a place opens, the layer is on.
+
+### Publish on a phone
+
+Publish / Save to Roblox copied the whole tree (`Document::save_snapshot`)
+to encode it on the upload's thread, so the editor went on meanwhile. A
+place of some size doubled in memory at the press of Publish and the
+system killed the process on the spot — no panic, no signal, so no crash
+report; `logcat` says `lowmemorykiller` / `am_kill`, which the logs file
+above now carries. On Android the place is encoded on the editor's thread
+from the tree itself, as Save to File does (`cloud_ui.rs start_save`,
+`cloud: place encoded for the upload in 0.8s, N bytes` in logcat), and
+only the bytes go to the upload's thread.
+
+### Luau completions in the script editor (`src/luau_intel`)
+
+The script editor's row of completions above the text (plugins'
+`ScriptEditorService` items were all it had) now comes first from the
+place and Roblox's API, ported from Android-rbxl's `luau_intelligence.rs`
+(the "Sora" completions): globals and libraries, `game:GetService("…")`,
+the services' children by name, classes' properties / methods / events,
+`Enum.X.Y`, the script's locals, functions and parameters, the members a
+required ModuleScript returns (instance and string requires, `./`, `../`,
+`@self`) and require paths; a line above it shows the signature of the
+call the caret is in with the current parameter in bold. A tap on an item
+replaces what was typed of it (`apply_suggestion_at`) and puts the caret
+after it. The place's index (`ProjectIndex`, every script's source with
+the open tabs' unsaved text over it) is cached by a fingerprint and
+rebuilt when the place changes, at most every four times its own cost
+(`luau intel: place indexed in N ms` in logcat when that is over 50 ms);
+the completion itself is computed when the text or the caret changes. The
+API tables (`api_data.rs`, static) and the reflection questions
+(`schema.rs`, over `rbx_reflection_database`) came along; the port's 47
+unit tests run on the host (`cargo test --lib luau_intel`).
+
+**A tap on a completion keeps the keyboard up** (the 2026-11-25 report:
+"a suggestion tap closes the keyboard"). egui's rule is that a click
+outside the focused widget surrenders its focus, and it judges the click
+as the *field* draws — so the editor had no focus for the rest of the
+tap's frame, the keyboard's mirror ended its session on "no field"
+(ime.rs), the focus came back only through `request_focus` after the
+field (the built-in items; the plugins' items never asked for it), and
+the keyboard went down after `HIDE_AFTER` whenever the tap outlasted a
+frame or two. Now the strips register their rects every frame
+(`keyboard::keep_focus_in`) and `Keyboard::before_frame` holds egui's
+`surrender_focus_on` at `Never` from a press that began inside one to
+the frame of its release — the text bar's device (above), made general;
+both accept paths put the caret after the word and keep the focus; the
+keyboard is never asked down while a finger is on the screen
+(`Keyboard::end_frame`); and the editor hands the mirror its text at the
+end of every frame it draws (`ime::field_text`), since the mirror learned
+the text from egui's change events only, which a completion taken
+outside the field never made — the keyboard's next letter was placed by
+the old text. The log line for a hide now names what has the focus.
+
+**Enter, then a letter on the line before** (the same report). After each
+of its operations the keyboard was told nothing of where the caret now
+was: a TextView calls `InputMethodManager.updateSelection` (and
+`updateExtractedText`, for a keyboard that asked to follow the text)
+after every edit, its own included, and a keyboard keeps a model of the
+caret from those calls and composes and deletes by it. `ImeBridge.java`
+now does the same at the end of every operation (`Conn.finish`:
+`tellSelection`, and `getExtractedText` remembers a monitor request), and
+`ime::unshift` moves a reported insertion to where the mirror's caret
+says it was made when a plain diff put it at the end of a run of equal
+characters (Enter at the end of a line above other lines came back as a
+line break *at the start of the next line*, with the caret moved back a
+frame later).
+
+**Auto-indent and Tab** (`src/code_indent.rs`, 5 host tests: `cargo test
+--lib code_indent`). Studio's Auto Indent Rule, Tab Width and Indent
+Using Spaces settings drive it: Enter keeps the previous line's
+indentation and goes one level deeper after a line that opens a block
+(`then`, `do`, `function (...)`, `repeat`, `else`, `{`, `(`); Enter right
+before the block's closer (`if x then|end`, `{|}`) puts the closer on a
+line of its own at the outer level; a closer typed at the start of a line
+(`end`, `else`, `elseif`, `until`, `}`) steps out to its opener's
+indentation (a small Luau lexer skips strings and `--` comments; typing on
+past it, `endTime`, steps back in). On the desktop (and a hardware
+keyboard) the script editor applies it after egui's `TextEdit` handled
+the key (`script_editor::auto_indent`: the text inserted is found by the
+caret). The soft keyboard's text, though, goes through the mirror: had
+the editor indented after the fact, the mirror would have been a frame
+behind and the keyboard's next letter placed by the unindented text. So
+`Conn.codeFixup` asks the native side *inside* the keyboard's operation
+(`nativeCodeFixup` → `ime::native_code_fixup` → the same
+`code_indent::on_insert`) and makes the replacement on the mirror before
+the operation is reported: the one replacement the editor applies holds
+the indentation, and field, mirror and keyboard agree. The soft keyboard
+has no Tab key: the editor's header shows **Tab** and **Untab** while the
+field is focused (one unit at the caret, or the selection's lines in and
+out; `code_indent::tab` / `untab`), held in focus like the strips. The
+dex was rebuilt (`tools/android/build-dex.sh`, 18 088 bytes).
 
 ## The first Play on a phone: Studio's content
 
@@ -603,10 +858,62 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   `load_trace::note_compile`) — and once more eight seconds in
   (`[startup] 8 s into Play; K scripts compiled …`: modules compile as
   they are required, so most of a big game's compiling comes after the
-  start line). `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
+  start line). **Since 2026-11-25 a place's scripts compile for Play in
+  the background as soon as the place is open**
+  (`bytecode_cache::precompile`, from `Editor::set_document`: one thread,
+  every Script / LocalScript / ModuleScript source of 1 KB and more,
+  into the memory and (4 KB and more) disk caches; a line `[startup] N
+  of M scripts (K KB) precompiled for Play in T ms` when it is through;
+  `RUSTUDIO_NO_PRECOMPILE=1` skips it) — Roblox has a place's scripts
+  compiled by the time the player is in, and rustudio's first Play of a
+  place compiled everything as the game started, finding the cache only
+  from the second Play on. **Compiling is a small part of the start**:
+  LBG on a 2-core desktop (debug build) starts Play in 1.4–1.6 s, of
+  which the 209 scripts loaded at start compile in 411 ms cold and 41 ms
+  from the cache; the rest is making the two Luau VMs (`runtimes made`
+  ≈ 340 ms: `Runtime::new` + `install_side` each), copying the DataModel
+  for the server (≈ 350 ms) and replicating it to the client (≈ 350 ms),
+  the server scripts' first run (≈ 140 ms) and the player's set-up
+  (≈ 120 ms). After the start line the game's own first frames are the
+  wait a player feels: LBG's client runs about 2 s of script in its first
+  eight frames (`ClientRenderer` 1 s, TopbarPlus' `IconController` 0.4 s,
+  the camera module, the HUD scripts) and the server 1.2 s in its first
+  fourteen (`LimitedShopTimer`'s DataStore session, `Bootstrap.Init`),
+  which `RUSTUDIO_SCRIPT_PROFILE=live` (`--bench`'s `scripts` report,
+  docs/PROFILING.md) shows per script. A phone's own numbers: its
+  `[startup] Play started in …` line is in the session log. (Under
+  `--fixed-dt` the same start takes 55 s on the desktop, all of it in
+  `server head start`'s six frames and none of it script time (312 ms
+  for the whole run): a harness artefact of the simulated clock —
+  probably the synchronous decodes it asks for (`gui.rs`, `media.rs`
+  `sim_clock::on()`), not checked — not the phone's.) `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
   prints the full `LOADTRACE` trail instead: the place read and parsed,
   every frame over 100 ms with its biggest bench sections, the asset
-  queues as they change. What is known of the cost without a trace:
+  queues as they change, each line with the resident size (`[rss N MB]`,
+  what `lmkd` judges the app by).
+
+  Big places and memory (2026-11-24, a 44 MB place of 996 380 instances
+  that crashed on open, and a 30 MB one that froze at Play): the file's
+  25.6 M property values parsed to ~4 GB, and Play held four copies of
+  the place. Now (`rbx_binary` vendored, marked rustudio):
+  - values equal to what `Document::prop` falls back to aren't stored
+    (`doc.rs implied_default`; names read straight from a property map
+    are always kept): 12.3 M of 25.6 M stored, every read the same
+    (`implied_default_tests`; `RUSTUDIO_TEST_PLACE=<.rbxl>` runs the
+    check over a real place). `RUSTUDIO_KEEP_DEFAULTS=1` stores them all;
+  - an instance's property list isn't sized for every property its
+    class has (2.2 GB for a million instances before a value was read),
+    and each class's instances share their common values as soon as the
+    file's chunks for that class end, not after the whole file;
+  - the play worker gets Play's server copy made once
+    (`start_play_threaded`); its `start_play` takes it as the server
+    DataModel instead of copying it again (a fourth copy, ~1 GB and ~6 s);
+  - copies size their tables once and skip the reference fix-up for
+    instances without references (`rbx_dom_weak` `clone_multiple_into_external`).
+  Desktop measure of that place: open peak 4.0 → 2.6 GB (19 → 10.5 s);
+  Play out of memory past 6 GB → running at 5.7 GB. Left: Play's start
+  still blocks the UI (~12 s there) while the main thread copies the
+  place and the worker builds the client copy and starts the scripts. What is known of the cost without a trace:
   LBG is 7.3 MB of Luau in 685 scripts, 67 of them `--!native` (1.4
   MB — their machine code is no longer built as they load: they run
   interpreted for their first frames and `runtime.rs native_drain`
@@ -660,6 +967,89 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   the answer before any of that: the debug APK runs the editor at
   opt-level 1 with debug assertions in every crate, several times slower
   than the release APK.
+- **The main thread's own per-frame work in Play** is what a profile
+  capture of a big game shows first, and it is platform-independent: a
+  `--profile-capture` of LBG on the desktop (debug, `--no-render`,
+  2026-11-25, `--play-only --no-render --profile-capture`) had the main lane busy
+  10.4 ms a frame, 6.6 of them in `vp_input` — `gui_modal::modal_shown`
+  walking every descendant of the PlayerGui each frame the game held
+  the mouse, to see whether a Modal button is up (LBG's GUI is tens of
+  thousands of objects). It is an index kept from the change journal
+  now (`gui_modal::ModalIndex`, in `Gui`), a full walk once per
+  document. What is left on that lane is the game's: TopbarPlus'
+  `updateTopbar` at 4–56 ms a call, the GUI walk (`gui_walk`) at 27 ms
+  p95 when LBG's layout changes, `p9_collect` spikes to 300 ms while the
+  game's first clones become garbage, and the camera module's occlusion
+  raycasts (`popper`, 10 ms average over the first frames). The voxel
+  destruction behind LBG's craters (`VoxelClient.luau`: up to 400 pooled
+  debris parts with physics and a Heartbeat raycast loop,
+  `MaxSplitsPerHit` 4096 anchored pieces moved with `BulkMoveTo`,
+  `ClientDebrisPerHit` unlimited; the Virus Overlord's Infernal Blades
+  beam voxelises a 90-stud cube) is the game's own load, cut in half by
+  its Settings > Fast Mode (`S_FastMode` halves the debris) or off with
+  `S_NoDestruction`; the harness probe for it is
+  `tools/probes/voxel1.luau` (it needs the character on a
+  `VoxelOrigin` part — the spawn is not on one).
+- **"The viewport lags only while things spawn and fly" (2026-11-26,
+  LBG on a phone).** Reproduced on the desktop with
+  `tools/probes/burst.luau` (400 falling debris parts, 2000
+  anchored parts, 10 VFX parts a Heartbeat; `--play-only --no-render
+  --luau server tools/probes/burst.luau@9 --luau client
+  tools/probes/fpswatch.luau@5 --profile-capture`, tools/probes/README.md).
+  The render lane keeps 60 fps throughout; what drops is the gameplay
+  thread's rate — Heartbeats a second 30–36 → 8–18 while ≥ 50 debris
+  parts are awake (`fpswatch.luau`), single digits in the worst second
+  — so every script-driven thing (VFX tweens, the camera, voxel debris
+  moved by `BulkMoveTo`) moves in steps while the world itself stays
+  smooth. Two causes, both in the gameplay step:
+  1. *Physics over budget while the debris is awake.* ≈400 awake bodies,
+     2800 contact pairs, 6400 solver rows at 240 Hz: the step waits
+     6–8 ms for the busy physics pool (`pf_spawn`) and the hurried
+     environment ticks (`physics_hurry_tail`) take 1–7 ms more, every
+     gameplay step. That is the sustained part of the lag; on a phone
+     the pool's threads also share the big cores with the render thread.
+     On Android the pool now defaults to **two threads**
+     (`android::export_env` sets `RUSTUDIO_PHYSICS_THREADS=2` unless
+     `debug.rustudio.env` says otherwise): a phone has four fast cores at
+     most and the render, gameplay and UI threads are on them already;
+     with four workers one lands on a slow core and every fork-join tick
+     waits for it. Other knobs: `RUSTUDIO_PHYSICS_HURRY=0`,
+     `RUSTUDIO_PHYSICS_CATCHUP=0` (a hurried frame's environment ticks
+     are lost, as Roblox's throttle loses them, instead of caught up
+     between frames), `RUSTUDIO_SOLVER_SERIAL=1` (`mech.rs`
+     `PHYSICS_HZ`, `PHYSICS_SERIAL_MAX_AWAKE`); the game's own Fast Mode
+     halves the debris. The desktop harness (2 CPUs, swapping at LBG's
+     1.7 GB) is too noisy to rank these — a phone capture during a
+     burst is what decides them.
+  2. *One-off stalls when a script mass-edits parts.* LBG's server init
+     (`Bootstrap.Init.Loaders.workspace`, ≈15 s into Play) sets
+     `CollisionGroup` on 6500 map parts and `CanCollide` on 2600; a
+     dropped leaderboard destroys hundreds; the debris pool is
+     (un)anchored in batches. Each used to cost: a 300 ms
+     `render_snapshot_apply` (the viewport dropped the previous frame's
+     6500-entry property map on the main thread — now deferred to the
+     worker, `snapshot.rs discard`); a physics rebuild that re-created
+     and woke every one of those parts (`[physics] big rebuild: 6567
+     seeds` — a `CollisionGroup` write now sets the collider's groups in
+     place, and the marks a publish moves aside keep their property
+     names (`held_marks`) instead of becoming bare refs that rebuilt the
+     part whatever the property was; the client's copy of the map, which
+     its physics leaves alone until a body of its own comes near, no
+     longer seeds a rebuild for each replicated write either; a rebuilt
+     resting assembly also stays asleep under the rapier solver); and a
+     `scene_sync` that
+     re-read every part's draw (`ss_part_draw` 278 ms — non-visual
+     properties no longer mark a part for re-reading,
+     `scene.rs non_visual_prop`). What is left of the stall is the
+     script's own run (the writes cost 1–25 µs each, the init's
+     `PreloadAsync`, `Voxel:RegisterOrigin` 3600 calls, `GetDescendants`
+     over the whole map).
+  Script hot spots the same captures showed (`RUSTUDIO_SCRIPT_PROFILE=exact`):
+  TopbarPlus (`setDropdown` 573 ms, `GetTextSize` 841 calls),
+  `QueryDescendants` (Luau, 65 calls 346 ms), `GetTagged` 64 ms (the
+  TagCache rebuilds), `IconController` Heartbeat (`TweenService:Create`
+  2754×), the camera's Popper rays. `RUSTUDIO_SNAPSHOT_LOG=1` prints
+  the mass edits as they happen (docs/PROFILING.md).
 
 Switches for a device, which has no shell environment to launch from:
 
@@ -678,7 +1068,9 @@ back to FIFO), `RUSTUDIO_NO_PERF_HINT` (no ADPF hint session for the
 frame thread; below), `RUSTUDIO_TURNIP` (0|1|force), `RUSTUDIO_GPU_TURBO`
 (1), `RUSTUDIO_TU_DEBUG` (Turnip's flags; "Turnip driver" below),
 `RUSTUDIO_SYSTEM_BARS` (1: the navigation and status bars stay, instead of
-immersive mode).
+immersive mode), `RUSTUDIO_PHYSICS_THREADS` (the physics pool; 2 on a
+phone by default, "Frame time on a phone" above), `RUSTUDIO_PHYSICS_HURRY`,
+`RUSTUDIO_PHYSICS_CATCHUP`.
 
 ### The frame's pacing on Android
 
@@ -807,6 +1199,27 @@ will look up (nothing named `__clear_cache`), `llvm-readelf -d … | grep
 NEEDED` the libraries it may look in (no libc++_shared.so), and `llvm-nm
 librustudio_android.so | grep -E ' (__register_frame|__cxa_throw|_Unwind_RaiseException)$'`
 must show all three defined (`t`/`T`) inside the library.
+
+### Luau compiler level and fast flags: `RUSTUDIO_LUAU_OPT`, `RUSTUDIO_LUAU_FLAGS`
+
+Studio compiles scripts at Luau optimization level 1; the desktop build
+keeps that (a debugger's view of locals, upvalues and call sites matches
+the source). A phone build compiles at level 2 by default — inlining
+and loop unrolling, the level Roblox's own clients use — because a
+big game's interpreted scripts are most of a phone's frame
+(`bytecode_cache.rs optimization_level`). `RUSTUDIO_LUAU_OPT=0|1|2` sets
+it anywhere (`adb shell setprop debug.rustudio.env "RUSTUDIO_LUAU_OPT=1"`,
+relaunch); the bytecode disk cache keys on it (`salt`), so switching
+never reuses the other level's bytecode. `RUSTUDIO_LUAU_FLAGS=
+"LuauFlagA,LuauFlagB=false"` sets Luau fast flags (a name alone turns it
+on) before the first VM is made, for trying a flag the vendored Luau
+has (`runtime.rs luau_flags`). Neither changes what scripts see: a
+level-2 chunk behaves as a level-1 one, only `debug.info` line
+and name details of inlined calls differ.
+
+(Script speed is judged on the release APK — "Install the release APK
+to judge speed", above: the debug one runs the Luau VM and the engine
+with assertions and overflow checks, several times slower.)
 
 ## Turnip driver (Snapdragon) and PanVK (Mali): `src/android/turnip.rs`
 
@@ -1258,7 +1671,38 @@ release), `clipboard` (each copy put on the system clipboard, each read
 and its length, or "no clip"), `text menu` (open, cut, copy, paste,
 select all), `render quality` (each Automatic level change, with
 `RUSTUDIO_QUALITY_TRACE=1`) and `memory:` (the resident size each 256 MB
-it grows, with the place being opened: `src/android/memory.rs`). For a
+it grows, with the place being opened, followed by what the editor holds
+— the DataModel's instances, the renderer's meshes, slabs, textures and
+items, and the GPU allocator's account (`memory::gpu_line`, wgpu's
+`generate_allocator_report`: MB allocated and reserved, and the largest
+allocations by label — on a phone the GPU's memory is system memory,
+Turnip's heap is host memory, so this says how much of the resident size
+is the GPU's; a run of 2026-11-25 was lost to `Out of memory` at 5.3 GB
+resident with 173 MB of Lua heaps and 48 MB of meshes, and nothing said
+where the rest was) — and, during Play, the worker's own line every 15 s:
+the two Lua heaps, the two DataModels' sizes, and how many publications
+replaced the viewport's whole document instead of sending a delta — one a
+frame would be the viewport rebuilding its scene every frame:
+`src/android/memory.rs`, `play_worker.rs memory_log`;
+`RUSTUDIO_MEMORY_LOG=1` turns the worker's line on on a desktop). **All of
+these are in the session log** (`<cache>/rustudio/logs/session.log`,
+`src/android/logcat.rs`: the app's lines at Info and the graphics stack's
+warnings, 6 MB then rotated to `session-prev.log`; a new process rotates
+too, and **three previous runs are kept** (`session-prev.log`,
+`session-prev2.log`, `session-prev3.log`, `logcat::PREVIOUS`) — with one,
+the run that crashed was gone once its automatic restart had itself been
+left and the app started again before Help > Copy Logs: the 2026-11-25
+"the session log was not saved". The file is unbuffered (a killed process
+keeps every line) and synced to storage every 1.5 s and at a panic, a
+lost GPU device and the loop's end (`sync_session`), for the crash that
+takes the phone down with it)
+plus everything written to stdout and stderr (`capture_stdio`: the
+`[startup]` timings, `LOADTRACE`, Luau prints — the app's own pipe over
+android-activity's logcat forwarder, the lines still reach logcat under
+`RustStdoutStderr`), and the logs export (Help > Copy Logs to Download,
+and the start after a crash) carries the end of all of them, oldest first — logcat's own buffer held 20 s of the app
+on the Note20 whose export of 2026-11-25 had none of the `memory:` lines
+that said when and into what the memory had grown. For a
 crash: `adb logcat -b crash -d` (debuggerd's tombstone: the
 signal, an abort's message — `memory allocation of N bytes failed` for
 one out of memory — and every thread's stack) and `adb shell dumpsys
@@ -1582,12 +2026,15 @@ also echoed to logcat at the next start.
    is done), orientation; a selection
    in a game's TextBox (the text bar's Copy takes the whole text, its
    Cut and Select all are for egui fields).
-5. `ContextActionService` touch buttons (`createTouchButton`) without the
-   CoreScripts (with them, Roblox's ContextActionTouch draws them).
-6. The display cutout: the window under the camera hole
-   (`layoutInDisplayCutoutMode` shortEdges) once the chrome pads itself
-   by the cutout inset (`jni::window_insets`), so the letterboxed strip
-   on that side goes the way the navigation bar's did (`system_bars.rs`).
+5. ~~`ContextActionService` touch buttons (`createTouchButton`) without
+   the CoreScripts~~ (`domains/context_action_touch.luau`, Roblox's
+   ContextActionTouch rebuilt; `ContextActionService:CallFunction` for
+   both; the "Audit: Roblox services on a device" row).
+6. ~~The display cutout: the window under the camera hole
+   (`layoutInDisplayCutoutMode` shortEdges), the chrome padded by the
+   cutout inset~~ (`src/android/cutout.rs`; the "What is where" row).
+   Left: the 3D view under the hole with only the GUIs inset, which
+   wants `ScreenInsets.DeviceSafeInsets` in the engine first.
 
 Each step closes rows in docs/ENGINE-GAPS.md; the Creator Hub reference
 pages are the source of truth for every member name, argument and enum.

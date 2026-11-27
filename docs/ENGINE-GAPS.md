@@ -238,6 +238,28 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   content, as Roblox does (`children`: `place_children` once for the
   parent and once per Folder; test `list_layout_in_a_folder`). Not done:
   an AutomaticSize parent measuring a Folder-held list's lines.
+- **An AutomaticSize list of RelativeXX cards measured three times its
+  height** (LBG's limited emotes: a column growing on Y of
+  `{1, 0}, {0.932, 0}` SizeConstraint RelativeXX cards, each holding a
+  0.48 UIAspectRatioConstraint frame): `gui_walk.rs` measured a child with
+  a Y Scale as sized by the growing axis whatever the Scale read, and
+  counted it by its content; down in the content the aspect frame, told
+  its height was unknown, derived 500 px of it from its width, and the
+  300 px list came out at 900 — its "LIMITED TIME" header and "Leaving
+  in" footer centred off the screen, the cards under the top edge. Now
+  `scale_axes` says which parent axis each Scale reads (both the width
+  under RelativeXX, both the height under RelativeYY) and a card on a
+  fixed axis counts by its Size (`auto_child_size`, `own_size_in_auto`).
+  Test `auto_size_counts_relative_xx_children_by_size`.
+- **A TextScaled label growing on X alone was 8 px wide**: the
+  `{0, 0}, {1, 0}` name tags of a horizontal list (LBG's "Accessory" /
+  "Animation" pills) were measured at their TextSize wrapped in no width
+  — one glyph wide — and the painted text then scaled down to 2 px in
+  that box. Roblox sizes such text by the box's height and widens the box
+  to the line (`scaled_text_size`: the largest whole size whose line fits
+  the height, at most 100; `content_size_in`; `FaceText` for a script's
+  read between walks). Test `text_scaled_auto_x_sizes_text_by_height`.
+  Not done: TextScaled growing on Y or XY still measures at TextSize.
 - **A short Team Create join played as if whole**: `rustudio_net`'s
   `Ready` is 1.5 s without an instance batch, not the server's end of
   transfer, and a child parked for a parent that never arrived left no
@@ -365,8 +387,11 @@ camera 75 → 100 with the 2° tolerance unchanged.
    round 13); the Place A chapel's darkness comes mostly from this.
    **ForceField visual**: Studio draws the spawn bubble at 10 s in demo and
    control; rustudio draws none. Terrain editing from scripts (FillBlock …).
-2. **PathfindingService:CreatePath / Path:ComputeAsync / GetWaypoints** —
-   most NPC games.
+2. ~~PathfindingService:CreatePath / Path:ComputeAsync / GetWaypoints~~
+   (`domains/geometry_nav.rs`: a heightfield navmesh over the collidable
+   parts and terrain, A* with Costs, jump links, PathfindingModifier /
+   PathfindingLink, Blocked / Unblocked, the deprecated
+   ComputeSmoothPathAsync / FindPathAsync; `geometry_tests.rs`).
 3. **TextService:GetTextSize / GetTextBoundsAsync** — UI layout code.
 4. ~~GuiService.MenuOpened / MenuClosed with an in-game Esc menu~~ (round 13).
 5. Gamepad input (GamepadConnected / Disconnected, gamepad KeyCodes).
@@ -377,8 +402,11 @@ camera 75 → 100 with the 2° tolerance unchanged.
    `InputBegan / Changed / Ended` and `TouchStarted / Moved / Ended`,
    ContextActionService `UserInputType.Touch` bindings and the
    touch-button CoreScript's feed (`BoundActionAdded / Removed / Changed`,
-   `GetActionButtonEvent`, `FireActionButtonFoundSignal`: ContextActionTouch
-   draws `createTouchButton` buttons when the CoreScripts run), the input action
+   `GetActionButtonEvent`, `FireActionButtonFoundSignal`, and
+   `CallFunction` for the press: ContextActionTouch draws
+   `createTouchButton` buttons when the CoreScripts run, and
+   `domains/context_action_touch.luau` draws the same ones — Roblox's
+   ContextActionGui, places, sizes and children — when they don't), the input action
    system's `TouchPosition / TouchDelta / TouchPinch` with `UIButton` /
    `UIModifier`, GuiObject `InputBegan(Touch)` / `TouchTap`, the gestures
    (`TouchTap`, `TouchTapInWorld`, `TouchLongPress`, `TouchPan`,

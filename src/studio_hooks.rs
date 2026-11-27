@@ -212,6 +212,7 @@ impl Editor {
         let (no_ui, shift) = (self.harness.run.no_ui, self.harness.run.input.shift);
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         self.with_game_host(|game, host| game.play_tick(ctx, dt, host, no_ui, shift));
+        self.finish_close();
         self.teleport_tick();
         self.finish_stopped_plugin_playtest();
     }
@@ -221,7 +222,31 @@ impl Editor {
         let no_ui = self.harness.run.no_ui;
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         self.with_game_host(|game, host| game.play_tick_hidden(dt, host, no_ui));
+        self.finish_close();
         self.teleport_tick();
         self.finish_stopped_plugin_playtest();
+    }
+
+    /// Stop as the Stop button / Shift+F5 / MCP `stop`: the first one closes
+    /// the session as Studio does (the client leaves, BindToClose callbacks
+    /// run up to the shutdown deadline); one while that runs ends it now.
+    /// (`stop_play` stays the immediate stop for everything else.)
+    pub fn request_stop(&mut self) {
+        if !self.game.is_playing() {
+            return;
+        }
+        self.with_game_host(|game, host| game.request_stop(host));
+        if !self.game.is_playing() {
+            self.stop_play();
+        } else {
+            self.finish_close();
+        }
+    }
+
+    /// A close that finished ends the session.
+    fn finish_close(&mut self) {
+        if self.game.close_finished() {
+            self.stop_play();
+        }
     }
 }

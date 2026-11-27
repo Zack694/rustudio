@@ -791,7 +791,10 @@ impl Editor {
                 }
                 pose_dirty = true;
             }
-            if ui.small_button("Delete KF").clicked() && self.anim_ed.keyframes.len() > 1 {
+            if ui.small_button("Delete KF").clicked()
+                && self.anim_ed.keyframes.len() > 1
+                && self.anim_ed.selected_kf < self.anim_ed.keyframes.len()
+            {
                 self.anim_ed.keyframes.remove(self.anim_ed.selected_kf);
                 self.anim_ed.sort_keyframes();
                 pose_dirty = true;

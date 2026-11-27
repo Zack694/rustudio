@@ -235,6 +235,32 @@ pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJo
     job
 }
 
+/// The indentation to make after this frame's typing: what `TextEdit`
+/// inserted at the caret (`before` → `after`, the caret at `caret` right
+/// after it — found by the caret, since an insertion at the end of a run
+/// of the same characters has no one place in a plain diff), given to
+/// code_indent.rs with Studio's settings.
+fn auto_indent(before: &str, after: &str, caret: usize) -> Option<crate::code_indent::Fixup> {
+    let ind = crate::code_indent::settings()?;
+    let inserted = typed_at_caret(before, after, caret)?;
+    crate::code_indent::on_insert(after, caret, &inserted, &ind)
+}
+
+/// `after` is `before` with text inserted ending at `caret` (chars): that text.
+fn typed_at_caret(before: &str, after: &str, caret: usize) -> Option<String> {
+    let len = after.chars().count().checked_sub(before.chars().count())?;
+    if len == 0 || caret < len || after.len() < before.len() {
+        return None;
+    }
+    let a: Vec<char> = after.chars().collect();
+    if caret > a.len() {
+        return None;
+    }
+    let at = caret - len;
+    let b: Vec<char> = before.chars().collect();
+    (b[..at] == a[..at] && b[at..] == a[caret..]).then(|| a[at..caret].iter().collect())
+}
+
 pub struct ScriptBuf {
     pub text: String,
     pub error: Option<(usize, String)>,
@@ -245,11 +271,18 @@ pub struct ScriptBuf {
     plugin_diags: Vec<(i64, String)>,
     plugin_checked: Option<String>,
     completions: Vec<(String, String)>,
+    /// The built-in completions (src/luau_intel) and signature help for
+    /// the caret they were made at.
+    intel: Vec<crate::luau_intel::Completion>,
+    sig: Option<crate::luau_intel::SignatureHelp>,
+    intel_at: Option<usize>,
 }
 
 #[derive(Default)]
 pub struct ScriptTabs {
     pub bufs: HashMap<Ref, ScriptBuf>,
+    /// The place's Luau index for the completions, rebuilt as it changes.
+    pub intel: crate::luau_intel::Intel,
     /// Lines (1-based) to put the cursor on and scroll to once the tab
     /// draws (the profiler's "Open script at line N").
     pub goto: HashMap<Ref, usize>,
@@ -408,6 +441,9 @@ impl Editor {
             plugin_diags: Vec::new(),
             plugin_checked: None,
             completions: Vec::new(),
+            intel: Vec::new(),
+            sig: None,
+            intel_at: None,
         });
         let editor_id = egui::Id::new(("script_text", r));
         let goto = self.scripts.goto.get(&r).copied();
@@ -448,6 +484,9 @@ impl Editor {
         let Some(buf) = self.scripts.bufs.get_mut(&r) else { return };
 
         let mut toolbar_changed = false;
+        // The soft keyboard has no Tab key: Android's editor gets one (and
+        // Shift+Tab) in the header. `Some(shift)` when pressed.
+        let mut soft_tab: Option<bool> = None;
         ui.horizontal(|ui| {
             icons::class_icon(ui, &class, 16.0);
             ui.label(RichText::new(&full_name).strong());
@@ -467,6 +506,21 @@ impl Editor {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if cfg!(target_os = "android") && focused {
+                    let untab = ui.small_button("Untab").on_hover_text("Shift+Tab: one level out");
+                    let tab = ui.small_button("Tab").on_hover_text("Tab: one level in");
+                    if tab.clicked() {
+                        soft_tab = Some(false);
+                    }
+                    if untab.clicked() {
+                        soft_tab = Some(true);
+                    }
+                    #[cfg(target_os = "android")]
+                    {
+                        crate::android::keyboard::keep_focus_in(tab.rect);
+                        crate::android::keyboard::keep_focus_in(untab.rect);
+                    }
+                }
                 egui::ComboBox::from_id_salt(("script_snippets", r)).selected_text("+ Snippet").width(84.0).show_ui(ui, |ui| {
                     for &(sname, scode) in SCRIPT_SNIPPETS {
                         if ui.selectable_label(false, sname).clicked() {
@@ -530,15 +584,51 @@ impl Editor {
         }
         // Plugins' autocomplete items for the word at the cursor: a click
         // puts the item in place of the word.
+        // (On Android a tap on a strip's button must leave the editor its
+        // focus — the keyboard and its mirror go with it: keyboard.rs
+        // `keep_focus_in`.)
+        #[cfg(target_os = "android")]
+        let keep = |r: &egui::Response| crate::android::keyboard::keep_focus_in(r.rect);
+        #[cfg(not(target_os = "android"))]
+        let keep = |_r: &egui::Response| {};
         let mut accept: Option<String> = None;
         if !buf.completions.is_empty() {
-            ui.horizontal_wrapped(|ui| {
+            let strip = ui.horizontal_wrapped(|ui| {
                 for (label, insert) in buf.completions.iter().take(12) {
                     if ui.small_button(label).clicked() {
                         accept = Some(insert.clone());
                     }
                 }
             });
+            keep(&strip.response);
+        }
+        // The built-in completions for the caret (src/luau_intel): a tap
+        // puts one in place of what was typed of it; the call's signature
+        // with the parameter the caret is at.
+        let mut accept_intel: Option<crate::luau_intel::Completion> = None;
+        if let Some(sig) = &buf.sig {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(RichText::new(format!("{}(", sig.name)).small().color(theme::TEXT_DIM));
+                for (i, p) in sig.parameters.iter().enumerate() {
+                    let active = sig.active_parameter == Some(i);
+                    let t = RichText::new(if i + 1 < sig.parameters.len() { format!("{p}, ") } else { p.clone() }).small();
+                    ui.label(if active { t.strong().color(theme::TEXT) } else { t.color(theme::TEXT_DIM) });
+                }
+                ui.label(RichText::new(")").small().color(theme::TEXT_DIM));
+            });
+        }
+        if !buf.intel.is_empty() {
+            let strip = ui.horizontal_wrapped(|ui| {
+                for c in buf.intel.iter().take(if cfg!(target_os = "android") { 8 } else { 12 }) {
+                    let b = ui.small_button(&c.label);
+                    let b = if c.detail.is_empty() { b } else { b.on_hover_text(&c.detail) };
+                    if b.clicked() {
+                        accept_intel = Some(c.clone());
+                    }
+                }
+            });
+            keep(&strip.response);
         }
         ui.separator();
 
@@ -551,6 +641,7 @@ impl Editor {
         ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
         let error_line = buf.error.as_ref().map(|e| e.0);
         let mut changed = toolbar_changed;
+        let mut indent_caret: Option<usize> = None;
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .id_salt(("script_scroll", r))
@@ -596,6 +687,9 @@ impl Editor {
                         }
                         ui.fonts_mut(|f| f.layout_job(job))
                     };
+                    // (the text before this frame's typing, for the
+                    // auto-indent below; the field changes only focused)
+                    let before = focused.then(|| buf.text.clone());
                     let out = egui::TextEdit::multiline(&mut buf.text)
                         .id(editor_id)
                         .code_editor()
@@ -606,13 +700,33 @@ impl Editor {
                         .layouter(&mut layouter)
                         .show(ui);
                     // The soft keyboard came up under the editor: the caret
-                    // scrolls into the room left above it.
+                    // scrolls into the room left above it. The keyboard types
+                    // code here: no suggestions or capitals (android/ime.rs).
                     #[cfg(target_os = "android")]
-                    crate::android::keyboard::reveal_cursor(ui, &out);
+                    {
+                        crate::android::keyboard::reveal_cursor(ui, &out);
+                        crate::android::ime::code_field(editor_id);
+                    }
+                    let caret = out.state.cursor.char_range().filter(|r| r.primary == r.secondary).map(|r| r.primary.index.0);
                     let resp = out.response.response;
                     if resp.changed() {
                         changed = true;
                         buf.edited = Instant::now();
+                        // Auto-indent (code_indent.rs): Enter keeps and
+                        // deepens the indentation, a closer typed steps out.
+                        // (Android's soft keyboard makes it on its mirror
+                        // inside its own operation, ime.rs
+                        // `native_code_fixup`: the text comes indented and
+                        // nothing is left to do here.)
+                        if let (Some(before), Some(caret)) = (before.as_deref(), caret) {
+                            if let Some(fix) = auto_indent(before, &buf.text, caret) {
+                                crate::code_indent::apply(&mut buf.text, &fix);
+                                let mut st = out.state.clone();
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(fix.cursor.0))));
+                                st.store(ui.ctx(), editor_id);
+                                indent_caret = Some(fix.cursor.0);
+                            }
+                        }
                     }
                     if let Some(line) = goto {
                         let y = resp.rect.top() + line.saturating_sub(1) as f32 * row_h;
@@ -649,14 +763,58 @@ impl Editor {
             st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(b), egui::text::CCursor::new(a))));
             st.store(ui.ctx(), editor_id);
         }
+        // A built-in completion taken: the text and the caret after it.
+        let mut moved_caret: Option<usize> = indent_caret;
+        // The soft Tab keys (Android): the unit at the caret, or the
+        // selection's lines in or out.
+        if let (Some(shift), Some(st)) = (soft_tab, egui::TextEdit::load_state(ui.ctx(), editor_id)) {
+            if let Some(cr) = st.cursor.char_range() {
+                let sel = (cr.secondary.index.0, cr.primary.index.0);
+                let ind = crate::code_indent::tab_unit();
+                let fix = if shift { crate::code_indent::untab(&buf.text, sel, &ind) } else { Some(crate::code_indent::tab(&buf.text, sel, &ind)) };
+                if let Some(fix) = fix {
+                    crate::code_indent::apply(&mut buf.text, &fix);
+                    let mut st = st;
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange {
+                        primary: egui::text::CCursor::new(fix.cursor.1),
+                        secondary: egui::text::CCursor::new(fix.cursor.0),
+                        ..Default::default()
+                    }));
+                    st.store(ui.ctx(), editor_id);
+                    moved_caret = Some(fix.cursor.1);
+                    changed = true;
+                }
+            }
+            ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+        }
+        if let (Some(c), Some(end)) = (accept_intel, word_end) {
+            let end = end.min(buf.text.chars().count());
+            let at = crate::luau_intel::apply_suggestion_at(&mut buf.text, end, &c);
+            let mut st = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
+            st.store(ui.ctx(), editor_id);
+            ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+            buf.completions.clear();
+            moved_caret = Some(at);
+            changed = true;
+        }
         if let (Some(insert), Some(end)) = (accept, word_end) {
             let chars: Vec<char> = buf.text.chars().collect();
+            let end = end.min(chars.len());
             let mut start = end;
             while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
                 start -= 1;
             }
             buf.text = chars[..start].iter().chain(insert.chars().collect::<Vec<_>>().iter()).chain(chars[end..].iter()).collect();
+            // (the caret after the word, the focus kept: the tap on the
+            // button took it from the field)
+            let at = start + insert.chars().count();
+            let mut st = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
+            st.store(ui.ctx(), editor_id);
+            ui.ctx().memory_mut(|m| m.request_focus(editor_id));
             buf.completions.clear();
+            moved_caret = Some(at);
             changed = true;
         }
         if changed {
@@ -674,7 +832,7 @@ impl Editor {
             );
             let typing_word = word_end.is_some_and(|i| {
                 let c: Vec<char> = text.chars().collect();
-                i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_' || c[i - 1] == '.' || c[i - 1] == ':')
+                i > 0 && i <= c.len() && (c[i - 1].is_alphanumeric() || c[i - 1] == '_' || c[i - 1] == '.' || c[i - 1] == ':')
             });
             let items = match (pos, typing_word) {
                 (Some((line, ch)), true) => self
@@ -690,14 +848,41 @@ impl Editor {
                     .unwrap_or_default(),
                 _ => Vec::new(),
             };
-            let final_items = if items.is_empty() {
-                word_end.map(|end| builtin_completions(&text, end)).unwrap_or_default()
-            } else {
-                items
+            if let Some(b) = self.scripts.bufs.get_mut(&r) {
+                b.completions = items;
+            }
+        }
+        // The built-in completions, for the caret where it is now (after a
+        // change, or when it moved; the index itself is cached).
+        let caret = moved_caret.or(word_end);
+        let stale = self.scripts.bufs.get(&r).is_some_and(|b| changed || b.intel_at != caret);
+        if stale && focused {
+            let text = self.scripts.bufs.get(&r).map(|b| b.text.clone()).unwrap_or_default();
+            let (items, sig) = match caret {
+                Some(at) if at <= text.chars().count() => {
+                    let overrides: Vec<(Ref, &str)> = self.scripts.bufs.iter().map(|(k, b)| (*k, b.text.as_str())).collect();
+                    let dom = &self.game.doc.dom;
+                    let intel = &mut self.scripts.intel;
+                    let items = intel.complete(dom, overrides.iter().copied(), r, &text, at);
+                    let sig = intel.signature(dom, overrides.iter().copied(), r, &text, at);
+                    (items, sig)
+                }
+                _ => (Vec::new(), None),
             };
             if let Some(b) = self.scripts.bufs.get_mut(&r) {
-                b.completions = final_items;
+                b.intel = items;
+                b.sig = sig;
+                b.intel_at = caret;
+                if changed && b.completions.is_empty() && b.intel.is_empty() {
+                    b.completions = caret.map(|end| builtin_completions(&b.text, end)).unwrap_or_default();
+                }
             }
+        }
+        // The text as it is now, for the soft keyboard's mirror (a change
+        // made here, not by the field: a completion taken, a Tab).
+        #[cfg(target_os = "android")]
+        if let Some(b) = self.scripts.bufs.get(&r) {
+            crate::android::ime::field_text(editor_id, &b.text);
         }
         if buf_needs_repaint(self.scripts.bufs.get(&r)) {
             ui.ctx().request_repaint_after(Duration::from_millis(300));

@@ -236,6 +236,8 @@ impl Block {
     fn read(v: &Voxels, lo: [i32; 3], n: [i32; 3]) -> Block {
         let len = (n[0].max(0) * n[1].max(0) * n[2].max(0)) as usize;
         let mut b = Block { lo, n, mat: vec![0; len], occ: vec![0.0; len] };
+        // (the chunk found once a run of voxels, not once a voxel)
+        let v = v.sampler();
         for z in 0..n[2] {
             for y in 0..n[1] {
                 for x in 0..n[0] {
@@ -275,12 +277,13 @@ impl Block {
     /// Writes the cells that differ from what `v` holds.
     fn write(&self, v: &mut Voxels) {
         let mut out = Vec::new();
+        let s = v.sampler();
         for z in 0..self.n[2] {
             for y in 0..self.n[1] {
                 for x in 0..self.n[0] {
                     let i = self.idx(x, y, z);
                     let w = [self.lo[0] + x, self.lo[1] + y, self.lo[2] + z];
-                    let (m0, o0) = v.get(w[0], w[1], w[2]);
+                    let (m0, o0) = s.get(w[0], w[1], w[2]);
                     let (m, o) = (self.mat[i], self.occ[i].clamp(0.0, 1.0));
                     let (m, o) = if m == 0 || o < MIN_OCC { (0, 0.0) } else { (m, o) };
                     if m != m0 || (o - if m0 == 0 { 0.0 } else { o0 }).abs() > 0.5 / 255.0 {
@@ -289,6 +292,7 @@ impl Block {
                 }
             }
         }
+        drop(s);
         v.edit(out);
     }
 }
@@ -759,25 +763,41 @@ pub fn smooth_region(b_mat: &[u8], b_occ: &[f32], n: [i32; 3], strength: f32) ->
             }
         }
     }
+    // The 3×3×3 average, an axis at a time (outside the box the field
+    // carries on as at the edge): nine reads a voxel in place of 27 — the
+    // Smooth brush runs this over its whole box, a voxel of margin
+    // around, at every step of a drag (a 64-stud brush is 42,875 voxels).
+    let mut avg = sdf.clone();
+    if len > 0 {
+        let mut tmp = vec![0.0f32; len];
+        for axis in 0..3 {
+            let stride = match axis {
+                0 => 1,
+                1 => n[0] as usize,
+                _ => (n[0] * n[1]) as usize,
+            };
+            let last = n[axis] - 1;
+            for z in 0..n[2] {
+                for y in 0..n[1] {
+                    for x in 0..n[0] {
+                        let i = idx(x, y, z);
+                        let c = [x, y, z][axis];
+                        let lo = if c > 0 { i - stride } else { i };
+                        let hi = if c < last { i + stride } else { i };
+                        tmp[i] = (avg[lo] + avg[i] + avg[hi]) * (1.0 / 3.0);
+                    }
+                }
+            }
+            std::mem::swap(&mut avg, &mut tmp);
+        }
+    }
     let mut mat = b_mat.to_vec();
     let mut occ = b_occ.to_vec();
     for z in 0..n[2] {
         for y in 0..n[1] {
             for x in 0..n[0] {
                 let i = idx(x, y, z);
-                let (mut sum, mut cnt) = (0.0, 0.0);
-                for dz in -1..=1 {
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
-                            let (a, bb, c) = (x + dx, y + dy, z + dz);
-                            // Outside the box the field carries on as at the edge.
-                            let (a, bb, c) = (a.clamp(0, n[0] - 1), bb.clamp(0, n[1] - 1), c.clamp(0, n[2] - 1));
-                            sum += sdf[idx(a, bb, c)];
-                            cnt += 1.0;
-                        }
-                    }
-                }
-                let d = sum / cnt;
+                let d = avg[i];
                 let target = (0.5 + d / VR).clamp(0.0, 1.0);
                 let o0 = if b_mat[i] == 0 { 0.0 } else { b_occ[i] };
                 let o = o0 + (target - o0) * strength;

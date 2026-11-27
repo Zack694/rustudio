@@ -131,14 +131,19 @@ impl RenderSnapshot {
     ) -> Result<(), MissingSnapshot> {
         let _scope = rustudio_core::bench::scope("render_snapshot_apply");
         match self.body {
-            Body::Replace(mirror) => *doc = *mirror,
+            Body::Replace(mirror) => {
+                let _r = rustudio_core::bench::scope("rsa_replace");
+                *doc = *mirror
+            }
             Body::Delta(delta) => {
                 if receiver.applied != Some((self.source_document_id, self.serial - 1, doc.id)) {
                     return Err(MissingSnapshot);
                 }
+                rustudio_core::bench::add("rsa_delta_tree", 0.0, delta.tree.len() as u64);
                 delta.apply(doc);
             }
         }
+        let _e = rustudio_core::bench::scope("rsa_effects");
         self.effects.publish(doc.id);
         *camera = self.camera;
         receiver.applied = Some((self.source_document_id, self.serial, doc.id));
@@ -217,11 +222,37 @@ impl Delta {
                 ));
             }
         }
+        if delta.properties.len() > 1500 && std::env::var_os("RUSTUDIO_SNAPSHOT_LOG").is_some() {
+            let mut keys: rustc_hash::FxHashMap<&str, usize> = Default::default();
+            let (mut maps, mut values, mut names) = (0usize, 0usize, 0usize);
+            for e in &delta.properties {
+                match e {
+                    PropertyEdit::Map(..) => maps += 1,
+                    PropertyEdit::Value(..) => values += 1,
+                    PropertyEdit::Name(..) => names += 1,
+                }
+            }
+            for m in &delta.marks {
+                if let Mark::Prop(_, k) = m {
+                    *keys.entry(k.as_str()).or_default() += 1;
+                }
+            }
+            let mut top: Vec<_> = keys.into_iter().collect();
+            top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            top.truncate(8);
+            eprintln!(
+                "[snapshot] big delta: {maps} maps, {values} values, {names} names, {} tree records, {} deleted; prop marks {:?}",
+                delta.tree.len(),
+                delta.deleted.len(),
+                top
+            );
+        }
         delta
     }
 
     fn apply(mut self, doc: &mut Document) {
         if !self.tree.is_empty() || !self.deleted.is_empty() {
+            let _t = rustudio_core::bench::scope("rsa_tree");
             let removed = doc.dom.apply_snapshot_tree(self.tree, &self.deleted);
             if !removed.is_empty() {
                 let roots: FxHashSet<_> = self.deleted.into_iter().collect();
@@ -235,6 +266,13 @@ impl Delta {
                 );
             }
         }
+        let _p = rustudio_core::bench::scope("rsa_props");
+        // The maps this delta replaces are freed off the render thread
+        // (`discard`): a script that touches a property on thousands of
+        // parts in one step hands over thousands of cloned maps, and
+        // freeing their old ones here — memory another thread allocated —
+        // stalled the viewport for hundreds of milliseconds.
+        let mut replaced: Vec<PropMap> = Vec::new();
         for edit in self.properties {
             match edit {
                 PropertyEdit::Value(r, key, value) => {
@@ -248,7 +286,7 @@ impl Delta {
                 }
                 PropertyEdit::Map(r, props) => {
                     if let Some(i) = doc.dom.get_by_ref_mut(r) {
-                        i.properties = props;
+                        replaced.push(std::mem::replace(&mut i.properties, props));
                     }
                 }
                 PropertyEdit::Name(r, name) => {
@@ -258,12 +296,36 @@ impl Delta {
                 }
             }
         }
+        drop(_p);
+        discard(replaced);
+        let _m = rustudio_core::bench::scope("rsa_marks");
         for mark in self.marks {
             match mark {
                 Mark::Tree(r) => doc.mark_tree(r),
                 Mark::Prop(r, key) => doc.mark_prop(r, key),
             }
         }
+    }
+}
+
+/// Frees a publication's replaced property maps: inline when few, else on a
+/// helper thread so the render thread only pays for the swap. (A thread per
+/// big batch: such batches are rare — a script sweeping the map — and a
+/// spawn costs tens of microseconds against the hundreds of milliseconds
+/// the frees took.)
+fn discard(maps: Vec<PropMap>) {
+    const INLINE: usize = 64;
+    if maps.len() <= INLINE {
+        let _d = rustudio_core::bench::scope("rsa_props_drop");
+        drop(maps);
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("snapshot-discard".into())
+        .spawn(move || drop(maps));
+    if let Err(e) = spawned {
+        // (the maps were moved into the closure, which the failed spawn dropped)
+        log::debug!("snapshot: discard thread: {e}");
     }
 }
 

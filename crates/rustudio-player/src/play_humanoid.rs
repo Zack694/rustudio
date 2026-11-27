@@ -67,8 +67,12 @@ pub(crate) struct HumDyn {
     /// starts (`hum_roots_seen`): a side that differs at the publish (`hum_post`)
     /// had a script move it while the world stepped.
     roots_seen: Option<(Option<Xform>, Option<Xform>)>,
-    /// Where a script put the root while the batch ran (`hum_script_moves`).
-    script_root: Option<Xform>,
+    /// Where a script put the root while the batch ran (`hum_script_moves`),
+    /// and on which side.
+    script_root: Option<(Xform, Side)>,
+    /// A server CFrame / PivotTo of the root waiting for the next frame's
+    /// Humanoid step (`hum_server_root`): the server copy holds it meanwhile.
+    deferred_server_root: Option<Xform>,
 }
 
 /// Frames from a character part entering a Seat to the Humanoid being
@@ -83,7 +87,7 @@ impl Default for HumDyn {
     /// A new character is in the air (it spawns above its SpawnLocation).
     fn default() -> Self {
         let hum = Humanoid { state: State::Freefall, bal_p: rustudio_physics::humanoid::BAL_P_FREEFALL, ..Default::default() };
-        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None, roots_seen: None, script_root: None }
+        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None, roots_seen: None, script_root: None, deferred_server_root: None }
     }
 }
 
@@ -277,7 +281,11 @@ impl Game {
         // Replication and the client render callbacks run after the body's
         // last step. Turn the newest script pose, using the same precedence
         // as the next physics step.
-        let script_root = Self::hum_written_root(&self.doc, s);
+        let (script_root, server_root) = match Self::hum_written_root(&self.doc, s) {
+            Some((xf, Side::Client)) => (Some(xf), None),
+            Some((xf, _)) => (None, Some(xf)),
+            None => (None, None),
+        };
         let root_xf = script_root.unwrap_or(root_xf);
         let facing = -root_xf.rot.z_axis;
         if facing.x.abs() + facing.z.abs() < 1e-4 {
@@ -295,8 +303,18 @@ impl Game {
         let Some(ch) = s.character.as_mut() else { return };
         ch.last_root = Some(xf);
         ch.yaw = cam_yaw;
+        // (a server write waits for the next frame's step, `hum_server_root`;
+        // the server copy keeps it)
+        if server_root.is_some() {
+            ch.dynamic.deferred_server_root = server_root;
+        }
         let mut pose = ch.rig.solve(xf, &ch.dynamic.transforms);
+        let server_pose = server_root.map(|xf| ch.rig.solve(xf, &ch.dynamic.transforms));
         pose.extend(self.tool_pose(&pose));
+        let server_pose = server_pose.map(|mut p| {
+            p.extend(self.tool_pose(&p));
+            p
+        });
         let client_tool = self.client_tool_pose(&pose);
         if let Some(s) = self.play.as_mut() {
             if let Some(cdoc) = s.other_doc.as_mut() {
@@ -304,7 +322,33 @@ impl Game {
                 rig::write_pose(cdoc, &client_tool, None);
             }
         }
-        rig::write_pose(&mut self.doc, &pose, None);
+        rig::write_pose(&mut self.doc, server_pose.as_ref().unwrap_or(&pose), None);
+    }
+
+    /// An R6 rig's leg length for its full hip (the taller of Left Leg and
+    /// Right Leg), read where the character is simulated: the owning
+    /// client's copy when it has one. Studio's network owner steps its
+    /// character with its own DataModel, so legs a LocalScript builds there
+    /// count (a server character that is a Torso and a root; the client
+    /// adds the limbs): read on the server, there were none, the full hip
+    /// came out 2 studs short and the character sank to its torso.
+    fn owned_r6_legs(&self, model: Ref) -> f32 {
+        let legs = |d: &Document, m: Ref| {
+            ["Left Leg", "Right Leg"]
+                .iter()
+                .filter_map(|n| d.find_named(m, n))
+                .filter_map(|r| rustudio_render::scene::vec3_of(d.prop(r, "Size")))
+                .map(|s| s.y)
+                .fold(0.0f32, f32::max)
+        };
+        let client = self
+            .play
+            .as_ref()
+            .and_then(|s| s.other_doc.as_ref().zip(s.map.s2c.get(&model).copied()));
+        match client {
+            Some((cd, cm)) => legs(cd, cm),
+            None => legs(&self.doc, model),
+        }
     }
 
     /// The client's CurrentCamera: its CFrame and Focus.
@@ -331,10 +375,11 @@ impl Game {
         Some(d.unwrap_or(-cf.rot.z_axis))
     }
 
-    /// The root scripts put on either side since the last published pose.
+    /// The root scripts put on either side since the last published pose,
+    /// and the side that wrote it (the server's write first).
     /// Studio drops owner poses older than a server CFrame write until the
     /// client acknowledges it.
-    fn hum_written_root(doc: &Document, s: &PlaySession) -> Option<Xform> {
+    fn hum_written_root(doc: &Document, s: &PlaySession) -> Option<(Xform, Side)> {
         let ch = s.character.as_ref()?;
         let last = ch.last_root?;
         let root = ch.rig.root;
@@ -343,14 +388,37 @@ impl Game {
         let changed = |xf: &Xform| {
             (xf.pos - last.pos).length() > 1e-4 || !(xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4)
         };
-        let next = server.filter(changed).or_else(|| client().filter(changed));
-        if let Some(xf) = next {
+        let next = server
+            .filter(changed)
+            .map(|xf| (xf, Side::Server))
+            .or_else(|| client().filter(changed).map(|xf| (xf, Side::Client)));
+        if let Some((xf, side)) = next {
             if rustudio_physics::physics::hum_debug() {
-                eprintln!("HUMDBG teleport from {:?} to {:?} (client {:?} server {:?})",
+                eprintln!("HUMDBG teleport from {:?} to {:?} by the {side:?} (client {:?} server {:?})",
                     last.pos, xf.pos, client().map(|c| c.pos), server.map(|c| c.pos));
             }
         }
         next
+    }
+
+    /// Where a script's root write moves the body, and when. The owning
+    /// client's write: at once. The server's: at the next frame's Humanoid
+    /// step, the server copy holding it meanwhile (`hum_post`). Roblox's owner
+    /// applies a server CFrame when the server's packet arrives, behind the
+    /// remote events the server fired before it (the next frame here,
+    /// `deliver_remotes`): LBG's Savage Fangs lands the character with a
+    /// FireClient that ends its client BodyPosition and then a server
+    /// `PrimaryPart.CFrame =` to the ground, 30 studs down. The body moved
+    /// at once, the BodyPosition still on it for that frame's step: the
+    /// mover's spring, 30 studs from its goal, threw the character 15 studs
+    /// up again.
+    fn hum_server_root(ch: &mut Character, physics: &mut PlayPhysics, xf: Xform, side: Side) {
+        if side == Side::Server {
+            ch.dynamic.deferred_server_root = Some(xf);
+        } else {
+            physics.teleport_humanoid(ch.model, &xf);
+            ch.last_root = Some(xf);
+        }
     }
 
     /// stepHumanoid: the body, the sensors, the
@@ -371,14 +439,21 @@ impl Game {
             self.ensure_hum_body(model, root);
         }
         // A script moved the root (PivotTo, CFrame, either side): the body
-        // goes there (Roblox moves the whole assembly).
+        // goes there (Roblox moves the whole assembly); the server's write of
+        // the last frame now, a new one at the next (`hum_server_root`).
         {
             let s = self.play.as_mut().expect("playing");
             let script_root = Self::hum_written_root(&self.doc, s);
+            let server_now = rustudio_render::scene::xform_of(&self.doc, root);
             let ch = s.character.as_mut().expect("character");
-            if let Some(xf) = script_root {
-                s.physics.teleport_humanoid(model, &xf);
-                ch.last_root = Some(xf);
+            if ch.dynamic.deferred_server_root.take().is_some() {
+                // (the latest the server put there)
+                if let Some(xf) = server_now {
+                    s.physics.teleport_humanoid(model, &xf);
+                    ch.last_root = Some(xf);
+                }
+            } else if let Some((xf, side)) = script_root {
+                Self::hum_server_root(ch, &mut s.physics, xf, side);
             }
             // An Anchored root (either side) or a root rigidly welded to an
             // Anchored part (e.g. Motor6D to a moving anchored craft) holds the
@@ -518,16 +593,7 @@ impl Game {
                 && seat_root.is_none()
                 && rustudio_engine::runtime::domains::world::part::with_graph(&self.doc, |g| g.grounded(&self.doc, root)));
         let hip_height = self.owned_humanoid_f32(humanoid, "HipHeight", 0.0);
-        let legs = if rig_type == RigType::R6 {
-            ["Left Leg", "Right Leg"]
-                .iter()
-                .filter_map(|n| self.doc.find_named(model, n))
-                .filter_map(|r| rustudio_render::scene::vec3_of(self.doc.prop(r, "Size")))
-                .map(|s| s.y)
-                .fold(0.0f32, f32::max)
-        } else {
-            0.0
-        };
+        let legs = if rig_type == RigType::R6 { self.owned_r6_legs(model) } else { 0.0 };
         let s = self.play.as_mut().expect("playing");
         s.physics.sync_gravity(&self.doc);
         let doc = &self.doc;
@@ -888,6 +954,41 @@ impl Game {
         }
     }
 
+    /// A script's root CFrame / PivotTo written since `hum_pre` read the roots:
+    /// in an Animator marker or KeyframeReached handler (Studio steps the
+    /// Animator after PreAnimation), in Stepped or PreSimulation, on either side.
+    /// The body goes there before the world steps, as a write before the frame
+    /// does in `hum_pre`; left alone, `hum_post` wrote the stepped pose over it
+    /// and the write was lost: LBG's Savage Fangs puts the character on the ground
+    /// from its Land marker (a server `PrimaryPart.CFrame =` as its client
+    /// BodyPosition ends), and the character fell the 33 studs instead.
+    /// (Each side against its own root as `hum_pre` left it, `hum_roots_seen`:
+    /// the client's copy has the server's write only after the frame.)
+    pub(super) fn hum_stepped_root(&mut self) {
+        let Some((xf, side)) = self.hum_root_moved_since_seen() else { return };
+        let Some(s) = self.play.as_mut() else { return };
+        let Some(ch) = s.character.as_mut() else { return };
+        Self::hum_server_root(ch, &mut s.physics, xf, side);
+    }
+
+    /// The root a script moved since `hum_roots_seen` (either side, the
+    /// server's write first), and the snapshot taken.
+    fn hum_root_moved_since_seen(&mut self) -> Option<(Xform, Side)> {
+        let s = self.play.as_mut()?;
+        let ch = s.character.as_mut()?;
+        let (server_was, client_was) = ch.dynamic.roots_seen.take()?;
+        let root = ch.rig.root;
+        let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, *c)));
+        let server = rustudio_render::scene::xform_of(&self.doc, root);
+        let moved = |now: Option<Xform>, was: Option<Xform>| match (now, was) {
+            (Some(n), Some(w)) => ((n.pos - w.pos).length() > 1e-4 || !(n.rot - w.rot).abs_diff_eq(Mat3::ZERO, 1e-4)).then_some(n),
+            _ => None,
+        };
+        // (The body may have just moved to a server write the client copy hasn't
+        // had yet: each side against its own value; the server's write first.)
+        moved(server, server_was).map(|xf| (xf, Side::Server)).or_else(|| moved(client, client_was).map(|xf| (xf, Side::Client)))
+    }
+
     /// Just before the world steps (after Stepped / PreSimulation's writes reached
     /// it): each side's root as the step starts from. `hum_post` honours a script
     /// write made after this, while the batch is in flight.
@@ -907,19 +1008,10 @@ impl Game {
     /// welded to a seat is moved by the world itself. A step on the calling thread
     /// leaves no such window and never gets here.)
     pub(super) fn hum_script_moves(&mut self) {
+        let moved = self.hum_root_moved_since_seen();
         let Some(s) = self.play.as_mut() else { return };
         let Some(ch) = s.character.as_mut() else { return };
-        let Some((server_was, client_was)) = ch.dynamic.roots_seen.take() else { return };
-        let root = ch.rig.root;
-        let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, *c)));
-        let server = rustudio_render::scene::xform_of(&self.doc, root);
-        let moved = |now: Option<Xform>, was: Option<Xform>| match (now, was) {
-            (Some(n), Some(w)) => ((n.pos - w.pos).length() > 1e-4 || !(n.rot - w.rot).abs_diff_eq(Mat3::ZERO, 1e-4)).then_some(n),
-            _ => None,
-        };
-        // (The body may have just moved to a server write the client copy hasn't
-        // had yet: each side against its own value; the server's write first.)
-        ch.dynamic.script_root = moved(server, server_was).or_else(|| moved(client, client_was));
+        ch.dynamic.script_root = moved;
     }
 
     /// After the Animator and Stepped: the colliders follow the animated
@@ -961,11 +1053,18 @@ impl Game {
         // the stepped pose being written over it. Studio keeps a server CFrame /
         // PivotTo of the player's character on both sides: the server tracks the        // CFrame revision it sent, the client acks it and owner poses older than        // the ack are dropped before they reach the body. The server's write is checked first for the same reason.
         ch.dynamic.roots_seen = None;
-        if let Some(xf) = ch.dynamic.script_root.take() {
-            s.physics.teleport_humanoid(model, &xf);
-            root_xf = xf;
+        if let Some((xf, side)) = ch.dynamic.script_root.take() {
+            if side == Side::Client {
+                s.physics.teleport_humanoid(model, &xf);
+                root_xf = xf;
+            } else {
+                ch.dynamic.deferred_server_root = Some(xf);
+            }
         }
         let pose = ch.rig.solve(root_xf, &ch.dynamic.transforms);
+        // (the server copy keeps a server write until the body has gone there,
+        // `hum_server_root`; the stepped pose is the client's)
+        let server_pose = ch.dynamic.deferred_server_root.map(|xf| ch.rig.solve(xf, &ch.dynamic.transforms));
         ch.last_root = Some(root_xf);
         ch.body.pos = root_xf.pos - Vec3::Y * ch.root_lift;
         ch.yaw = rustudio_physics::humanoid::yaw_of_look(-root_xf.rot.z_axis);
@@ -995,6 +1094,10 @@ impl Game {
         let fell = root_xf.pos.y < s.physics.fallen_height;
         let mut pose = pose;
         pose.extend(self.tool_pose(&pose));
+        let server_pose = server_pose.map(|mut p| {
+            p.extend(self.tool_pose(&p));
+            p
+        });
         let client_tool = self.client_tool_pose(&pose);
         if let Some(s) = self.play.as_mut() {
             if let Some(cdoc) = s.other_doc.as_mut() {
@@ -1002,7 +1105,7 @@ impl Game {
                 rig::write_pose(cdoc, &client_tool, None);
             }
         }
-        rig::write_pose(&mut self.doc, &pose, None);
+        rig::write_pose(&mut self.doc, server_pose.as_ref().unwrap_or(&pose), None);
         let humanoid = out.humanoid;
         if let Some(m) = out.floor_changed {
             let v = Variant::Enum(rbx_dom_weak::types::Enum::from_u32(m));
@@ -1393,6 +1496,112 @@ mod script_moves_player_character_tests {
         assert!(client_since.is_some(), "the client never had the server's CFrame");
     }
 
+    /// A player-owned R6 character whose legs exist only on its client
+    /// (e.g. the server's character is a Torso and a root, a
+    /// LocalScript builds the limbs) stands on those legs, as in Studio,
+    /// where the owning client simulates its character with its own
+    /// DataModel. The full hip was read from the server's copy: no legs,
+    /// 2 studs short, and the character stood on its torso. Walking, those
+    /// legs are posed on the torso before PostSimulation (they read a frame
+    /// behind it, 0.37 studs here).
+    #[test]
+    fn r6_legs_only_the_owning_client_has_hold_the_character_up() {
+        let mut game = Game::new(None);
+        game.play_rig = Some(rustudio_engine::rig::RigType::R6);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 120);
+        let height = |game: &mut Game| {
+            game.run_luau(Side::Client, r#"
+                local ch = game.Players.LocalPlayer.Character
+                local root = ch.HumanoidRootPart
+                local params = RaycastParams.new()
+                params.FilterDescendantsInstances = {ch}
+                local hit = workspace:Raycast(root.Position, Vector3.new(0, -20, 0), params)
+                error(string.format("height %.3f", root.Position.Y - hit.Position.Y))
+            "#)
+            .and_then(|e| e.split("height ").nth(1).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f32>().ok()))
+            .expect("height")
+        };
+        let before = height(&mut game);
+        assert!((before - 3.0).abs() < 0.2, "R6 root {before} studs over the floor at the start");
+        // The server drops the legs; the client puts its own back.
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local ch = game:GetService("Players"):GetPlayers()[1].Character
+                ch["Left Leg"]:Destroy()
+                ch["Right Leg"]:Destroy()
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 10);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local ch = game.Players.LocalPlayer.Character
+                assert(not ch:FindFirstChild("Left Leg"), "the server's removal didn't replicate")
+                for _, side in {{"Left", -1}, {"Right", 1}} do
+                    local leg = Instance.new("Part")
+                    leg.Name = side[1] .. " Leg"
+                    leg.Size = Vector3.new(1, 2, 1)
+                    leg.CanCollide = false
+                    local hip = Instance.new("Motor6D")
+                    hip.Name = side[1] .. " Hip"
+                    hip.Part0 = ch.Torso
+                    hip.Part1 = leg
+                    hip.C0 = CFrame.new(side[2] * 0.5, -1, 0)
+                    hip.C1 = CFrame.new(0, 1, 0)
+                    leg.Parent = ch
+                    hip.Parent = ch.Torso
+                    if side[1] == "Left" then _G.leftHip = hip end
+                end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 180);
+        let after = height(&mut game);
+        assert!((after - 3.0).abs() < 0.2, "R6 root {after} studs over the floor on client-only legs (3 with legs)");
+        // Walking, the client-only legs are where their hips put them when
+        // PostSimulation (Heartbeat) reads them (they lagged the torso by a
+        // frame of motion: 0.27 studs at 16 studs/s).
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local RS = game:GetService("RunService")
+                local ch = game.Players.LocalPlayer.Character
+                local hip = _G.leftHip
+                _G.worst, _G.fast, _G.calls, _G.start = 0, 0, 0, ch.HumanoidRootPart.Position
+                local function check()
+                    _G.calls += 1
+                    local want = hip.Part0.CFrame * hip.C0 * hip.Transform * hip.C1:Inverse()
+                    _G.worst = math.max(_G.worst, (want.Position - hip.Part1.Position).Magnitude)
+                    if ch.HumanoidRootPart.AssemblyLinearVelocity.Magnitude > 8 then _G.fast += 1 end
+                end
+                RS.PostSimulation:Connect(function()
+                    local ok, e = pcall(check)
+                    if not ok then _G.err = e end
+                end)
+                ch.Humanoid:MoveTo(ch.HumanoidRootPart.Position + Vector3.new(0, 0, -200))
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 90);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                assert(not _G.err, _G.err)
+                assert(_G.fast > 30, "the character didn't walk: " .. _G.fast .. " of " .. _G.calls .. " moved " .. tostring(game.Players.LocalPlayer.Character.HumanoidRootPart.Position - _G.start))
+                assert(_G.worst < 0.02, string.format("Left Leg %.3f studs off its hip while walking", _G.worst))
+            "#),
+            None
+        );
+    }
+
     #[test]
     fn local_character_falls_through_a_streamed_out_floor() {
         use rbx_dom_weak::types::{Enum, Variant};
@@ -1482,5 +1691,311 @@ mod script_moves_player_character_tests {
         );
         // The server still has it solid.
         assert_eq!(game.run_luau(Side::Server, "assert(workspace.Door.CanCollide)"), None);
+    }
+
+    /// Roblox (LBG's Savage Fangs, a client-side cutscene over an R6 character):
+    /// a BodyPosition with P 160, D 22, MaxForce 1e5 that the owning client puts
+    /// in its HumanoidRootPart lifts the character 33 studs in about a third of a
+    /// second (a PD controller on the assembly's acceleration), and the server's
+    /// view follows; a server `PrimaryPart.CFrame =` while that client mover is
+    /// gone again drops the character to the ground at once on both sides, and
+    /// a later server CFrame write while a client BodyVelocity drives the
+    /// character forward is kept too (the move's teleports on a miss / grab).
+    #[test]
+    fn client_body_position_lifts_the_character_quickly_and_server_cframes_stick() {
+        let (mut game, ctx) = playing();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 150);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local RunService = game:GetService("RunService")
+                local ch = game:GetService("Players").LocalPlayer.Character
+                assert(ch and ch:FindFirstChild("HumanoidRootPart"), "no character")
+                local root = ch.HumanoidRootPart
+                _G.y0 = root.Position.Y
+                _G.ys = {}
+                local bp = Instance.new("BodyPosition")
+                bp.D = 22
+                bp.P = 160
+                bp.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+                bp.Position = (root.CFrame * CFrame.new(0, 33, 0)).Position
+                bp.Parent = root
+                _G.bp = bp
+                RunService.Heartbeat:Connect(function()
+                    table.insert(_G.ys, root.Position.Y - _G.y0)
+                end)
+            "#),
+            None
+        );
+        // 0.5 s: Roblox is at the goal (a hair of overshoot) after ~0.35 s.
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local ys = _G.ys
+                local rows = {}
+                for i = 1, #ys, 3 do table.insert(rows, string.format("%.1f", ys[i])) end
+                local at20 = ys[20] or 0
+                assert(at20 > 28 and at20 < 38, "client rose " .. string.format("%.1f", at20) .. " studs in 20 frames; per 3 frames: " .. table.concat(rows, " "))
+            "#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                _G.hi = root.Position.Y
+            "#),
+            None
+        );
+        // the server's copy of the client-owned character is up there too
+        let mut server_up = false;
+        for _ in 0..30 {
+            tick(&mut game, &ctx, 1);
+            if game.run_luau(Side::Server, r#"
+                local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                assert(root.Position.Y > _G.hi - 1 and root.Position.Y > 20, "server sees Y " .. root.Position.Y)
+            "#).is_none() {
+                server_up = true;
+                break;
+            }
+        }
+        assert!(server_up, "the server never saw the character up");
+        // Land marker: the client removes its BodyPosition, the server puts the
+        // character on the ground in the same frame (Utils.SetCFrame, server set).
+        assert_eq!(game.run_luau(Side::Client, "_G.bp:Destroy() _G.bp = nil"), None);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local ch = game:GetService("Players"):GetPlayers()[1].Character
+                local root = ch.HumanoidRootPart
+                _G.ground = Vector3.new(root.Position.X + 10, 3.5, root.Position.Z + 10)
+                ch.PrimaryPart.CFrame = CFrame.new(_G.ground)
+            "#),
+            None
+        );
+        for n in 1..=12 {
+            tick(&mut game, &ctx, 1);
+            assert_eq!(
+                game.run_luau(Side::Server, r#"
+                    local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                    assert((root.Position - _G.ground).Magnitude < 2, "server root at " .. tostring(root.Position) .. ", put at " .. tostring(_G.ground))
+                "#),
+                None,
+                "server {n} frames after the drop"
+            );
+        }
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                assert(root.Position.Y < _G.y0 + 2, "client root still at Y " .. root.Position.Y .. " 12 frames after the server dropped it to the ground")
+            "#),
+            None
+        );
+        // Grab marker: a client BodyVelocity (MaxForce 85000, 44 studs/s forward),
+        // then the server teleports the character 30 studs ahead on a miss.
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                local bv = Instance.new("BodyVelocity")
+                bv.MaxForce = Vector3.new(85000, 85000, 85000)
+                bv.Velocity = root.CFrame.LookVector * 44
+                bv.Parent = root
+                _G.bv = bv
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 20);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                local v = root.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+                assert(v.Magnitude > 35, "client drives at " .. v.Magnitude .. " studs/s under a 44 studs/s BodyVelocity")
+            "#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local ch = game:GetService("Players"):GetPlayers()[1].Character
+                local root = ch.HumanoidRootPart
+                _G.tp = (root.CFrame * CFrame.new(0, 0, -30)).Position
+                ch.PrimaryPart.CFrame = CFrame.new(_G.tp) * root.CFrame.Rotation
+            "#),
+            None
+        );
+        assert_eq!(game.run_luau(Side::Client, "_G.bv:Destroy() _G.bv = nil"), None);
+        let mut client_there = false;
+        for n in 1..=12 {
+            tick(&mut game, &ctx, 1);
+            assert_eq!(
+                game.run_luau(Side::Server, r#"
+                    local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                    assert((root.Position - _G.tp).Magnitude < 6, "server root at " .. tostring(root.Position) .. ", teleported to " .. tostring(_G.tp))
+                "#),
+                None,
+                "server {n} frames after the teleport"
+            );
+            if !client_there {
+                // (the client reads the server's goal through an attribute)
+                assert_eq!(game.run_luau(Side::Server, r#"workspace:SetAttribute("tp", _G.tp)"#), None);
+                client_there = game.run_luau(Side::Client, r#"
+                    local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                    local tp = workspace:GetAttribute("tp")
+                    assert(tp and (root.Position - tp).Magnitude < 6, "client root at " .. tostring(root.Position) .. ", server teleported to " .. tostring(tp))
+                "#).is_none();
+            }
+        }
+        assert!(client_there, "the client never arrived at the server's teleport");
+    }
+
+    /// Roblox: a server `PrimaryPart.CFrame =` on the player's character made
+    /// from a RunService.Stepped handler (or an AnimationTrack marker, which the
+    /// Animator fires in the same place of the frame: LBG's Savage Fangs lands the
+    /// character from its Land marker) holds, like one made before the frame.
+    /// The write came after the Humanoid step had read the root and before the
+    /// world stepped: the stepped pose was written over it and the character
+    /// stayed where it was (33 studs up, falling from there).
+    #[test]
+    fn server_cframe_from_a_stepped_handler_sticks() {
+        let (mut game, ctx) = playing();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 120);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local ch = game:GetService("Players"):GetPlayers()[1].Character
+                local root = ch.HumanoidRootPart
+                _G.tp = Vector3.new(root.Position.X + 25, root.Position.Y, root.Position.Z + 25)
+                game:GetService("RunService").Stepped:Once(function()
+                    ch.PrimaryPart.CFrame = CFrame.new(_G.tp)
+                    _G.wrote = true
+                end)
+            "#),
+            None
+        );
+        let mut client_there = false;
+        for n in 1..=15 {
+            tick(&mut game, &ctx, 1);
+            assert_eq!(
+                game.run_luau(Side::Server, r#"
+                    assert(_G.wrote, "Stepped never fired")
+                    local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                    local d = (root.Position - _G.tp) * Vector3.new(1, 0, 1)
+                    assert(d.Magnitude < 0.5, "server root at " .. tostring(root.Position) .. ", put at " .. tostring(_G.tp))
+                "#),
+                None,
+                "server {n} frames after the Stepped write"
+            );
+            if !client_there {
+                assert_eq!(game.run_luau(Side::Server, r#"workspace:SetAttribute("tp", _G.tp)"#), None);
+                client_there = game.run_luau(Side::Client, r#"
+                    local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                    local tp = workspace:GetAttribute("tp")
+                    local d = (root.Position - tp) * Vector3.new(1, 0, 1)
+                    assert(tp and d.Magnitude < 0.5, "client root at " .. tostring(root.Position) .. ", server put it at " .. tostring(tp))
+                "#).is_none();
+            }
+        }
+        assert!(client_there, "the client never had the server's CFrame");
+    }
+
+    /// Roblox (LBG's Savage Fangs' Land marker): the server fires the client
+    /// a RemoteEvent on which it destroys the BodyPosition holding its
+    /// character 30 studs up, then (same handler) sets the character's CFrame
+    /// to the ground. The owner gets both in that order: the character is on
+    /// the ground from then on. The body went to the server's CFrame before
+    /// the client had the event, with the BodyPosition still on it for one
+    /// step: 30 studs from its goal, it threw the character back up.
+    #[test]
+    fn server_cframe_behind_a_fire_client_lands_the_character_for_good() {
+        let (mut game, ctx) = playing();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+                local re = Instance.new("RemoteEvent")
+                re.Name = "SF"
+                re.Parent = game:GetService("ReplicatedStorage")
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 120);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                local bp = Instance.new("BodyPosition")
+                bp.D = 22
+                bp.P = 160
+                bp.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+                bp.Position = root.Position + Vector3.new(0, 30, 0)
+                bp.Parent = root
+                _G.y0 = root.Position.Y
+                _G.ymax_after = nil
+                game:GetService("ReplicatedStorage"):WaitForChild("SF").OnClientEvent:Connect(function()
+                    bp:Destroy()
+                    _G.ended = true
+                end)
+                game:GetService("RunService").Heartbeat:Connect(function()
+                    if _G.ended then
+                        _G.ymax_after = math.max(_G.ymax_after or 0, root.Position.Y)
+                    end
+                end)
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 40);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                assert(root.Position.Y > _G.y0 + 25, "client only rose to " .. root.Position.Y - _G.y0)
+            "#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                local ch = plr.Character
+                _G.ground = Vector3.new(ch.HumanoidRootPart.Position.X, 3.5, ch.HumanoidRootPart.Position.Z)
+                game:GetService("RunService").Stepped:Once(function()
+                    game:GetService("ReplicatedStorage").SF:FireClient(plr)
+                    ch.PrimaryPart.CFrame = CFrame.new(_G.ground)
+                end)
+            "#),
+            None
+        );
+        for n in 1..=30 {
+            tick(&mut game, &ctx, 1);
+            assert_eq!(
+                game.run_luau(Side::Server, r#"
+                    local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                    assert((root.Position - _G.ground).Magnitude < 2.5, "server root at " .. tostring(root.Position) .. ", put at " .. tostring(_G.ground))
+                "#),
+                None,
+                "server {n} frames after the landing"
+            );
+        }
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                assert(_G.ended, "the client never got the event")
+                assert(root.Position.Y < _G.y0 + 1.5, "client root at Y " .. root.Position.Y .. " half a second after the landing (stood at " .. _G.y0 .. ")")
+                assert(_G.ymax_after < _G.y0 + 8, "the client went back up to Y " .. _G.ymax_after .. " after the landing (stood at " .. _G.y0 .. ")")
+            "#),
+            None
+        );
     }
 }

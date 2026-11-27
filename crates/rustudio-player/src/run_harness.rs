@@ -46,6 +46,12 @@ pub struct RunHarness {
     /// `--no-render`: no GPU device on purpose (src/offscreen.rs); shots
     /// write no picture.
     pub no_render: bool,
+    /// Whether Play Core UI (`CoreGui`: topbar, leaderboard, chat, backpack)
+    /// starts shown: false by default in `--headless` / `--no-render` runs
+    /// unless overridden by `--show-core-ui` or `RUSTUDIO_SHOW_CORE_UI=1`.
+    pub show_core_gui: bool,
+    /// True when `show_core_gui` was explicitly forced by CLI or env.
+    pub show_core_gui_explicit: bool,
     /// `--seconds N` without --bench in a --no-ui run: end the run at N
     /// seconds on the harness clock (from Play's start with --from-play).
     pub end_after: Option<f32>,
@@ -81,6 +87,22 @@ pub struct HarnessInput {
 
 /// The process's exit code once a harness run finished (finish_run).
 pub static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Resolves whether Play Core UI (topbar, leaderboard, chat, backpack) starts
+/// shown and whether that value was explicitly overridden.
+///
+/// Precedence: explicit CLI flag (`--show-core-ui` / `--hide-core-ui` /
+/// `--no-core-ui`) > `RUSTUDIO_SHOW_CORE_UI` env var > `!headless`.
+pub fn resolve_show_core_gui(cli: Option<bool>, env: Option<&str>, headless: bool) -> (bool, bool) {
+    if let Some(v) = cli {
+        return (v, true);
+    }
+    if let Some(v) = env.map(str::trim).filter(|s| !s.is_empty()) {
+        let on = !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"));
+        return (on, true);
+    }
+    (!headless, false)
+}
 
 impl RunHarness {
     /// Whether StudioTestService:EndTest ends the whole run here (a --no-ui
@@ -718,6 +740,41 @@ impl HarnessAction {
         Some((at.trim().parse().ok()?, HarnessAction::Text(text.to_string())))
     }
 
+    /// `--finger X1,Y1>X2,Y2@S`: a finger of the game's (touch identity,
+    /// `RUSTUDIO_TOUCH=1`; touch_input.rs `harness_finger`) in the 3D view
+    /// (view coordinates): down at S, moving in 10 steps over 0.5 s, lifted
+    /// at S + 0.6. `--tap X,Y@S`: down at S, lifted 0.1 s later, still.
+    /// (`UiAction("finger:ID:PHASE:X,Y")` each; app.rs `harness_inject`.)
+    pub fn parse_finger(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
+        let (what, at) = s.split_once('@')?;
+        let at: f32 = at.trim().parse().ok()?;
+        let (a, b) = what.split_once('>')?;
+        let xy = |p: &str| -> Option<(f32, f32)> {
+            let (x, y) = p.split_once(',')?;
+            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+        };
+        let ((x1, y1), (x2, y2)) = (xy(a)?, xy(b)?);
+        let finger = |phase: &str, x: f32, y: f32| HarnessAction::UiAction(format!("finger:1:{phase}:{x},{y}"));
+        let mut v = vec![(at, finger("start", x1, y1))];
+        for k in 1..=10 {
+            let f = k as f32 / 10.0;
+            v.push((at + 0.05 * k as f32, finger("move", x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)));
+        }
+        v.push((at + 0.6, finger("end", x2, y2)));
+        Some(v)
+    }
+
+    pub fn parse_tap(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
+        let (xy, at) = s.split_once('@')?;
+        let at: f32 = at.trim().parse().ok()?;
+        let (x, y) = xy.split_once(',')?;
+        let (x, y): (f32, f32) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
+        Some(vec![
+            (at, HarnessAction::UiAction(format!("finger:1:start:{x},{y}"))),
+            (at + 0.1, HarnessAction::UiAction(format!("finger:1:end:{x},{y}"))),
+        ])
+    }
+
     /// `--ldrag X1,Y1>X2,Y2@S`: left-drag in the 3D view (view coordinates):
     /// press at S, move in 10 steps over 0.5 s, let go at S + 0.6.
     /// `--lhold X,Y@S:HOLD`: the left button pressed at X,Y at S, let go at S + HOLD
@@ -1030,4 +1087,21 @@ pub fn frame_grid(dt: f32) -> f32 {
     // period of that is held against the frames that follow.)
     *owed = (*owed - n / hz).max(-0.25 / hz);
     n / hz
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_show_core_gui;
+
+    #[test]
+    fn show_core_gui_defaults_off_in_headless_and_honors_overrides() {
+        assert_eq!(resolve_show_core_gui(None, None, false), (true, false));
+        assert_eq!(resolve_show_core_gui(None, None, true), (false, false));
+        assert_eq!(resolve_show_core_gui(Some(true), None, true), (true, true));
+        assert_eq!(resolve_show_core_gui(Some(false), None, false), (false, true));
+        assert_eq!(resolve_show_core_gui(None, Some("1"), true), (true, true));
+        assert_eq!(resolve_show_core_gui(None, Some("0"), false), (false, true));
+        assert_eq!(resolve_show_core_gui(None, Some("false"), false), (false, true));
+        assert_eq!(resolve_show_core_gui(Some(false), Some("1"), false), (false, true));
+    }
 }

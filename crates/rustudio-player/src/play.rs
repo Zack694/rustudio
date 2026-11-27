@@ -394,8 +394,17 @@ impl ServerPhase {
     }
 }
 
+/// The Enum.CloseReason a Studio Stop gives BindToClose callbacks.
+const CLOSE_REASON: &str = "DeveloperShutdown";
+
 pub struct PlaySession {
     pub mode: RunMode,
+    /// Stop has begun closing the session the way Studio does: the client
+    /// left, the server runs its BindToClose callbacks (since this instant).
+    pub(crate) closing: Option<std::time::Instant>,
+    /// The close finished (every BindToClose returned, or the shutdown
+    /// deadline passed): the session can be torn down.
+    pub(crate) close_done: bool,
     /// Place content loads only Roblox content while this session lives
     /// (assets::place_content_allowed).
     _scripts_running: Option<rustudio_core::assets::ScriptsRunning>,
@@ -506,6 +515,8 @@ impl PlaySession {
             map: Default::default(),
             physics: PlayPhysics(None),
             pending_frame: None,
+            closing: None,
+            close_done: false,
             server_phase: None,
             touch_seen: None,
             character: None,
@@ -559,6 +570,11 @@ impl PlaySession {
     /// The id of the DataModel not shown (the server's while the client is).
     pub fn other_doc_id(&self) -> Option<u64> {
         self.other_doc.as_ref().map(|d| d.id)
+    }
+
+    /// How many instances the DataModel not shown has (the memory log).
+    pub fn other_doc_instances(&self) -> Option<usize> {
+        self.other_doc.as_ref().map(|d| d.dom.descendants().count())
     }
 }
 
@@ -859,26 +875,25 @@ impl Game {
         // From before any script runs until the session ends: no local files
         // as place content (assets::place_content_allowed).
         let scripts_running = rustudio_core::assets::ScriptsRunning::new();
-        // Cloud data stays in memory for any published place but the
-        // scratch experience (domains::data::local_mode_for).
+        // A published place's Play uses its real cloud data, as Studio's
+        // does, unless Data in Play says otherwise (domains::data::local_mode_for).
         let universe = live_ids
             .map(|(u, _)| u)
             .or_else(|| self.doc.cloud.as_ref().map(|o| o.universe_id))
             .unwrap_or(0);
         rustudio_engine::runtime::domains::data::PLAY_UNIVERSE
             .store(universe, std::sync::atomic::Ordering::Relaxed);
-        if rustudio_engine::runtime::domains::data::local_mode_for(universe) && universe != 0 {
-            self.push_log(
-                rustudio_core::log::Level::Warn,
-                format!(
-                    "DataStores, MemoryStores and Messaging stay in memory for this Play \
-                     (universe {universe} is a published game; Studio Settings > rustudio > \
-                     Use live DataStores uses its real data)"
-                ),
-            );
-        }
-        if rustudio_core::rustudio_settings::live_data() {
-            self.info("DataStores: live");
+        if universe != 0 {
+            if rustudio_engine::runtime::domains::data::local_mode_for(universe) {
+                self.push_log(
+                    rustudio_core::log::Level::Warn,
+                    "DataStores, MemoryStores and Messaging stay in memory for this Play (Studio Settings > rustudio > Data in Play is \"In memory only\")".to_string(),
+                );
+            } else {
+                self.info(format!(
+                    "DataStores, MemoryStores and Messaging use universe {universe}'s real data, as in Studio (writes need the game's \"Enable Studio Access to API Services\")"
+                ));
+            }
         }
         let play_doc = teleport.as_ref().map_or(&self.doc, |destination| &destination.doc);
         let signal_mode = SignalMode::of(play_doc);
@@ -917,9 +932,20 @@ impl Game {
         // session's copy is made; the edit document is what Stop brings back)
         let mut edit_doc = teleport.map(|t| std::mem::replace(&mut self.doc, t.doc));
         let label = if two { "Play" } else { "Run" };
-        let mut server_doc = self
-            .doc
-            .clone_for_play(format!("{} ({label}: Server)", self.doc.title));
+        let title = self.doc.title.clone();
+        // A play worker's document is a copy made for this session already
+        // (start_play_threaded): it becomes the server DataModel as it is.
+        // Copying it again held a fourth copy of the place for the whole
+        // session and took as long as the first (a million-instance place:
+        // ~1 GB and ~6 s more, and the session's start ran out of memory).
+        let take = std::mem::take(&mut self.doc_is_play_copy) && edit_doc.is_none();
+        let mut server_doc = if take {
+            let mut d = std::mem::replace(&mut self.doc, Document::placeholder());
+            d.title = format!("{title} ({label}: Server)");
+            d
+        } else {
+            self.doc.clone_for_play(format!("{title} ({label}: Server)"))
+        };
         // Roblox's default PlayerModule, PlayerScriptsLoader and
         // RbxCharacterSounds join StarterPlayerScripts, as Studio does.
         // Every Roblox DataModel has these services, even when the file
@@ -1006,7 +1032,7 @@ impl Game {
         let (mut client_doc, map) = if two {
             let (c, m) = replicate::initial_client(
                 &server_doc,
-                format!("{} ({label}: Client)", self.doc.title),
+                format!("{title} ({label}: Client)"),
             );
             (Some(c), m)
         } else {
@@ -1157,6 +1183,17 @@ impl Game {
         });
         rustudio_core::load_trace::mark("play: server scripts started");
         if two {
+            // A client only ever joins a server that has been running: for
+            // seconds on a live server, for the frames a Studio Play join
+            // takes. The server's first frames' resumptions — a module's
+            // `spawn(function() ... end)` at require time, a `task.wait()`
+            // before the setup, a Heartbeat:Wait() — have run before the
+            // join snapshot is taken, so what they build is in it.
+            // (Forsaken's ServerStarter makes workspace.Players / Map / Misc
+            // and moves the Lobby into Map inside a spawn(); joined at once,
+            // the client's StarterPlayerScripts indexed workspace.Map.Lobby
+            // before it existed — "Map is not a valid member of Workspace".)
+            self.server_head_start();
             self.create_player();
             if self.play.as_ref().is_some_and(|s| s.map.streaming()) {
                 let (position, _) = self.character_spawn_point();
@@ -1224,6 +1261,27 @@ impl Game {
         rustudio_core::load_trace::mark("play: DataModels running");
     }
 
+    /// The server frames that run before the player joins (`start_play`):
+    /// their Heartbeat and the resumptions due at each (legacy spawn /
+    /// wait, task.wait, a Heartbeat:Wait()), no physics — the time a join
+    /// takes, in server frames.
+    fn server_head_start(&mut self) {
+        const FRAMES: u32 = 6;
+        let dt = 1.0 / 60.0;
+        let root = self.doc.dom.root_ref();
+        let run_service = self.doc.find_child(root, "RunService");
+        self.with_side(Side::Server, |rt, _, _| {
+            for _ in 0..FRAMES {
+                if let Some(rs) = run_service {
+                    rt.fire(rs, "PostSimulation", vec![Value::Number(dt)]);
+                    rt.fire(rs, "Heartbeat", vec![Value::Number(dt)]);
+                }
+                rt.step(dt);
+            }
+        });
+        rustudio_core::load_trace::mark("play: server head start");
+    }
+
     /// Player.CharacterRemoving (on both sides) just before the old character
     /// goes, as Roblox does on respawn and LoadCharacter.
     fn fire_character_removing(&mut self, model: Ref) {
@@ -1257,6 +1315,51 @@ impl Game {
         }
     }
 
+    /// The local player leaves the server, as in Roblox: CharacterRemoving
+    /// and the character goes, PlayerRemoving(player, reason), then the
+    /// Player leaves Players. (A kick; Stop, where Studio closes the client.)
+    pub(crate) fn player_leaves(&mut self, reason: &str) {
+        let Some(player) = self.play.as_ref().map(|s| s.player).filter(|p| p.is_some()) else {
+            return;
+        };
+        let model = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model);
+        if let Some(m) = model {
+            self.fire_character_removing(m);
+        }
+        let players = self.doc.find_child(self.doc.dom.root_ref(), "Players");
+        self.with_side(Side::Server, |rt, _, _| {
+            if let Some(ps) = players {
+                let reason = rt
+                    .lua
+                    .load(format!("return Enum.PlayerExitReason.{reason}"))
+                    .eval::<Value>()
+                    .unwrap_or(Value::Nil);
+                rt.fire(ps, "PlayerRemoving", vec![rt.inst(player), reason]);
+                rt.dispatch();
+            }
+            let leave = rt
+                .lua
+                .load("return function(p) local c = p.Character if c then p.Character = nil c:Destroy() end p.Parent = nil end")
+                .set_name("=rustudio.player_leaves")
+                .eval::<mlua::Function>();
+            if let Ok(f) = leave {
+                let left = rustudio_engine::runtime::security::with_main_identity(
+                    &rt.lua,
+                    rustudio_engine::runtime::security::CORE,
+                    || f.call::<()>(rt.inst(player)),
+                );
+                if let Err(e) = left {
+                    rt.report_error(&e);
+                }
+                rt.dispatch();
+            }
+        });
+        // The session stops driving the character it no longer has.
+        if let Some(s) = self.play.as_mut() {
+            s.character = None;
+        }
+    }
+
     /// Players.PlayerRemoving when Play stops (the player leaves the server),
     /// with one dispatch so handlers run before the session goes.
     fn fire_player_removing(&mut self) {
@@ -1286,7 +1389,100 @@ impl Game {
         }
     }
 
+/// Roblox's shutdown deadline: BindToClose callbacks get this long before
+    /// the server stops anyway (OnCloseTimeoutInSeconds' default).
+    pub const CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Whether Stop has begun closing the session (and is waiting on it).
+    pub fn is_closing(&self) -> bool {
+        self.play.as_ref().is_some_and(|s| s.closing.is_some())
+    }
+
+    /// Whether a begun close has finished and the session can end.
+    pub fn close_finished(&self) -> bool {
+        self.play.as_ref().is_some_and(|s| s.closing.is_some() && s.close_done)
+    }
+
+    /// Begins Studio's Stop: the client leaves (PlayerRemoving, the client's
+    /// scripts stop), then the server's game:BindToClose callbacks run while
+    /// the session keeps stepping. `close_finished` says when it's over;
+    /// `stop_play_now` then ends the session. Runs where the runtimes are
+    /// (the gameplay worker in threaded Play).
+    pub fn begin_close(&mut self, host: &mut dyn GameHost) {
+        let _ = host;
+        if self.play.as_ref().is_none_or(|s| s.closing.is_some()) {
+            return;
+        }
+        if self.play.is_some() {
+            self.wait_for_play_physics();
+        }
+        // (with_side wants the server's DataModel in front; the session
+        // keeps stepping after this, so put the shown one back.)
+        self.server_front();
+        // Studio closes the client first: the player leaves the server.
+        self.player_leaves("Unknown");
+        self.with_side(Side::Server, |rt, _, _| {
+            if let Err(e) = rustudio_engine::runtime::begin_close(&rt.lua, CLOSE_REASON) {
+                rt.report_error(&e);
+            }
+            rt.dispatch();
+        });
+        self.shown_front();
+        if let Some(s) = self.play.as_mut() {
+            s.closing = Some(std::time::Instant::now());
+        }
+        self.update_close_state();
+        if !self.close_finished() {
+            self.info("Stopping: the server is running its BindToClose callbacks (Stop again to end now)");
+        }
+    }
+
+    /// After a step while closing: done once no BindToClose callback is
+    /// still running, or at the shutdown deadline.
+    pub(crate) fn update_close_state(&mut self) {
+        let Some(since) = self.play.as_ref().filter(|s| !s.close_done).and_then(|s| s.closing) else {
+            return;
+        };
+        let pending = self
+            .with_play_side(Side::Server, |rt, _, _| rustudio_engine::runtime::close_pending(&rt.lua))
+            .unwrap_or(false);
+        let late = since.elapsed() >= Self::CLOSE_DEADLINE;
+        if pending && late {
+            self.warn("Cancelling remaining scheduled operations due to shutdown deadline being reached");
+        }
+        if !pending || late {
+            if let Some(s) = self.play.as_mut() {
+                s.close_done = true;
+            }
+        }
+    }
+
     pub fn stop_play(&mut self, host: &mut dyn GameHost) {
+        self.stop_play_now(host)
+    }
+
+    /// Stop as Studio's Stop button: begins the close (see begin_close); a
+    /// Stop while closing ends the session now.
+    pub fn request_stop(&mut self, host: &mut dyn GameHost) {
+        if !self.is_playing() {
+            return;
+        }
+        if self.is_closing() || self.teleport_to.is_some() || self.fixed_dt.is_some() {
+            return self.stop_play_now(host);
+        }
+        if self.play_thread.is_some() {
+            self.begin_close_worker();
+            if let Some(s) = self.play.as_mut() {
+                s.closing = Some(std::time::Instant::now());
+            }
+        } else {
+            self.begin_close(host);
+        }
+    }
+
+    /// Ends the session at once (a forced Stop, a finished close, teleports,
+    /// self-tests): scripts' threads end with it.
+    pub fn stop_play_now(&mut self, host: &mut dyn GameHost) {
         // (a teleport ends this session to start the destination's)
         let teleporting = self.teleport_to.is_some() || std::mem::take(&mut self.quiet_stop);
         if teleporting {
@@ -1307,7 +1503,10 @@ impl Game {
                 s.server_phase = None;
             }
             self.server_front();
-            self.fire_player_removing();
+            // (A close already told the server the player left.)
+            if self.play.as_ref().is_some_and(|s| s.closing.is_none()) {
+                self.fire_player_removing();
+            }
             // The Play DataModels' plugin copies unload with them, the
             // client's first (measured in Studio: PlayClient, then PlayServer).
             self.with_side(Side::Client, |rt, _, _| host.unload_plugins(rt));
@@ -3405,6 +3604,7 @@ impl Game {
             self.threaded_step(keyboard, dt, host);
         } else {
             self.step_play(dt, host, &keyboard, false);
+            self.update_close_state();
         }
     }
 
@@ -3426,6 +3626,7 @@ impl Game {
             self.threaded_step(keyboard, dt, host);
         } else {
             self.step_play(dt, host, &keyboard, false);
+            self.update_close_state();
         }
     }
 
@@ -3682,6 +3883,9 @@ impl Game {
         {
             let _s = rustudio_core::bench::scope("p2_player_humanoid");
             hum_out = Some(self.hum_pre(dt));
+            // (the roots the Animator's markers / Stepped / PreSimulation
+            // write against: `hum_stepped_root`)
+            self.hum_roots_seen();
         }
         {
             let _s = rustudio_core::bench::scope("p2_npc_pre");
@@ -3727,6 +3931,7 @@ impl Game {
             }
         }
         if hum_out.is_some() {
+            self.hum_stepped_root();
             self.hum_roots_seen();
         }
         if hum_out.is_some() {
@@ -3743,7 +3948,10 @@ impl Game {
         // Keep the rendered document on the UI thread while the solver works
         // on its owned world. Commit and replicate at the next frame boundary.
         let sc = rustudio_core::bench::scope("p3_physics_step");
-        self.sync_touch_interest();
+        {
+            let _t = rustudio_core::bench::scope("p3_touch_interest");
+            self.sync_touch_interest();
+        }
         let input = PlayFrameInput {
             mode, dt, realtime, humanoid: hum_out, local_input_edge: self.play_input_pose_due,
         };
@@ -3987,9 +4195,23 @@ impl Game {
         let began = std::mem::take(began);
         let ended = std::mem::take(ended);
         let (mode, dt, realtime) = (phase.mode, phase.dt, phase.realtime);
+        // While the session closes the client has left (Studio closes the
+        // PlayClient first): its scripts no longer run.
+        let mode = if self.play.as_ref().is_some_and(|s| s.closing.is_some()) { RunMode::Run } else { mode };
         let (humanoid_server, seat_server) = (phase.humanoid_server, phase.seat_server);
         let velocities = std::mem::take(&mut phase.velocities);
         let state_names = std::mem::take(&mut phase.state_names);
+        // A server script wrote Player.Character this frame: the remotes it
+        // fired after the write reach the client after the write's client
+        // half (step 6: the property, CharacterAdded), as Roblox keeps a
+        // property change and a remote fired after it in one order.
+        // (Forsaken's ActorCreated handler reads
+        // LocalPlayer.Character.Humanoid: delivered before the half, it
+        // found the character the server had just destroyed — "Humanoid is
+        // not a valid member" — and the thread that builds the ability bar
+        // died with it.)
+        let remotes_after_adopt = !phase.server_out.2.is_empty()
+            || self.play.as_ref().is_some_and(|s| s.character_client_pending.is_some());
         let sc = rustudio_core::bench::scope("p6_client_lua");
         if mode == RunMode::Play {
             let prep = rustudio_core::bench::scope("p6a_prep");
@@ -4157,6 +4379,21 @@ impl Game {
                     (seat, cseat, tf, sf)
                 });
             let mut vehicle_changed: Option<(Ref, i32, f32, i32, f32)> = None;
+            // The client's own joints follow this frame's replicated parts
+            // before its scripts run: parts only the client has (a place's
+            // LocalScript-built limbs on a server Torso) were still where the
+            // last frame's solve (p6d, after RenderStepped) left them, so
+            // Heartbeat and RenderStepped read limbs a frame behind a moving
+            // torso (0.27 studs at a walk, 60 fps). In Studio the owner's
+            // step poses its whole assembly before PostSimulation.
+            {
+                let _cj = rustudio_core::bench::scope("p6a_client_joints");
+                if let Some(s) = self.play.as_mut() {
+                    if let Some(cd) = s.other_doc.as_mut() {
+                        s.client_joints.solve(cd, &s.map.c2s);
+                    }
+                }
+            }
             let lua_sc = rustudio_core::bench::scope("p6b_lua");
             let server_doc_id = self.doc.id;
             self.with_side(Side::Client, |rt, _, _| {
@@ -4253,6 +4490,8 @@ impl Game {
                             Value::Boolean(gpe),
                         ],
                     );
+                    // (one resumption point per input: runtime.rs)
+                    rt.input_resumption_point();
                 };
                 rt.spawn_global("__rs_input_frame_end", vec![Value::Number(dt as f64)]);
                 // The device's motion sensors' new samples (touch screens).
@@ -4303,6 +4542,9 @@ impl Game {
                             Value::Table(began_on),
                         ],
                     );
+                    // The finger's handlers before its next event changes
+                    // its InputObject (runtime.rs input_resumption_point).
+                    rt.input_resumption_point();
                 }
                 for g in &touch_gestures {
                     use crate::touch_gestures::Gesture;
@@ -4540,7 +4782,10 @@ impl Game {
             if mode == RunMode::Play && studio_path() {
                 self.hum_face_camera();
             }
-            self.deliver_remotes();
+            if !remotes_after_adopt {
+                // (else after step 6's character write: `remotes_after_adopt`)
+                self.deliver_remotes();
+            }
             // Client -> Server Animator replication for the local player's character
             // (in Studio, the owning client drives its character's Animator and
             // replicates those tracks back to the server Animator).
@@ -4685,6 +4930,10 @@ impl Game {
             self.adopt_character(player, model);
         }
         self.character_client_half();
+        if remotes_after_adopt {
+            // (held back above, until the character write's client half)
+            self.deliver_remotes();
+        }
         let due = self
             .play
             .as_ref()
@@ -5212,6 +5461,53 @@ mod client_start_order_tests {
         tick(&mut game, 1);
         assert_eq!(
             game.run_luau(Side::Client, r#"assert(_G.spawnReady == true, "spawn GUI did not see initialized data")"#),
+            None
+        );
+    }
+
+    /// The player joins a server that has run its first frames
+    /// (`server_head_start`): what a server module built in a `spawn()` at
+    /// require time is in the join snapshot, as on Roblox, where a join
+    /// takes seconds on a live server and frames in Studio. (Forsaken's
+    /// ServerStarter makes workspace.Map and moves the lobby into it in a
+    /// spawn(); a StarterPlayerScripts script of the game indexes
+    /// workspace.Map.Lobby at its start.) Server scripts still start
+    /// before the player exists.
+    #[test]
+    fn server_spawned_setup_is_in_the_join_snapshot() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let sss = game.doc.find_child(root, "ServerScriptService").unwrap();
+        game.doc.dom.insert(sss, InstanceBuilder::new("Script").with_property("Source", r#"
+            _G.players_at_start = #game:GetService("Players"):GetPlayers()
+            spawn(function()
+                local map = Instance.new("Folder")
+                map.Name = "Map"
+                map.Parent = workspace
+                Instance.new("Folder", map).Name = "Lobby"
+            end)
+            task.spawn(function()
+                game:GetService("RunService").Heartbeat:Wait()
+                Instance.new("Folder", workspace).Name = "Misc"
+            end)
+        "#.to_string()));
+        let sp = game.doc.find_child(root, "StarterPlayer").unwrap();
+        let sps = game.doc.find_child(sp, "StarterPlayerScripts").unwrap();
+        game.doc.dom.insert(sps, InstanceBuilder::new("LocalScript").with_property("Source", r#"
+            _G.lobby_at_start = workspace:FindFirstChild("Map") ~= nil
+                and workspace.Map:FindFirstChild("Lobby") ~= nil
+            _G.misc_at_start = workspace:FindFirstChild("Misc") ~= nil
+        "#.to_string()));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"assert(_G.players_at_start == 0, "a player existed when server scripts started")"#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                assert(_G.lobby_at_start == true, "the spawn()'d workspace.Map.Lobby was not in the join snapshot")
+                assert(_G.misc_at_start == true, "the Heartbeat-waited workspace.Misc was not in the join snapshot")
+            "#),
             None
         );
     }
@@ -6237,6 +6533,67 @@ mod character_set_tests {
                 local plr = game:GetService("Players").LocalPlayer
                 assert(plr.Character == nil, "client Character: " .. tostring(plr.Character))
                 assert(#_G.removing == 2, "client CharacterRemoving " .. #_G.removing)
+            "#),
+            None
+        );
+    }
+
+    /// A remote the server fires right after its `player.Character = rig`
+    /// reaches the client after the write (the property, CharacterAdded),
+    /// as Roblox keeps a property change and a remote fired after it in one
+    /// order — a game's "actor created" handler reads
+    /// LocalPlayer.Character.Humanoid at once (Forsaken's ActorNetwork; it
+    /// builds the ability bar in the same thread). Delivered before the
+    /// write's client half, it found the old character, which the server
+    /// had just destroyed: "Humanoid is not a valid member of Model", and
+    /// no abilities. (play.rs finish_client_phase `remotes_after_adopt`.)
+    #[test]
+    fn remote_fired_after_a_character_write_sees_the_new_character() {
+        let mut game = Game::new(None);
+        rig_in_storage(&mut game);
+        let root = game.doc.dom.root_ref();
+        let rs = game.doc.find_child(root, "ReplicatedStorage").unwrap();
+        game.doc.dom.insert(rs, InstanceBuilder::new("RemoteEvent").with_name("ActorCreated"));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        tick(&mut game, 90);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local plr = game:GetService("Players").LocalPlayer
+                _G.old = plr.Character
+                _G.seen = {}
+                game:GetService("ReplicatedStorage").ActorCreated.OnClientEvent:Connect(function(rig)
+                    local ch = plr.Character
+                    table.insert(_G.seen, {
+                        isRig = ch == rig,
+                        isOld = ch == _G.old,
+                        humanoid = ch and ch:FindFirstChildOfClass("Humanoid") ~= nil,
+                    })
+                end)
+            "#),
+            None
+        );
+        // Forsaken's order: the old character destroyed, the rig written,
+        // the remote fired — in one server thread.
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                local rig = game:GetService("ReplicatedStorage").SwapRig:Clone()
+                rig.Parent = workspace
+                plr.Character:Destroy()
+                plr.Character = rig
+                game:GetService("ReplicatedStorage").ActorCreated:FireAllClients(rig)
+            "#),
+            None
+        );
+        tick(&mut game, 10);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                assert(#_G.seen == 1, "the remote reached the client " .. #_G.seen .. " times")
+                local s = _G.seen[1]
+                assert(not s.isOld, "the handler found the old, destroyed character")
+                assert(s.isRig, "the handler's LocalPlayer.Character is not the rig")
+                assert(s.humanoid, "the handler's character has no Humanoid")
             "#),
             None
         );

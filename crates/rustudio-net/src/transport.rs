@@ -59,15 +59,24 @@ impl DialPlan {
 /// [verified: live 2026-11-05, Studio's log "UDMUX Address = …, Port = <NetStackPort>"]:
 /// the UDMUX relay's address at `NetStackPort`, with a RUPP header naming the
 /// RCC (`MachineAddress:NetStackPort`) and carrying the `NetStackTokenValue`.
+///
+/// A join script with no UDMUX endpoint and no `NetStackTokenValue`
+/// [seen live 2026-11-24] is a direct dial: `relay` is then the RCC itself
+/// and `token` is `None`, so no RUPP header is used.
 pub struct QuicTarget {
     pub relay: std::net::SocketAddr,
     pub rcc: (std::net::Ipv4Addr, u16),
-    token: [u8; 16],
+    token: Option<[u8; 16]>,
     /// SHA-256 of the accepted server certificates (NetStackConfig.certHashes).
     cert_hashes: Vec<[u8; 32]>,
 }
 
 impl QuicTarget {
+    /// True when this target dials the RCC directly, with no UDMUX relay.
+    pub fn is_direct(&self) -> bool {
+        self.token.is_none()
+    }
+
     pub fn from_join(js: &JoinScript) -> Result<QuicTarget> {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -85,13 +94,18 @@ impl QuicTarget {
                 .map_err(|_| NetError::JoinScript("bad UDMUX address".into()))?,
             None => std::net::IpAddr::V4(rcc_ip),
         };
-        let tok = b64
-            .decode(js.net_stack_token_value.expose())
-            .map_err(|_| NetError::JoinScript("NetStackTokenValue is not base64".into()))?;
-        let token: [u8; 16] = tok
-            .as_slice()
-            .try_into()
-            .map_err(|_| NetError::JoinScript(format!("NetStackTokenValue is {} bytes, not 16", tok.len())))?;
+        let token = if js.udmux_endpoints.is_empty() && js.net_stack_token_value.is_empty() {
+            // Direct dial: nothing to relay through, nothing to present.
+            None
+        } else {
+            let tok = b64
+                .decode(js.net_stack_token_value.expose())
+                .map_err(|_| NetError::JoinScript("NetStackTokenValue is not base64".into()))?;
+            let token: [u8; 16] = tok.as_slice().try_into().map_err(|_| {
+                NetError::JoinScript(format!("NetStackTokenValue is {} bytes, not 16", tok.len()))
+            })?;
+            Some(token)
+        };
         let cert_hashes = js
             .net_stack_config
             .as_ref()
@@ -309,9 +323,37 @@ mod tests {
         let t = QuicTarget::from_join(&js).unwrap();
         assert_eq!(t.relay.to_string(), "128.116.63.33:64852");
         assert_eq!(t.rcc, ("10.1.2.3".parse().unwrap(), 64852));
-        assert_eq!(t.token, *b"0123456789abcdef");
+        assert_eq!(t.token, Some(*b"0123456789abcdef"));
+        assert!(!t.is_direct());
         assert_eq!(t.cert_hashes.len(), 1);
         assert_eq!(t.cert_hashes[0], [0u8; 32]);
+    }
+
+    #[test]
+    fn quic_target_direct_when_no_relay_and_no_token() {
+        // The shape Roblox returned on 2026-11-24: no UDMUX, no NetStack
+        // token, DirectServerReturn, NetStackPort set.
+        let js = JoinScript::parse(
+            r#"{"MachineAddress":"10.1.2.3","ServerPort":54713,"NetStackPort":53601,
+                "UdmuxEndpoints":[],"DirectServerReturn":true,
+                "NetStackConfig":"{\"pubKey\":\"\",\"port\":53601,\"caps\":\"\",\"certHashes\":[\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]}"}"#,
+        )
+        .unwrap();
+        let t = QuicTarget::from_join(&js).unwrap();
+        assert!(t.is_direct());
+        assert_eq!(t.relay.to_string(), "10.1.2.3:53601");
+        assert_eq!(t.rcc, ("10.1.2.3".parse().unwrap(), 53601));
+        assert_eq!(t.cert_hashes.len(), 1);
+    }
+
+    #[test]
+    fn quic_target_relay_without_token_is_rejected() {
+        let js = JoinScript::parse(
+            r#"{"MachineAddress":"10.1.2.3","ServerPort":100,"NetStackPort":64852,
+                "UdmuxEndpoints":[{"Address":"128.116.63.33","Port":64852}]}"#,
+        )
+        .unwrap();
+        assert!(QuicTarget::from_join(&js).is_err());
     }
 
     #[test]

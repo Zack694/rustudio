@@ -152,6 +152,8 @@ pub const ENV_PREFILTER_SAMPLES: usize = 64; // GGX importance samples per texel
 pub const ATMOS_HAZE_K: f32 = 2.65; // haze = skybox irradiance(dir) × Color² × mean irradiance × this (structure from AdvSkyFS +; this factor is Lighting's members, not yet read: measured on two Colors, day and night alike: 2.93-3.12 from the faces in Python, 2.65 once rustudio draws it (its haze read 6 % over Studio at 2.95))
 pub const TONE_CURVE: [f32; 5] = [6.0402, 0.0064675, 2.41386, 0.656391, 1.157207]; // Default tone curve a..e: y = x(ax+b)/(x(ax+c)+d)·e, fitted to 16 Studio screenshots, RMS 0.38 levels
 pub const LIGHT_INTENSITY: f32 = 1.06; // local light = Color² × Brightness × 1.06 × falloff × N·L (fit over 5 configurations)
+pub const HUMANOID_JUMP_POWER_MAX: f32 = 1000.0; // Humanoid.JumpPower clamps to [0, 1000] (Roblox docs)
+pub const HUMANOID_MAX_SLOPE_MAX: f32 = 89.0; // Humanoid.MaxSlopeAngle clamps to [0, 89] (Roblox docs)
 pub const LIGHT_MAX_RANGE: f32 = 120.0; // Range setters clamp to [0, 120]: SpotLight, PointLight/SurfaceLight
 pub const LIGHT_MAX_ANGLE: f32 = 180.0; // SpotLight.Angle and SurfaceLight.Angle clamp to [0, 180]
 pub const CLOCK_TIME_MAX: f32 = 24.0; // ClockTime: clamp to [0, 24], × 3600, truncated to whole seconds, stored as µs (× 1 000 000)
@@ -167,6 +169,15 @@ pub const SHADOW_SOFTNESS_MAX: f32 = 1.0; // ShadowSoftness clamps to [0, 1]
 pub fn setter_clamp(class: &str, prop: &str, v: f32) -> Option<f32> {
     let light = matches!(class, "PointLight" | "SpotLight" | "SurfaceLight");
     Some(match (class, prop) {
+        // Humanoid speeds and jumps can't go below zero (Roblox clamps
+        // WalkSpeed at 0 since 2017: a game that takes 100 off a speed
+        // of 8 to hold a player still during an emote gets 0, not a
+        // walk backwards at 92 studs/s; JumpPower is 0..1000, JumpHeight
+        // and MaxHealth 0 or more, MaxSlopeAngle 0..89 — the API's
+        // documented ranges).
+        ("Humanoid", "WalkSpeed" | "JumpHeight" | "MaxHealth") => v.max(0.0),
+        ("Humanoid", "JumpPower") => v.clamp(0.0, HUMANOID_JUMP_POWER_MAX),
+        ("Humanoid", "MaxSlopeAngle") => v.clamp(0.0, HUMANOID_MAX_SLOPE_MAX),
         (_, "Range") if light => v.clamp(0.0, LIGHT_MAX_RANGE),
         ("SpotLight" | "SurfaceLight", "Angle") => v.clamp(0.0, LIGHT_MAX_ANGLE),
         ("Lighting", "ClockTime") => clock_time(v),

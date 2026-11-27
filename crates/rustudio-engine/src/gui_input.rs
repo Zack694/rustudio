@@ -113,6 +113,8 @@ enum Target {
 struct Root {
     /// Drawn over the world (AlwaysOnTop, ScreenGuis), not depth-tested.
     on_top: bool,
+    /// Render layer: 0 = 3D world GUIs, 1 = 3D AlwaysOnTop GUIs, 2 = ScreenGuis.
+    layer: u8,
     /// LightInfluence / Brightness: the colour factor (gamma space).
     light: f32,
     order: i64,
@@ -860,13 +862,15 @@ impl Gui {
         };
         let mut layered: Vec<Ref> = Vec::new();
         if let Some(pg) = screen_parent {
-            for g in children(d, pg) {
+            let mut stack: Vec<Ref> = children(d, pg);
+            stack.reverse();
+            while let Some(g) = stack.pop() {
                 let Some(class) = d.class_of(g) else { continue };
-                if !boolp(d, g, "Enabled", true) {
-                    continue;
-                }
                 match class.as_str() {
                     "ScreenGui" => {
+                        if !boolp(d, g, "Enabled", true) {
+                            continue;
+                        }
                         // ScreenInsets None / DeviceSafeInsets (IgnoreGuiInset, which
                         // doc.rs derives from it both ways): the whole view.
                         // TopbarSafeInsets: the top bar's free area, GuiService.TopbarInset
@@ -876,11 +880,27 @@ impl Gui {
                         let si = enum_u32(d.prop(g, "ScreenInsets"));
                         let ignore = matches!(si, Some(0) | Some(1));
                         let inset = if ignore { 0.0 } else { mech::GUI_TOP_INSET };
-                        let (target, canvas, abs_offset) = self.screen_root(rect, si, inset);
+                        // Editing (StarterGui): no top bar in the edit DataModel, so
+                        // every ScreenGui covers the whole view at AbsolutePosition
+                        // 0, 0 whatever its ScreenInsets (STUDIO-FACTS F46;
+                        // checks/gui-layout/studio captures: GetGuiInset 0, the
+                        // CoreUISafeInsets ScreenGui at 0, 0 the viewport's size).
+                        // Roblox's UIEditor draws its outline and handles at the
+                        // frame's AbsolutePosition in a default ScreenGui it makes
+                        // in CoreGui (UIEditor.rbxm CoreGuiManager.createScreenGui
+                        // sets only ClipToDeviceSafeArea / SafeAreaCompatibility),
+                        // drawn here with no inset (Roots::CoreGui): with the 58 px
+                        // inset this ScreenGui sat that far below the outline.
+                        let (target, canvas, abs_offset) = if inp.playing {
+                            self.screen_root(rect, si, inset)
+                        } else {
+                            (Target::Screen(rect.min), [rect.width(), rect.height()], [0.0, 0.0])
+                        };
                         roots.push(Root {
                             on_top: true,
+                            layer: 2,
                             light: 1.0,
-                            order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                            order: num(d, g, "DisplayOrder", 0.0) as i64,
                             dist: 0.0,
                             gui: g,
                             target,
@@ -899,7 +919,16 @@ impl Gui {
                             }
                         }
                     }
-                    "SurfaceGui" | "BillboardGui" => layered.push(g),
+                    "SurfaceGui" | "BillboardGui" => {
+                        if boolp(d, g, "Enabled", true) {
+                            layered.push(g);
+                        }
+                    }
+                    "Folder" => {
+                        let mut k = children(d, g);
+                        k.reverse();
+                        stack.extend(k);
+                    }
                     _ => {}
                 }
             }
@@ -907,7 +936,7 @@ impl Gui {
         // CoreGui during Play: Roblox's built-in in-experience UIs (ExperienceChat,
         // bubbleChat BillboardGuis, top-bar chat toggle) live in CoreGui, respecting
         // ScreenInsets / DisplayOrder just like PlayerGui.
-        if inp.playing && inp.roots == Roots::View {
+        if inp.playing && inp.roots == Roots::View && !self.hide_core_gui {
             if let Some(core) = d.find_child(root, "CoreGui") {
                 let mut stack: Vec<Ref> = children(d, core);
                 stack.reverse();
@@ -924,8 +953,9 @@ impl Gui {
                             let (target, canvas, abs_offset) = self.screen_root(rect, si, inset);
                             roots.push(Root {
                                 on_top: true,
+                                layer: 2,
                                 light: 1.0,
-                                order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                                order: num(d, g, "DisplayOrder", 0.0) as i64,
                                 dist: 0.0,
                                 gui: g,
                                 target,
@@ -975,6 +1005,7 @@ impl Gui {
                 if d.exists(w) {
                     roots.push(Root {
                         on_top: true,
+                        layer: 2,
                         light: 1.0,
                         order: 0,
                         dist: 0.0,
@@ -998,8 +1029,9 @@ impl Gui {
                             if boolp(d, g, "Enabled", true) {
                                 roots.push(Root {
                                     on_top: true,
+                                    layer: 2,
                                     light: 1.0,
-                                    order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                                    order: num(d, g, "DisplayOrder", 0.0) as i64,
                                     dist: 0.0,
                                     gui: g,
                                     target: Target::Screen(rect.min),
@@ -1075,8 +1107,9 @@ impl Gui {
                 };
                 roots.push(Root {
                     on_top,
+                    layer: u8::from(on_top),
                     light,
-                    order: if on_top { 500_000 } else { 0 } + z_offset,
+                    order: z_offset,
                     dist,
                     gui: g,
                     target,
@@ -1088,13 +1121,13 @@ impl Gui {
         // Back to front: 3D GUIs (far first, AlwaysOnTop after), then ScreenGuis by DisplayOrder.
         {
             let _sort = rustudio_core::bench::scope("gui_z_sort");
-            // (stably by order, then far to near: the same order as a
+            // (stably by layer and order, then far to near: the same order as a
             // stable sort of the roots, sorting small keys instead)
-            let mut keys: Vec<(i64, f32, u32)> =
-                roots.iter().enumerate().map(|(i, r)| (r.order, r.dist, i as u32)).collect();
-            keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(&b.2)));
+            let mut keys: Vec<(u8, i64, f32, u32)> =
+                roots.iter().enumerate().map(|(i, r)| (r.layer, r.order, r.dist, i as u32)).collect();
+            keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(b.2.total_cmp(&a.2)).then(a.3.cmp(&b.3)));
             let mut slots: Vec<Option<Root>> = roots.drain(..).map(Some).collect();
-            roots.extend(keys.iter().map(|k| slots[k.2 as usize].take().expect("each root once")));
+            roots.extend(keys.iter().map(|k| slots[k.3 as usize].take().expect("each root once")));
         }
         drop(place);
 
@@ -1916,12 +1949,36 @@ impl Gui {
                         }
                     }
                     let began_on: Vec<Ref> = under.iter().filter(|h| h.button).map(|h| h.r).collect();
-                    let sunk = top.is_some();
+                    // A finger landing on a draggable object (Draggable, or
+                    // a UIDragDetector) that nothing in front of it took
+                    // drags it, as a left press does (`input`): the drag is
+                    // the GUI's (the camera doesn't turn with it), and a
+                    // ScrollingFrame behind it doesn't scroll.
+                    let top_i = under.iter().rposition(|h| h.sink);
+                    // (a ScrollingFrame drawn over it takes the finger to
+                    // scroll instead; a draggable ScrollingFrame drags)
+                    let scroll_top = under.iter().rposition(|h| h.scrolling);
+                    let drag_i = under
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(i, h)| h.drag && top_i.is_none_or(|t| *i >= t) && scroll_top.is_none_or(|s| *i >= s))
+                        .map(|(i, _)| i);
+                    let drag = drag_i.map(|i| under[i].r);
+                    if let Some(d) = drag {
+                        super::share().drags.push((d, 0, x, y, true));
+                    }
+                    let sunk = top.is_some() || drag.is_some();
                     // The top ScrollingFrame under it scrolls with it (as on
                     // a phone; whether the camera turns too stays with
                     // Active, like Roblox: a frame with Active off lets the
                     // finger through to the camera while it scrolls).
-                    let scroll = under.iter().rev().find(|h| h.scrolling).map(|h| h.r);
+                    let scroll = under
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(i, h)| h.scrolling && drag_i.is_none_or(|di| *i > di))
+                        .map(|(_, h)| h.r);
                     if let Some(sf) = scroll {
                         // (a finger landing stops the canvas gliding)
                         self.events.push(GuiEvent::ScrollDrag(sf, [0.0, 0.0]));
@@ -1940,6 +1997,7 @@ impl Gui {
                             began_on: began_on.clone(),
                             scroll,
                             scrolled: false,
+                            drag,
                             speed: (0.0, 0.0),
                             moved_at: now_t,
                         },
@@ -1951,6 +2009,11 @@ impl Gui {
                     let (dx, dy) = (x - f.x, y - f.y);
                     f.x = x;
                     f.y = y;
+                    if let Some(d) = f.drag {
+                        if dx != 0.0 || dy != 0.0 {
+                            super::share().drags.push((d, 1, x, y, true));
+                        }
+                    }
                     if let Some(sf) = f.scroll {
                         // The canvas moves against the finger, by the
                         // finger's own pixels (direction-limited where it
@@ -1991,6 +2054,9 @@ impl Gui {
                 TouchState::End | TouchState::Cancel => {
                     let Some(f) = self.touch_fingers.remove(&t.id) else { continue };
                     let (dx, dy) = (x - f.x, y - f.y);
+                    if let Some(d) = f.drag {
+                        super::share().drags.push((d, 2, x, y, true));
+                    }
                     for h in &under {
                         self.events.push(GuiEvent::Fire(h.r, "InputEnded", vec![input(t.state, dx, dy)]));
                     }
@@ -2073,7 +2139,8 @@ impl Gui {
         let plugin = self.input_inset.is_some();
         let gui_xy = |p: Pos2| (p.x - rect.left(), p.y - rect.top() - inset);
         let now: HashSet<Ref> = under.iter().map(|h| h.r).collect();
-        let moved = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        let delta = ctx.input(|i| i.pointer.delta());
+        let moved = delta != egui::Vec2::ZERO;
         if let Some(p) = pointer {
             let (x, y) = gui_xy(p);
             for h in &under {
@@ -2098,7 +2165,7 @@ impl Gui {
                     self.events.push(GuiEvent::Fire(
                         h.r,
                         "InputChanged",
-                        vec![GuiArg::Input { button: 0, began: false, x, y }],
+                        vec![GuiArg::InputMove { x, y, dx: delta.x, dy: delta.y }],
                     ));
                 }
             }
@@ -2107,7 +2174,7 @@ impl Gui {
         if moved {
             if let (Some(d), Some(p)) = (self.dragging, pointer) {
                 let (x, y) = gui_xy(p);
-                super::share().drags.push((d, 1, x, y));
+                super::share().drags.push((d, 1, x, y, false));
             }
             if let (Some(tb), Some(p)) = (self.tb_selecting, pointer) {
                 if self.focus == Some(tb) && ctx.input(|i| i.pointer.primary_down()) {
@@ -2246,7 +2313,7 @@ impl Gui {
                         .map(|(_, h)| h.r);
                     if let Some(d) = drag {
                         self.dragging = Some(d);
-                        super::share().drags.push((d, 0, x, y));
+                        super::share().drags.push((d, 0, x, y, false));
                         took = true;
                     }
                 }
@@ -2331,7 +2398,7 @@ impl Gui {
                 if b == 1 {
                     self.tb_selecting = None;
                     if let Some(d) = self.dragging.take() {
-                        super::share().drags.push((d, 2, x, y));
+                        super::share().drags.push((d, 2, x, y, false));
                     }
                 }
                 for h in &under {
@@ -2504,7 +2571,16 @@ impl Gui {
                 std::mem::take(&mut sh.tb_script_sel),
             )
         };
+        let in_hidden_core = |r: Ref| {
+            self.hide_core_gui
+                && doc
+                    .find_child(doc.dom.root_ref(), "CoreGui")
+                    .is_some_and(|c| doc.is_ancestor(c, r))
+        };
         for req in focus_reqs {
+            if req.is_some_and(in_hidden_core) {
+                continue;
+            }
             if req.is_some() && req != self.focus {
                 self.swallow = self.last_key_char.take().filter(|(_, at)| now - *at < WINDOW);
                 self.tb_blink = now_s;
@@ -2537,8 +2613,14 @@ impl Gui {
         if self.swallow.as_ref().is_some_and(|(_, at)| now - *at >= WINDOW) {
             self.swallow = None;
         }
-        let Some(f) = self.focus else { return false };
-        if !doc.exists(f) {
+        let Some(f) = self.focus else {
+            let mut sh = super::share();
+            sh.tb_live = None;
+            sh.tb_ime.clear();
+            sh.tb_ime_sel = None;
+            return false;
+        };
+        if !doc.exists(f) || in_hidden_core(f) {
             self.focus = None;
             self.tb_cursor = -1;
             self.tb_sel = -1;
@@ -2548,6 +2630,9 @@ impl Gui {
             sh.focus = None;
             sh.tb_cursor.insert(f, -1);
             sh.tb_sel.insert(f, -1);
+            sh.tb_live = None;
+            sh.tb_ime.clear();
+            sh.tb_ime_sel = None;
             return false;
         }
         // Keep live cursor valid against the document's current Text.
@@ -2616,6 +2701,46 @@ impl Gui {
         };
 
         let mut actions: Vec<textbox::EditAction> = Vec::new();
+        // The soft keyboard's editor (Android, src/android/ime.rs): its
+        // replacements, code points [a, b) becoming a string, as a
+        // selection and a typing of the string; where it put the selection.
+        let (ime_ops, ime_sel) = {
+            let mut sh = super::share();
+            (std::mem::take(&mut sh.tb_ime), sh.tb_ime_sel.take())
+        };
+        let byte_of = |text: &str, cp: usize| -> usize {
+            text.char_indices().nth(cp).map_or(text.len(), |(b, _)| b)
+        };
+        let mut live = state.text.clone();
+        for (a, b, text) in ime_ops {
+            let (a, b) = (a.min(b), a.max(b));
+            let (ab, bb) = (byte_of(&live, a), byte_of(&live, b));
+            actions.push(textbox::EditAction::ClickAt { pos: ab + 1, shift: false });
+            if bb > ab {
+                actions.push(textbox::EditAction::ClickAt { pos: bb + 1, shift: true });
+            }
+            if text == "\n" && !multi_line {
+                actions.push(textbox::EditAction::Enter);
+            } else if text.is_empty() {
+                if bb > ab {
+                    actions.push(textbox::EditAction::Backspace { word: false });
+                }
+            } else {
+                actions.push(textbox::EditAction::InsertText(text.clone()));
+            }
+            // (the next replacement's positions are in the text as it is
+            // after this one, when the field is editable)
+            if editable {
+                live.replace_range(ab..bb, &text);
+            }
+        }
+        if let Some((a, b)) = ime_sel {
+            let (ab, bb) = (byte_of(&live, a.min(b)), byte_of(&live, a.max(b)));
+            actions.push(textbox::EditAction::ClickAt { pos: ab + 1, shift: false });
+            if bb > ab {
+                actions.push(textbox::EditAction::ClickAt { pos: bb + 1, shift: true });
+            }
+        }
         for e in &raw_events {
             match e {
                 egui::Event::Copy => actions.push(textbox::EditAction::Copy),
@@ -2708,11 +2833,14 @@ impl Gui {
             sh.focus = None;
             sh.tb_cursor.insert(f, -1);
             sh.tb_sel.insert(f, -1);
+            sh.tb_live = None;
             self.focus = None;
             self.tb_cursor = -1;
             self.tb_sel = -1;
             self.tb_selecting = None;
             self.tb_held_key = None;
+        } else {
+            super::share().tb_live = Some((state.text, state.cursor, state.selection_start, multi_line));
         }
         true
     }
@@ -3736,6 +3864,82 @@ mod billboard_canvas_tests {
 }
 
 #[cfg(test)]
+mod edit_screen_gui_tests {
+    use super::*;
+    use rbx_dom_weak::types::{UDim, UDim2};
+    use rbx_dom_weak::InstanceBuilder;
+
+    /// Editing, a StarterGui ScreenGui (IgnoreGuiInset false, ScreenInsets
+    /// CoreUISafeInsets) covers the whole view: no 58 px top bar in the edit
+    /// DataModel (checks/gui-layout/studio captures: GetGuiInset 0, the
+    /// ScreenGui at 0, 0 the viewport's size). It must be drawn where its
+    /// AbsolutePosition says, as the CoreGui overlay Roblox's UIEditor draws
+    /// its outline in (Roots::CoreGui, no inset), or the outline sits 58 px
+    /// above the frame.
+    #[test]
+    fn edit_screen_gui_draws_at_its_absolute_position() {
+        let mut d = Document::new_place();
+        let root = d.dom.root_ref();
+        let sg = d.find_child(root, "StarterGui").expect("StarterGui");
+        let screen = d.insert(sg, InstanceBuilder::new("ScreenGui"));
+        let at = |x: i32, y: i32| UDim2::new(UDim::new(0.0, x), UDim::new(0.0, y));
+        let b = d.insert(
+            screen,
+            InstanceBuilder::new("TextButton").with_property("Position", at(10, 20)).with_property("Size", at(100, 40)),
+        );
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::new(300.0, 100.0), egui::vec2(800.0, 600.0));
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter().clone();
+            gui.draw(
+                ui.ctx(),
+                &painter,
+                DrawIn { render_state: None, doc: &d, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Roots::View },
+            );
+        });
+        out.textures_delta.clear();
+        let laid = gui.layout.get(&b).copied().expect("laid out");
+        assert_eq!(laid.pos, [10.0, 20.0]);
+        let c = gui.screen_center(b).expect("drawn");
+        assert!((c.x - (300.0 + 10.0 + 50.0)).abs() < 0.5 && (c.y - (100.0 + 20.0 + 20.0)).abs() < 0.5, "drawn at {c:?}");
+    }
+
+    #[test]
+    fn edit_starter_gui_renders_screen_gui_inside_folder() {
+        let mut d = Document::new_place();
+        let root = d.dom.root_ref();
+        let sg = d.find_child(root, "StarterGui").expect("StarterGui");
+        let folder = d.insert(sg, InstanceBuilder::new("Folder").with_name("Menus"));
+        let screen = d.insert(folder, InstanceBuilder::new("ScreenGui").with_name("Hud"));
+        let at = |x: i32, y: i32| UDim2::new(UDim::new(0.0, x), UDim::new(0.0, y));
+        let frame = d.insert(
+            screen,
+            InstanceBuilder::new("Frame").with_property("Position", at(20, 30)).with_property("Size", at(100, 50)),
+        );
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter().clone();
+            gui.draw(
+                ui.ctx(),
+                &painter,
+                DrawIn { render_state: None, doc: &d, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Roots::View },
+            );
+        });
+        out.textures_delta.clear();
+        let laid = gui.layout.get(&frame).copied().expect("ScreenGui inside Folder in StarterGui should lay out");
+        assert_eq!(laid.pos, [20.0, 30.0]);
+        assert_eq!(laid.size, [100.0, 50.0]);
+    }
+}
+
+#[cfg(test)]
 mod touch_scroll_tests {
     use super::*;
 
@@ -3842,5 +4046,107 @@ mod touch_scroll_tests {
         // ExtentsOffsetWorldSpace (0,1,0) adds +5 on Y; ExtentsOffset (0.5,0,0) adds +1 along cam.right (+X).
         assert!((world.y - 10.0).abs() < 1e-3, "expected Y=10.0, got {world:?}");
         assert!((world.x - (cam.right().x * 1.0)).abs() < 1e-3, "expected X shift by 0.5*half_x, got {world:?}");
+    }
+
+    /// A finger on a Draggable frame (or a UIDragDetector's parent) drags
+    /// it as the mouse does (`share().drags`, marked a finger's so the
+    /// scripts don't end it for a mouse button that was never held): the
+    /// finger is the GUI's, and the ScrollingFrame behind the frame
+    /// doesn't scroll. A finger landing on a scrolling frame drawn over
+    /// a draggable one scrolls it instead.
+    #[test]
+    fn a_finger_drags_a_draggable_frame_instead_of_the_canvas_behind_it() {
+        let (sf, frame) = (Ref::new(), Ref::new());
+        let mut gui = Gui { input_inset: Some(0.0), ..Gui::default() };
+        gui.hits.push(hit(sf, 0.0, 0.0, 200.0, 400.0, false, true));
+        let mut d = hit(frame, 20.0, 20.0, 120.0, 80.0, false, false);
+        d.drag = true;
+        gui.hits.push(d);
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let touch = |state, x: f32, y: f32| GuiTouch { id: 7, state, pos: Pos2::new(x, y) };
+        let drags_of = |r: Ref| -> Vec<(u8, f32, f32, bool)> {
+            let mut sh = super::super::share();
+            let mine: Vec<_> = sh.drags.iter().filter(|d| d.0 == r).map(|d| (d.1, d.2, d.3, d.4)).collect();
+            sh.drags.retain(|d| d.0 != r);
+            mine
+        };
+        drags_of(frame);
+        let out = gui.touch_input(&[touch(TouchState::Begin, 50.0, 40.0)], rect);
+        assert!(out[0].sunk, "{out:?}");
+        gui.touch_input(&[touch(TouchState::Change, 60.0, 45.0)], rect);
+        gui.touch_input(&[touch(TouchState::Change, 60.0, 45.0)], rect);
+        gui.touch_input(&[touch(TouchState::End, 90.0, 70.0)], rect);
+        assert_eq!(
+            drags_of(frame),
+            vec![(0, 50.0, 40.0, true), (1, 60.0, 45.0, true), (2, 90.0, 70.0, true)]
+        );
+        assert!(!gui.events.iter().any(|e| matches!(e, GuiEvent::ScrollDrag(..) | GuiEvent::Fling(..))), "{:?}", gui.events);
+        assert!(gui.touch_fingers.is_empty());
+
+        // The scrolling frame in front: it scrolls, nothing drags.
+        gui.hits.swap(0, 1);
+        gui.events.clear();
+        gui.touch_input(&[touch(TouchState::Begin, 50.0, 40.0)], rect);
+        gui.touch_input(&[touch(TouchState::Change, 50.0, 20.0)], rect);
+        gui.touch_input(&[touch(TouchState::End, 50.0, 20.0)], rect);
+        assert!(drags_of(frame).is_empty());
+        assert!(gui.events.iter().any(|e| matches!(e, GuiEvent::ScrollDrag(r, [0.0, 20.0]) if *r == sf)), "{:?}", gui.events);
+    }
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+    use rbx_dom_weak::InstanceBuilder;
+
+    /// The soft keyboard's replacements (Android, src/android/ime.rs:
+    /// `share().tb_ime`, code points) type into the focused TextBox as a
+    /// selection and an insertion, in bytes; the box's state goes back out
+    /// in `tb_live` for the keyboard's mirror.
+    #[test]
+    fn soft_keyboard_replacements_edit_the_focused_textbox() {
+        // (channel 2's share: this thread's alone)
+        let _ch = super::super::share_channel(2);
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let sg = d.insert(root, InstanceBuilder::new("ScreenGui"));
+        let tb = d.insert(sg, InstanceBuilder::new("TextBox").with_property("Text", "héllo"));
+        let mut gui = Gui { focus: Some(tb), ..Gui::default() };
+        {
+            let mut sh = super::super::share();
+            sh.tb_live = None;
+            sh.tb_ime.clear();
+            // 'é' (code point 1, two bytes) becomes "E", then " wörld" goes on
+            // the end of the text as it is after that.
+            sh.tb_ime.push((1, 2, "E".to_string()));
+            sh.tb_ime.push((5, 5, " wörld".to_string()));
+            sh.tb_ime_sel = None;
+        }
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        assert!(gui.keyboard(&ctx, &d));
+        ctx.end_pass().textures_delta.clear();
+        let texts: Vec<String> = gui.events.iter().filter_map(|e| match e {
+            GuiEvent::TextBoxUpdate { r, text: Some(t), .. } if *r == tb => Some(t.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(texts.last().map(String::as_str), Some("hEllo wörld"), "{texts:?}");
+        let live = super::super::share().tb_live.clone();
+        assert_eq!(live, Some(("hEllo wörld".to_string(), "hEllo wörld".len() as i32 + 1, -1, false)));
+        // (the Play loop writes the update to the document between frames)
+        d.dom.get_by_ref_mut(tb).unwrap().properties.insert(rbx_dom_weak::ustr("Text"), rbx_dom_weak::types::Variant::String("hEllo wörld".into()));
+        // A selection the keyboard set: code points 1..4 ("Ell").
+        super::super::share().tb_ime_sel = Some((1, 4));
+        ctx.begin_pass(egui::RawInput::default());
+        gui.keyboard(&ctx, &d);
+        ctx.end_pass().textures_delta.clear();
+        let live = super::super::share().tb_live.clone();
+        assert_eq!(live, Some(("hEllo wörld".to_string(), 5, 2, false)));
+        // Losing the focus takes the state away.
+        gui.focus = None;
+        ctx.begin_pass(egui::RawInput::default());
+        assert!(!gui.keyboard(&ctx, &d));
+        ctx.end_pass().textures_delta.clear();
+        assert!(super::super::share().tb_live.is_none());
     }
 }

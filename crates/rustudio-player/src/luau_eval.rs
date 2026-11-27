@@ -40,7 +40,11 @@ fn key(id: u64) -> String {
 /// `Runtime::dispatch` after.
 pub fn start(lua: &Lua, code: &str, id: u64, identity: u8) -> Result<(), String> {
     rustudio_engine::runtime::security::with_main_identity(lua, identity, || -> mlua::Result<()> {
-        let env = rustudio_engine::globals_parity::harness_env(lua)?;
+        // A script's environment (public globals, locked), as Studio's
+        // command bar has: not the harness one, whose host globals (rustudio
+        // internals) a game function called from here could reach with
+        // getfenv(0).
+        let env = rustudio_engine::globals_parity::new_env(lua, None)?;
         let f = lua.load(code).set_name("=mcp").set_environment(env).into_function()?;
         let sink = lua.create_table()?;
         lua.set_named_registry_value(&key(id), sink.clone())?;

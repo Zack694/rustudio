@@ -35,11 +35,14 @@
 
 mod assets;
 pub mod clipboard;
+pub mod cutout;
+pub mod ime;
 pub mod intent;
 pub mod jni;
 pub mod keyboard;
 pub mod lifecycle;
 mod logcat;
+pub mod logs;
 pub mod memory;
 pub mod perf_hint;
 pub mod sensors;
@@ -98,6 +101,19 @@ fn export_env() {
     set("XDG_DATA_HOME", &data_dir());
     set("TMPDIR", &cache.join("tmp"));
     let _ = std::fs::create_dir_all(cache.join("tmp"));
+    // A phone's physics pool: two threads, not the desktop's four. A phone
+    // has four fast cores at most (a Snapdragon 865: one prime, three gold,
+    // four slow A55s) and the render, gameplay and UI threads are already
+    // on them; a fork-join step with four workers puts one on a slow core
+    // and every tick waits for that one. (`physics::par_pool`; a
+    // debug.rustudio.env value below still wins.)
+    if std::env::var_os("RUSTUDIO_PHYSICS_THREADS").is_none() {
+        // SAFETY: as above, before any other thread.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("RUSTUDIO_PHYSICS_THREADS", "2")
+        };
+    }
     // The editor's RUSTUDIO_* switches, for a device that has no shell
     // environment to launch from:
     //   adb shell setprop debug.rustudio.env "RUSTUDIO_NO_NATIVE=1 RUSTUDIO_QUALITY_TRACE=1"
@@ -156,12 +172,37 @@ pub fn run(app: AndroidApp) {
     }
     init_dirs(&app);
     export_env();
+    // The session log file (logcat.rs): the lines logged so far go in first.
+    logcat::open_session();
     // The motion sensors behind UserInputService (sensors.rs), for the
     // engine's device_sensors.
     rustudio_engine::device_sensors::install(sensors::source());
+    // A MicroProfiler export (written under the app's files folder, which
+    // the Files apps can't open) is copied to Download/rustudio/<name>, as
+    // the logs are, so a capture of a laggy minute can be sent from the phone.
+    rustudio_profiler_ui::on_saved(|path| {
+        let name = path.file_name()?.to_str()?.to_string();
+        let bytes = std::fs::read(path).ok()?;
+        match jni::export_download(&name, "application/octet-stream", &bytes) {
+            Ok(shown) => {
+                log::info!("profiler: capture copied to {shown} ({} bytes)", bytes.len());
+                Some(shown)
+            }
+            Err(e) => {
+                log::warn!("profiler: copy to Download failed: {e}");
+                None
+            }
+        }
+    });
     // The navigation and status bars out of the way (immersive mode), on
     // the main thread when it gets to it; the window grows to the screen.
     system_bars::hide();
+    // And under the camera hole on its side (cutout.rs): the editor pads
+    // itself by the hole's insets instead of Android letterboxing the side.
+    cutout::request();
+    // The soft keyboard's input connection (ime.rs): its Java class out of
+    // the library, its view into the activity.
+    ime::install();
     log::info!(
         "files {} / data {} / cache {}",
         files_dir().display(),
@@ -264,6 +305,7 @@ pub fn run(app: AndroidApp) {
             // (eframe gave up: a surface or device it couldn't make)
             log::error!("eframe: {e}");
             log::error!("rustudio: the editor's loop ended with an error, leaving the process");
+            logcat::sync_session();
             std::process::exit(2);
         }
         Err(payload) => {
@@ -276,6 +318,7 @@ pub fn run(app: AndroidApp) {
             if let Some(p) = rustudio_core::crash::last_report() {
                 log::error!("rustudio: crash report {} (echoed to Output and logcat at the next start)", p.display());
             }
+            logcat::sync_session();
             std::process::exit(101);
         }
     }
@@ -328,6 +371,9 @@ pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
         log::error!("{line}");
         rustudio_core::crash::note(line);
         GPU_LOST.store(true, std::sync::atomic::Ordering::Release);
+        // (the renderer skips uploads that would panic on the device's
+        // destroyed buffers in the rest of this frame: world_gui.rs `stage`)
+        rustudio_render::gpu_health::mark_lost(format!("GPU device lost ({reason:?}: {message})"));
     });
 }
 
@@ -419,6 +465,7 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     let line = format!("rustudio: {why}; nothing more can be drawn. {saved}. rustudio restarts; open the saved copy from Recent or the recovery folder.");
     log::error!("{line}");
     eprintln!("{line}");
+    logcat::sync_session();
     let _ = rustudio_core::crash::write_event(&why, &line);
     if let Err(e) = jni::relaunch() {
         log::error!("rustudio: relaunch: {e}");
